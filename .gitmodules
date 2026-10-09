@@ -1,0 +1,4 @@
+[submodule "share/bindings"]
+	path = share/bindings
+	url = ../hbinds.git
+	branch = nightly
