@@ -25,7 +25,8 @@ const host_test_roots = [_][]const u8{
     "src/build/verify_store.zig",
 };
 
-/// The output layout of build.md under the absolute San root.
+/// The output layout under the absolute San root. Every generated path
+/// lies under build/.
 const Layout = struct {
     root: []const u8,
     build: []const u8,
@@ -274,15 +275,14 @@ fn addClean(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
     step.dependOn(&run.step);
 }
 
-/// The store verification of build.md: the explicit fetch into a fresh
-/// store with the network denied, then a comparison with the store. The
+/// Adds the store verification: the explicit fetch into a fresh store
+/// with the network denied, then a comparison with the store. The
 /// tool empties its work directory on every run, because Zig reuses the
 /// output directory of a Run step across runs.
 fn addVerifyStore(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
     if (b.graph.host.result.os.tag != .macos) {
         return failSteps(b, &.{step}, "verify-store denies the network " ++
-            "through /usr/bin/sandbox-exec, which only macOS has; " ++
-            "Linux hosts join with CI");
+            "through /usr/bin/sandbox-exec, so it runs only on macOS");
     }
 
     if (failMissingPackage(b, step, layout)) return;

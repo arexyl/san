@@ -111,9 +111,8 @@ pub fn check(
 }
 
 /// Reports whether the absolute path `value` names `expected` once both
-/// are resolved lexically. A relative value never does: coord.py runs
-/// from the Hakusan root, so a relative value follows the caller's
-/// working directory.
+/// are resolved lexically. A relative value never does: Zig resolves it
+/// against the working directory of the invocation, not the San root.
 fn samePath(
     gpa: Allocator,
     value: []const u8,

@@ -6,8 +6,8 @@
 //! invocation, help and clean included. build.zig therefore checks the
 //! availability first and requests a package only when the store holds
 //! it. The check reads std.Build.package_map, a build-system
-//! implementation detail; re-run the gating probe on every Zig patch
-//! update.
+//! implementation detail, so recheck after every Zig update that help,
+//! clean, and the host tests still pass with an empty store.
 
 const std = @import("std");
 
