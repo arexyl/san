@@ -25,6 +25,13 @@ const host_test_roots = [_][]const u8{
     "src/build/verify_store.zig",
 };
 
+/// The root of the engine module, which also holds its host tests.
+const engine_root = "src/engine/Engine.zig";
+
+/// The modes of the engine's host tests: Debug, and the safe mode that
+/// the core keeps in published builds.
+const engine_test_modes = [_]std.lang.Optimize{ .debug, .safe };
+
 /// The output layout under the absolute San root. Every generated path
 /// lies under build/.
 const Layout = struct {
@@ -89,13 +96,14 @@ pub fn build(b: *std.Build) void {
     const abi = b.option(
         profile.Abi,
         "abi",
-        "Android ABI of check-header: " ++ profile.abi_names,
+        "Android ABI of check-header and check-engine: " ++ profile.abi_names,
     );
 
     const optimize = b.option(
         std.lang.Optimize,
         "optimize",
-        "Optimization mode of check-header: " ++ profile.optimize_names,
+        "Optimization mode of check-header and check-engine: " ++
+            profile.optimize_names,
     );
 
     const ndk_root = b.option(
@@ -130,6 +138,12 @@ pub fn build(b: *std.Build) void {
         "Assert the translated header layout in an Android object for -Dabi",
     );
 
+    const check_engine = b.step(
+        "check-engine",
+        "Compile the engine module as an Android object without libc " ++
+            "for -Dabi",
+    );
+
     const clean_step = b.step("clean", "Remove build/work and build/reports");
 
     const verify_store = b.step(
@@ -145,6 +159,7 @@ pub fn build(b: *std.Build) void {
             test_step,
             test_header,
             check_header,
+            check_engine,
             clean_step,
             verify_store,
         }, b.fmt("a Zig 0.{d}.x release required; found {f}", .{
@@ -160,12 +175,15 @@ pub fn build(b: *std.Build) void {
     addVerifyStore(b, verify_store, layout);
     addHeaderTest(b, test_header, layout);
 
-    addHeaderCheck(b, check_header, layout, .{
+    const selection: Selection = .{
         .abi = abi,
         .optimize = optimize,
         .ndk = ndk_root,
         .guard_ndk_major = guard_ndk_major,
-    });
+    };
+
+    addHeaderCheck(b, check_header, layout, selection);
+    addEngineCheck(b, check_engine, selection);
 }
 
 /// Returns the absolute San root. A supported invocation passes
@@ -257,6 +275,24 @@ fn addHostTests(b: *std.Build, step: *std.Build.Step) void {
         run.setCwd(scratch);
         step.dependOn(&run.step);
     }
+
+    for (engine_test_modes) |optimize| {
+        const tests = b.addTest(.{
+            .name = b.fmt("engine-{t}", .{optimize}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(engine_root),
+                .target = b.graph.host,
+                .optimize = optimize,
+                // The tests run the system backing on the host libc.
+                .link_libc = true,
+            }),
+        });
+
+        const run = b.addRunArtifact(tests);
+
+        run.setCwd(scratch);
+        step.dependOn(&run.step);
+    }
 }
 
 fn addClean(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
@@ -340,31 +376,54 @@ fn addHeaderTest(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
     step.dependOn(&b.addRunArtifact(tests).step);
 }
 
+/// An Android ABI and an optimization mode that the profile permits.
+const Android = struct {
+    abi: profile.Abi,
+    optimize: std.lang.Optimize,
+};
+
+/// The Android ABI and mode of a selection, or the message that names its
+/// missing or unsupported input.
+const Selected = union(enum) {
+    ok: Android,
+    rejected: []const u8,
+};
+
+/// Checks the ABI and the mode of `selection` against the profile.
+fn selectAndroid(b: *std.Build, selection: Selection) Selected {
+    const abi = selection.abi orelse return .{
+        .rejected = "missing -Dabi; choose one of: " ++ profile.abi_names,
+    };
+
+    const optimize = selection.optimize orelse return .{
+        .rejected = "missing -Doptimize; choose one of: " ++
+            profile.optimize_names,
+    };
+
+    if (!profile.combinationSupported(abi, optimize)) return .{
+        .rejected = b.fmt(
+            "unsupported combination -Dabi={t} -Doptimize={t}; " ++
+                "supported: {{{s}}} x {{{s}}}",
+            .{ abi, optimize, profile.abi_names, profile.optimize_names },
+        ),
+    };
+
+    return .{ .ok = .{ .abi = abi, .optimize = optimize } };
+}
+
 fn addHeaderCheck(
     b: *std.Build,
     step: *std.Build.Step,
     layout: Layout,
     selection: Selection,
 ) void {
-    const abi = selection.abi orelse return failSteps(
-        b,
-        &.{step},
-        "missing -Dabi; choose one of: " ++ profile.abi_names,
-    );
+    const android = switch (selectAndroid(b, selection)) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
 
-    const optimize = selection.optimize orelse return failSteps(
-        b,
-        &.{step},
-        "missing -Doptimize; choose one of: " ++ profile.optimize_names,
-    );
-
-    if (!profile.combinationSupported(abi, optimize)) {
-        return failSteps(b, &.{step}, b.fmt(
-            "unsupported combination -Dabi={t} -Doptimize={t}; " ++
-                "supported: {{{s}}} x {{{s}}}",
-            .{ abi, optimize, profile.abi_names, profile.optimize_names },
-        ));
-    }
+    const abi = android.abi;
+    const optimize = android.optimize;
 
     const ndk_root = selection.ndk orelse return failSteps(
         b,
@@ -414,6 +473,40 @@ fn addHeaderCheck(
                 .{ .name = "bindings", .module = header.bindingsModule(b) },
                 .{ .name = "table", .module = tableModule(b) },
             },
+        }),
+        .use_llvm = true,
+    });
+
+    _ = object.getEmittedBin();
+    step.dependOn(&object.step);
+}
+
+/// Compiles the engine module for the selected ABI as an object without
+/// libc. Its root references the engine's entry points, so the compile
+/// generates their code. Nothing links the object yet.
+fn addEngineCheck(
+    b: *std.Build,
+    step: *std.Build.Step,
+    selection: Selection,
+) void {
+    const android = switch (selectAndroid(b, selection)) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    const engine = b.createModule(.{
+        .root_source_file = b.path(engine_root),
+        .link_libc = false,
+    });
+
+    const object = b.addObject(.{
+        .name = b.fmt("engine-check-{t}", .{android.abi}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/engine_check.zig"),
+            .target = b.resolveTargetQuery(android.abi.targetQuery()),
+            .optimize = android.optimize,
+            .link_libc = false,
+            .imports = &.{.{ .name = "engine", .module = engine }},
         }),
         .use_llvm = true,
     });
