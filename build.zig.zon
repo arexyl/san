@@ -9,6 +9,29 @@
             .hash = "translate_c-2.0.2-Q_BUWvBNBwBgPKQJPblip6M7AHNK_IPNPmyv4rSIQMQc",
             .lazy = true,
         },
+        // libpng 1.6.59, the upstream release archive at the download
+        // location that libpng.org lists. libpng.org gives its SHA-256 as
+        // d80dd2a38a37f803cb9b6ac7b14bd6e74ddc3b654780a8380bdf93523fdb4389,
+        // and the archive behind this hash matched that digest on
+        // 2026-10-17. Zig keeps only a recompressed tarball, so no build
+        // can repeat that check.
+        .libpng = .{
+            .url = "https://download.sourceforge.net/libpng/libpng-1.6.59.tar.xz",
+            .hash = "N-V-__8AALklYQB8O4neIy7xVIGTKkDqkIwe5uoN9ExqSXov",
+            .lazy = true,
+        },
+        // zlib 1.3.2, the upstream release archive under zlib.net/fossils/,
+        // whose URL stays valid after a newer release. zlib.net gives its
+        // SHA-256 as
+        // bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16,
+        // and the archive behind this hash matched that digest on
+        // 2026-10-17. Zig keeps only a recompressed tarball, so no build
+        // can repeat that check.
+        .zlib = .{
+            .url = "https://zlib.net/fossils/zlib-1.3.2.tar.gz",
+            .hash = "N-V-__8AAJ2cNgAgfBtAw33Bxfu1IWISDeKKSr3DAqoAysIJ",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",

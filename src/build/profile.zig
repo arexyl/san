@@ -91,7 +91,9 @@ pub fn combinationSupported(abi: Abi, optimize: std.lang.Optimize) bool {
     };
 }
 
-fn supportedOnSomeAbi(optimize: std.lang.Optimize) bool {
+/// Reports whether the profile builds some ABI in `optimize`. The host
+/// tests of the codecs take only such a mode.
+pub fn supportedOnSomeAbi(optimize: std.lang.Optimize) bool {
     for (std.enums.values(Abi)) |abi| {
         if (combinationSupported(abi, optimize)) return true;
     }

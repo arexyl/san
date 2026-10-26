@@ -2,14 +2,17 @@
 //!
 //! Every option is declared before any package request, so help, clean,
 //! and the host tests need neither -Dabi, -Doptimize, -Dndk, nor a
-//! fetched package. A missing or rejected input fails the steps that
-//! need it through a Fail step that names the input, before any target
-//! compilation. An ambient input of the environment fails the whole
-//! configuration.
+//! fetched package. -Doptimize requests the codec packages, because the
+//! Android steps and the codec host tests compile them; help, clean, and
+//! the host tests that need no package take no -Doptimize. A missing or
+//! rejected input fails the steps that need it through a Fail step that
+//! names the input, before any target compilation. An ambient input of
+//! the environment fails the whole configuration.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const ambient = @import("src/build/ambient.zig");
+const codecs = @import("src/build/codecs.zig");
 const header = @import("src/build/header.zig");
 const ndk = @import("src/build/ndk.zig");
 const packages = @import("src/build/packages.zig");
@@ -73,6 +76,10 @@ const Layout = struct {
     }
 };
 
+/// The message of a missing -Doptimize.
+const missing_optimize = "missing -Doptimize; choose one of: " ++
+    profile.optimize_names;
+
 /// The selection of an Android build.
 const Selection = struct {
     abi: ?profile.Abi,
@@ -82,7 +89,7 @@ const Selection = struct {
     guard_ndk_major: ?u32,
 };
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     // The configure logic reads the environment and the package store,
     // which the configuration cache cannot track. Poisoning the cache
     // runs the configuration in every invocation, so no cached
@@ -96,20 +103,23 @@ pub fn build(b: *std.Build) void {
     const abi = b.option(
         profile.Abi,
         "abi",
-        "Android ABI of check-header and check-engine: " ++ profile.abi_names,
+        "Android ABI of check-header, check-engine, and check-codecs: " ++
+            profile.abi_names,
     );
 
     const optimize = b.option(
         std.lang.Optimize,
         "optimize",
-        "Optimization mode of check-header and check-engine: " ++
+        "Optimization mode of the Android checks and of the Zig code of " ++
+            "test-codecs; requests the codec packages: " ++
             profile.optimize_names,
     );
 
     const ndk_root = b.option(
         []const u8,
         "ndk",
-        "Absolute NDK root of check-header; no environment fallback",
+        "Absolute NDK root of check-header and check-codecs; no " ++
+            "environment fallback",
     );
 
     const guard_zig_minor = b.option(
@@ -144,6 +154,16 @@ pub fn build(b: *std.Build) void {
             "for -Dabi",
     );
 
+    const test_codecs = b.step(
+        "test-codecs",
+        "Compile the host codec archives and run the codec host tests",
+    );
+
+    const check_codecs = b.step(
+        "check-codecs",
+        "Compile the zlib and libpng archives for -Dabi",
+    );
+
     const clean_step = b.step("clean", "Remove build/work and build/reports");
 
     const verify_store = b.step(
@@ -160,6 +180,8 @@ pub fn build(b: *std.Build) void {
             test_header,
             check_header,
             check_engine,
+            test_codecs,
+            check_codecs,
             clean_step,
             verify_store,
         }, b.fmt("a Zig 0.{d}.x release required; found {f}", .{
@@ -184,6 +206,8 @@ pub fn build(b: *std.Build) void {
 
     addHeaderCheck(b, check_header, layout, selection);
     addEngineCheck(b, check_engine, selection);
+
+    try addCodecSteps(b, test_codecs, check_codecs, layout, selection);
 }
 
 /// Returns the absolute San root. A supported invocation passes
@@ -396,8 +420,7 @@ fn selectAndroid(b: *std.Build, selection: Selection) Selected {
     };
 
     const optimize = selection.optimize orelse return .{
-        .rejected = "missing -Doptimize; choose one of: " ++
-            profile.optimize_names,
+        .rejected = missing_optimize,
     };
 
     if (!profile.combinationSupported(abi, optimize)) return .{
@@ -425,23 +448,7 @@ fn addHeaderCheck(
     const abi = android.abi;
     const optimize = android.optimize;
 
-    const ndk_root = selection.ndk orelse return failSteps(
-        b,
-        &.{step},
-        "missing -Dndk; pass the absolute NDK root",
-    );
-
-    const opened = ndk.open(
-        b,
-        ndk_root,
-        abi.triple(),
-        selection.guard_ndk_major,
-    );
-
-    const found = switch (opened) {
-        .ok => |valid| valid,
-        .rejected => |message| return failSteps(b, &.{step}, message),
-    };
+    const found = openNdk(b, step, selection, abi) orelse return;
 
     if (failMissingPackage(b, step, layout)) return;
 
@@ -513,6 +520,177 @@ fn addEngineCheck(
 
     _ = object.getEmittedBin();
     step.dependOn(&object.step);
+}
+
+/// Opens the NDK of `selection` for `abi`. A missing or rejected root
+/// fails `step` with the message that names it and returns null.
+fn openNdk(
+    b: *std.Build,
+    step: *std.Build.Step,
+    selection: Selection,
+    abi: profile.Abi,
+) ?ndk.Root {
+    const root = selection.ndk orelse {
+        failSteps(b, &.{step}, "missing -Dndk; pass the absolute NDK root");
+
+        return null;
+    };
+
+    const opened = ndk.open(b, root, abi.triple(), selection.guard_ndk_major);
+
+    return switch (opened) {
+        .ok => |found| found,
+        .rejected => |message| {
+            failSteps(b, &.{step}, message);
+
+            return null;
+        },
+    };
+}
+
+/// Adds test-codecs and check-codecs. Both need the codec packages, which
+/// only -Doptimize requests.
+fn addCodecSteps(
+    b: *std.Build,
+    test_codecs: *std.Build.Step,
+    check_codecs: *std.Build.Step,
+    layout: Layout,
+    selection: Selection,
+) error{LazyDependencyNeeded}!void {
+    const optimize = selection.optimize orelse return failSteps(
+        b,
+        &.{ test_codecs, check_codecs },
+        missing_optimize,
+    );
+
+    const codec_packages = try requestCodecs(b, layout);
+
+    addCodecTest(b, test_codecs, layout, codec_packages, optimize);
+    addCodecCheck(b, check_codecs, layout, selection, codec_packages);
+}
+
+/// Requests both codec packages before either one ends the configuration,
+/// so that one invocation marks every missing package. Under --system,
+/// Zig names a missing package only by its hash in the store, so this
+/// also names each one with the explicit fetch.
+fn requestCodecs(
+    b: *std.Build,
+    layout: Layout,
+) error{LazyDependencyNeeded}!codecs.Packages {
+    const libpng = b.dependencyLazy("libpng", .{});
+
+    const zlib = b.dependencyLazy("zlib", .{});
+
+    if (b.graph.system_package_mode) {
+        if (std.meta.isError(libpng)) reportMissing(b, layout, "libpng");
+        if (std.meta.isError(zlib)) reportMissing(b, layout, "zlib");
+    }
+
+    return .{ .libpng = try libpng, .zlib = try zlib };
+}
+
+fn reportMissing(b: *std.Build, layout: Layout, name: []const u8) void {
+    std.log.err(
+        "package {s} is not in the store {s}; run the explicit fetch: {s}",
+        .{ name, layout.store, layout.fetchCommand(b) },
+    );
+}
+
+/// Adds the host codec archives and the host tests of the codecs. The
+/// archives compile in their own mode, and `optimize` selects the mode of
+/// the Zig tests.
+fn addCodecTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    layout: Layout,
+    codec_packages: codecs.Packages,
+    optimize: std.lang.Optimize,
+) void {
+    if (!profile.supportedOnSomeAbi(optimize)) return failSteps(
+        b,
+        &.{step},
+        b.fmt("unsupported -Doptimize={t} for test-codecs; supported: {s}", .{
+            optimize,
+            profile.optimize_names,
+        }),
+    );
+
+    // With an explicit host query, the host compiles take Zig's own libc
+    // headers, as the host translation does, and no SDK of the host.
+    const host = b.resolveTargetQuery(profile.hostQuery(b.graph.host.result));
+
+    const added = codecs.addArchives(
+        b,
+        codec_packages,
+        host,
+        .host,
+        layout.root,
+    );
+
+    const archives = switch (added) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    dependOnArchives(step, archives);
+
+    const tests = b.addTest(.{
+        .name = "pnglibconf-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/pnglibconf_test.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{
+                .name = "pnglibconf",
+                .module = codecs.configModule(b, codec_packages.libpng),
+            }},
+        }),
+    });
+
+    step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+/// Adds the codec archives of the selected ABI. Nothing links them yet.
+fn addCodecCheck(
+    b: *std.Build,
+    step: *std.Build.Step,
+    layout: Layout,
+    selection: Selection,
+    codec_packages: codecs.Packages,
+) void {
+    const android = switch (selectAndroid(b, selection)) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    const found = openNdk(b, step, selection, android.abi) orelse return;
+
+    const platform: codecs.Platform = .{ .android = .{
+        .abi = android.abi,
+        .include_dirs = found.include_dirs,
+    } };
+
+    const added = codecs.addArchives(
+        b,
+        codec_packages,
+        b.resolveTargetQuery(android.abi.targetQuery()),
+        platform,
+        layout.root,
+    );
+
+    const archives = switch (added) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    dependOnArchives(step, archives);
+}
+
+fn dependOnArchives(step: *std.Build.Step, archives: codecs.Archives) void {
+    for ([_]*std.Build.Step.Compile{ archives.zlib, archives.png }) |archive| {
+        _ = archive.getEmittedBin();
+        step.dependOn(&archive.step);
+    }
 }
 
 fn tableModule(b: *std.Build) *std.Build.Module {
