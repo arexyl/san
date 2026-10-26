@@ -2,7 +2,8 @@
 //! compile of San takes.
 //!
 //! zlib and libpng each compile into a static archive with its own
-//! module. Zig sets the optimization mode per module, so the C code
+//! module; the png archive also holds San's containment adapter of
+//! libpng. Zig sets the optimization mode per module, so the C code
 //! compiles in ReleaseSafe, at -O2 with the undefined-behavior trap, in
 //! every San build mode, Debug included: Debug runs execute the C code
 //! that published builds ship, whatever mode the Zig code takes.
@@ -18,6 +19,32 @@ pub const hardening_header = "src/build/hardening.h";
 /// San's libpng configuration header, relative to the San root. libpng's
 /// package holds no pnglibconf.h, so png.h includes this one.
 pub const png_config_header = "src/codecs/png/config/pnglibconf.h";
+
+/// The containment adapter of libpng and its one header, relative to the
+/// San root. Zig code reaches the adapter only through the translation of
+/// the header.
+pub const png_adapter_source = "src/codecs/png/adapter.c";
+pub const png_adapter_header = "src/codecs/png/adapter.h";
+
+/// The flags that San's own C adds to every flag of `cFlags`: every
+/// warning is an error. The codec headers raise none of them: the config
+/// and libpng directories are system include paths, and zlib.h and
+/// zconf.h, which the png module finds through an -I path, count as
+/// system headers by their names.
+const adapter_flags = [_][]const u8{
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "--system-header-prefix=zlib.h",
+    "--system-header-prefix=zconf.h",
+};
+
+/// The flag of libpng's compiles that renames libpng's one call of zlib's
+/// inflate, in png_zlib_inflate, to the adapter's observer. The observer
+/// calls inflate unchanged and records the end and the size of the image
+/// data stream, which libpng only warns about. zlib and the adapter
+/// compile without it, so they keep the real inflate.
+const inflate_observer = "-Dinflate=san_png_inflate";
 
 /// zlib's inflate path, which libpng's reader uses. The gz file
 /// functions and deflate stay out.
@@ -233,7 +260,7 @@ pub fn addArchives(
 
     const png_flags = std.mem.concat(b.graph.arena, []const u8, &.{
         flags,
-        &.{simd.define()},
+        &.{ simd.define(), inflate_observer },
     }) catch @panic("OOM");
 
     png.addCSourceFiles(.{
@@ -246,6 +273,14 @@ pub fn addArchives(
         .root = png_root,
         .files = simd.sources(),
         .flags = png_flags,
+    });
+
+    png.addCSourceFile(.{
+        .file = b.path(png_adapter_source),
+        .flags = std.mem.concat(b.graph.arena, []const u8, &.{
+            flags,
+            &adapter_flags,
+        }) catch @panic("OOM"),
     });
 
     return .{ .ok = .{

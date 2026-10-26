@@ -1,6 +1,7 @@
-//! The translation of the Bindings header through the translate-c
-//! package, and the module that hands the Bindings files to the checks.
-//! The translations and their modules stay in the build cache.
+//! The translation of C headers through the translate-c package: the
+//! Bindings header and the headers of San's C adapters. Also the module
+//! that hands the Bindings files to the checks. The translations and
+//! their modules stay in the build cache.
 
 const std = @import("std");
 
@@ -72,8 +73,9 @@ pub fn translate(
 }
 
 /// Translates the C source `source` for `target` and returns the module
-/// of the translation, named `name`.
-fn translateFile(
+/// of the translation, named `name`. The Bindings header and the header
+/// of each C adapter take this one path.
+pub fn translateFile(
     b: *std.Build,
     comptime Translator: type,
     translate_c: *std.Build.Dependency,

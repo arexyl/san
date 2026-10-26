@@ -35,6 +35,9 @@ const engine_root = "src/engine/Engine.zig";
 /// the core keeps in published builds.
 const engine_test_modes = [_]std.lang.Optimize{ .debug, .safe };
 
+/// The root of the PNG decoder, which also holds its host tests.
+const png_decoder_root = "src/codecs/png/Decoder.zig";
+
 /// The output layout under the absolute San root. Every generated path
 /// lies under build/.
 const Layout = struct {
@@ -647,6 +650,56 @@ fn addCodecTest(
         }),
     });
 
+    step.dependOn(&b.addRunArtifact(tests).step);
+    addDecoderTest(b, step, layout, host, archives, optimize);
+}
+
+/// Adds the host tests of the PNG decoder, linked with the host archives.
+/// The decoder reaches the adapter through the host translation of the
+/// adapter's header.
+fn addDecoderTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    layout: Layout,
+    host: std.Build.ResolvedTarget,
+    archives: codecs.Archives,
+    optimize: std.lang.Optimize,
+) void {
+    if (failMissingPackage(b, step, layout)) return;
+
+    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
+
+    const adapter = header.translateFile(
+        b,
+        translate_c.Translator,
+        b.dependency("translate_c", .{}),
+        host,
+        .host,
+        "adapter",
+        b.path(codecs.png_adapter_header),
+    );
+
+    const engine = b.createModule(.{
+        .root_source_file = b.path(engine_root),
+    });
+
+    const tests = b.addTest(.{
+        .name = b.fmt("png-decoder-{t}", .{optimize}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(png_decoder_root),
+            .target = host,
+            .optimize = optimize,
+            // The tests run the system backing on the host libc.
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "adapter", .module = adapter },
+                .{ .name = "engine", .module = engine },
+            },
+        }),
+    });
+
+    tests.root_module.linkLibrary(archives.png);
+    tests.root_module.linkLibrary(archives.zlib);
     step.dependOn(&b.addRunArtifact(tests).step);
 }
 

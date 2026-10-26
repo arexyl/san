@@ -295,8 +295,12 @@ pub const TestBacking = struct {
 /// A budget that admits every block of the tests below.
 const roomy: Ledger.Budget = .{ .bytes = 1 << 20 };
 
-/// Checks that the ledger counts exactly what the backing holds.
-fn expectMatches(heap: *const Heap, test_backing: *const TestBacking) !void {
+/// Checks that the ledger counts exactly what the backing holds. The
+/// tests of the codecs share it.
+pub fn expectMatches(
+    heap: *const Heap,
+    test_backing: *const TestBacking,
+) !void {
     try testing.expectEqual(test_backing.outstanding, heap.ledger.usage.live);
     try testing.expectEqual(test_backing.peak, heap.ledger.usage.peak);
 }
@@ -576,12 +580,13 @@ test "the system backing serves aligned blocks from libc" {
 }
 
 /// The runs of a failure-injection test, and how many of them ended with
-/// a settled ledger and an empty backing.
-const Exits = struct {
+/// a settled ledger and an empty backing. The tests of the codecs share
+/// it.
+pub const Exits = struct {
     runs: u32 = 0,
     settled: u32 = 0,
 
-    fn record(
+    pub fn record(
         exits: *Exits,
         heap: *const Heap,
         test_backing: *const TestBacking,
