@@ -1,7 +1,9 @@
-//! The test inputs of the PNG decoder: how a test splits its
+//! The shared test inputs of the PNG decoder: how a test splits its
 //! input into portions, San's strictness over libpng as a table of
 //! generated images and their outcomes, and the image of the
-//! failure-injection tests.
+//! failure-injection tests. The decoder's host tests and its Android test
+//! library and harness run these same definitions, so a host run and a
+//! device run answer the same questions.
 
 const std = @import("std");
 const Decoder = @import("Decoder.zig");
@@ -10,8 +12,9 @@ const fixtures = @import("fixtures.zig");
 const Error = Decoder.Error;
 const Reason = Decoder.Reason;
 
-/// How a test splits its input into portions.
-pub const Plan = union(enum) {
+/// How a test splits its input into portions. The tag is 32 bits wide, so
+/// the request of a device test carries it.
+pub const Plan = union(enum(u32)) {
     /// One portion.
     whole,
     /// One byte per portion.

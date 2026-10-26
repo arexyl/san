@@ -1,6 +1,9 @@
-//! The NDK root of a San build: the validation of the one explicit root
-//! and the registration of its configure-time reads. In this profile San
-//! takes only system headers from the NDK; no NDK tool runs.
+//! The NDK root of a San build: the validation of the one explicit root,
+//! the registration of its configure-time reads, and the Zig libc
+//! description that the build generates from it. San takes from the NDK
+//! only system headers, the API-level stubs that its libraries link
+//! against, and the crt objects of its Android test executables; no NDK
+//! tool runs.
 
 const std = @import("std");
 const profile = @import("profile.zig");
@@ -26,9 +29,17 @@ pub const ParseRevisionError = error{
 pub const Root = struct {
     path: []const u8,
     revision: Revision,
+    /// `<ndk>/toolchains/llvm/prebuilt/<host>/sysroot`.
+    sysroot: []const u8,
     /// `<sysroot>/usr/include`, then `<sysroot>/usr/include/<triple>`:
     /// the order of a Zig libc description.
     include_dirs: [2][]const u8,
+    /// `<sysroot>/usr/lib/<triple>/<level>`: the stubs of the profile's
+    /// API level and the crt objects of executables.
+    crt_dir: []const u8,
+    /// The API-level stub of Bionic's libc.so in `crt_dir`, the one
+    /// shared library that a San library links against.
+    libc_stub: []const u8,
 };
 
 /// The outcome of opening an NDK root: the root, or a message that names
@@ -199,11 +210,99 @@ pub fn open(
         };
     }
 
+    const crt_dir = crtDir(
+        b.graph.arena,
+        sysroot,
+        triple,
+        profile.api_level,
+    ) catch @panic("OOM");
+
+    const libc_stub = b.pathJoin(&.{ crt_dir, "libc.so" });
+
+    trackPresence(b, libc_stub);
+
+    std.Io.Dir.cwd().access(b.graph.io, libc_stub, .{}) catch |err| {
+        return .{ .rejected = b.fmt(
+            "-Dndk={s}: missing libc.so stub of API level {d}: {s}: {t}",
+            .{ root, profile.api_level, libc_stub, err },
+        ) };
+    };
+
     return .{ .ok = .{
         .path = root,
         .revision = revision,
+        .sysroot = sysroot,
         .include_dirs = include_dirs,
+        .crt_dir = crt_dir,
+        .libc_stub = libc_stub,
     } };
+}
+
+/// Returns the directory of the stubs and crt objects of the target
+/// `triple` at the API level `api_level` in the NDK sysroot `sysroot`.
+pub fn crtDir(
+    gpa: std.mem.Allocator,
+    sysroot: []const u8,
+    triple: []const u8,
+    api_level: u32,
+) std.mem.Allocator.Error![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}/usr/lib/{s}/{d}", .{
+        sysroot,
+        triple,
+        api_level,
+    });
+}
+
+/// Returns the Zig libc description of the target `triple` at the API
+/// level `api_level` in the NDK sysroot `sysroot`, as a pure function of
+/// the three. It has the seven keys that Zig requires, in Zig's order.
+/// The NDK keeps the crt objects beside the stubs, so `cc_dir` equals
+/// `crt_dir`, and the keys of other platforms stay empty.
+///
+/// Zig 0.17.0 keys a compile that uses a description on `crt_dir` alone,
+/// so a changed description with the same `crt_dir` would reuse stale
+/// objects. `crt_dir` holds every input of this function, so for an
+/// unchanged generator it carries the whole description. A change to
+/// the generator needs a fresh local cache.
+pub fn libcDescription(
+    gpa: std.mem.Allocator,
+    sysroot: []const u8,
+    triple: []const u8,
+    api_level: u32,
+) std.mem.Allocator.Error![]u8 {
+    const crt_dir = try crtDir(gpa, sysroot, triple, api_level);
+    defer gpa.free(crt_dir);
+
+    return std.fmt.allocPrint(gpa,
+        \\include_dir={s}/usr/include
+        \\sys_include_dir={s}/usr/include/{s}
+        \\crt_dir={s}
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\cc_dir={s}
+        \\darwin_sdk_dir=
+        \\
+    , .{ sysroot, sysroot, triple, crt_dir, crt_dir });
+}
+
+/// Writes the libc description of `triple` at the profile's API level in
+/// `root` into the build cache, and returns its path. Only an Android
+/// executable takes it: a San library links no libc.
+pub fn addLibcFile(
+    b: *std.Build,
+    root: Root,
+    triple: []const u8,
+) std.Build.LazyPath {
+    const text = libcDescription(
+        b.graph.arena,
+        root.sysroot,
+        triple,
+        profile.api_level,
+    ) catch @panic("OOM");
+
+    const name = b.fmt("libc-{s}-{d}.txt", .{ triple, profile.api_level });
+
+    return b.addWriteFiles().add(name, text);
 }
 
 /// Registers the contents of the file at the absolute `path`.
@@ -289,6 +388,93 @@ test "an absent, empty, or garbled revision fails with its own error" {
 
     for (cases) |case| {
         try testing.expectError(case[0], parseRevision(case[1]));
+    }
+}
+
+/// Returns the value of `key` in a libc description, or null when the
+/// description has no such line.
+fn descriptionValue(text: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+
+    while (lines.next()) |line| {
+        const equals = std.mem.findScalar(u8, line, '=') orelse continue;
+
+        if (std.mem.eql(u8, line[0..equals], key)) return line[equals + 1 ..];
+    }
+
+    return null;
+}
+
+test "the libc description has the seven keys in Zig's order" {
+    const text = try libcDescription(
+        testing.allocator,
+        "/ndk/sysroot",
+        "aarch64-linux-android",
+        33,
+    );
+    defer testing.allocator.free(text);
+
+    try testing.expectEqualStrings(
+        \\include_dir=/ndk/sysroot/usr/include
+        \\sys_include_dir=/ndk/sysroot/usr/include/aarch64-linux-android
+        \\crt_dir=/ndk/sysroot/usr/lib/aarch64-linux-android/33
+        \\msvc_lib_dir=
+        \\kernel32_lib_dir=
+        \\cc_dir=/ndk/sysroot/usr/lib/aarch64-linux-android/33
+        \\darwin_sdk_dir=
+        \\
+    , text);
+}
+
+test "cc_dir equals crt_dir, and crt_dir equals the root's" {
+    const triple = "x86_64-linux-android";
+
+    const text = try libcDescription(testing.allocator, "/s", triple, 33);
+    defer testing.allocator.free(text);
+
+    const crt_dir = try crtDir(testing.allocator, "/s", triple, 33);
+    defer testing.allocator.free(crt_dir);
+
+    const listed = descriptionValue(text, "crt_dir").?;
+
+    try testing.expectEqualStrings(crt_dir, listed);
+    try testing.expectEqualStrings(listed, descriptionValue(text, "cc_dir").?);
+}
+
+test "equal inputs give equal bytes" {
+    const first = try libcDescription(testing.allocator, "/s", "x", 33);
+    defer testing.allocator.free(first);
+
+    const second = try libcDescription(testing.allocator, "/s", "x", 33);
+    defer testing.allocator.free(second);
+
+    try testing.expectEqualSlices(u8, first, second);
+}
+
+test "every input of the description changes crt_dir" {
+    const base = try libcDescription(testing.allocator, "/s", "x", 33);
+    defer testing.allocator.free(base);
+
+    const variants = [_]struct { []const u8, []const u8, u32 }{
+        .{ "/t", "x", 33 },
+        .{ "/s", "y", 33 },
+        .{ "/s", "x", 34 },
+    };
+
+    for (variants) |variant| {
+        const text = try libcDescription(
+            testing.allocator,
+            variant[0],
+            variant[1],
+            variant[2],
+        );
+        defer testing.allocator.free(text);
+
+        try testing.expect(!std.mem.eql(
+            u8,
+            descriptionValue(base, "crt_dir").?,
+            descriptionValue(text, "crt_dir").?,
+        ));
     }
 }
 

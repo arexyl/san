@@ -11,9 +11,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const allowlist = @import("src/build/allowlist.zig");
 const ambient = @import("src/build/ambient.zig");
 const codecs = @import("src/build/codecs.zig");
 const header = @import("src/build/header.zig");
+const inspect = @import("src/build/inspect.zig");
+const library = @import("src/build/library.zig");
 const ndk = @import("src/build/ndk.zig");
 const packages = @import("src/build/packages.zig");
 const profile = @import("src/build/profile.zig");
@@ -28,6 +31,7 @@ const host_test_roots = [_][]const u8{
     "src/build/verify_store.zig",
     "src/build/allowlist.zig",
     "src/build/inspect.zig",
+    "src/build/install_prefix.zig",
 };
 
 /// The root of the engine module, which also holds its host tests.
@@ -39,6 +43,14 @@ const engine_test_modes = [_]std.lang.Optimize{ .debug, .safe };
 
 /// The root of the PNG decoder, which also holds its host tests.
 const png_decoder_root = "src/codecs/png/Decoder.zig";
+
+/// The root of libsan_png_test.so, the device test library of the PNG
+/// decoder, and the root of its harness.
+const png_device_test_root = "src/codecs/png/device_test.zig";
+const png_device_harness_root = "src/codecs/png/device_harness.zig";
+
+/// The root of the deliberately defective libraries of check-inspect.
+const inspect_defects_root = "src/build/inspect_defects.zig";
 
 /// The output layout under the absolute San root. Every generated path
 /// lies under build/.
@@ -108,8 +120,8 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     const abi = b.option(
         profile.Abi,
         "abi",
-        "Android ABI of check-header, check-engine, and check-codecs: " ++
-            profile.abi_names,
+        "Android ABI of check-header, check-engine, check-codecs, " ++
+            "check-inspect, and stage-device: " ++ profile.abi_names,
     );
 
     const optimize = b.option(
@@ -123,8 +135,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     const ndk_root = b.option(
         []const u8,
         "ndk",
-        "Absolute NDK root of check-header and check-codecs; no " ++
-            "environment fallback",
+        "Absolute NDK root of the Android steps; no environment fallback",
     );
 
     const guard_zig_minor = b.option(
@@ -169,6 +180,19 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         "Compile the zlib and libpng archives for -Dabi",
     );
 
+    const check_inspect = b.step(
+        "check-inspect",
+        "Check that the inspection rejects a defective library of each " ++
+            "base rule for -Dabi",
+    );
+
+    const stage_device = b.step(
+        "stage-device",
+        "Link and inspect the PNG device test library for -Dabi, then " ++
+            "install it and its harness into --prefix, which must be " ++
+            "build/work/<abi>-<mode>/",
+    );
+
     const clean_step = b.step("clean", "Remove build/work and build/reports");
 
     const verify_store = b.step(
@@ -187,6 +211,8 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             check_engine,
             test_codecs,
             check_codecs,
+            check_inspect,
+            stage_device,
             clean_step,
             verify_store,
         }, b.fmt("a Zig 0.{d}.x release required; found {f}", .{
@@ -212,7 +238,15 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     addHeaderCheck(b, check_header, layout, selection);
     addEngineCheck(b, check_engine, selection);
 
-    try addCodecSteps(b, test_codecs, check_codecs, layout, selection);
+    const inspection = addInspectionTool(b);
+
+    addInspectCheck(b, check_inspect, selection, inspection);
+
+    try addCodecSteps(b, .{
+        .test_codecs = test_codecs,
+        .check_codecs = check_codecs,
+        .stage_device = stage_device,
+    }, layout, selection, inspection);
 }
 
 /// Returns the absolute San root. A supported invocation passes
@@ -553,25 +587,41 @@ fn openNdk(
     };
 }
 
-/// Adds test-codecs and check-codecs. Both need the codec packages, which
-/// only -Doptimize requests.
-fn addCodecSteps(
-    b: *std.Build,
+/// The steps that compile the codecs.
+const CodecSteps = struct {
     test_codecs: *std.Build.Step,
     check_codecs: *std.Build.Step,
+    stage_device: *std.Build.Step,
+};
+
+/// Adds test-codecs, check-codecs, and stage-device. They need the codec
+/// packages, which only -Doptimize requests.
+fn addCodecSteps(
+    b: *std.Build,
+    steps: CodecSteps,
     layout: Layout,
     selection: Selection,
+    inspection: *std.Build.Step.Compile,
 ) error{LazyDependencyNeeded}!void {
     const optimize = selection.optimize orelse return failSteps(
         b,
-        &.{ test_codecs, check_codecs },
+        &.{ steps.test_codecs, steps.check_codecs, steps.stage_device },
         missing_optimize,
     );
 
     const codec_packages = try requestCodecs(b, layout);
 
-    addCodecTest(b, test_codecs, layout, codec_packages, optimize);
-    addCodecCheck(b, check_codecs, layout, selection, codec_packages);
+    addCodecTest(b, steps.test_codecs, layout, codec_packages, optimize);
+    addCodecCheck(b, steps.check_codecs, layout, selection, codec_packages);
+
+    addDeviceStage(
+        b,
+        steps.stage_device,
+        layout,
+        selection,
+        codec_packages,
+        inspection,
+    );
 }
 
 /// Requests both codec packages before either one ends the configuration,
@@ -739,6 +789,331 @@ fn addCodecCheck(
     };
 
     dependOnArchives(step, archives);
+}
+
+/// Adds stage-device: libsan_png_test.so, the device test library of the
+/// PNG decoder in the link shape of the San library, and its harness.
+/// The inspection runs on the exact file that the install copies, and
+/// both installs wait for it, so only an inspected library reaches the
+/// install prefix.
+fn addDeviceStage(
+    b: *std.Build,
+    step: *std.Build.Step,
+    layout: Layout,
+    selection: Selection,
+    codec_packages: codecs.Packages,
+    inspection: *std.Build.Step.Compile,
+) void {
+    const android = switch (selectAndroid(b, selection)) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    const found = openNdk(b, step, selection, android.abi) orelse return;
+
+    if (failMissingPackage(b, step, layout)) return;
+
+    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
+
+    const target = b.resolveTargetQuery(android.abi.targetQuery());
+
+    const added = codecs.addArchives(
+        b,
+        codec_packages,
+        target,
+        .{ .android = .{
+            .abi = android.abi,
+            .include_dirs = found.include_dirs,
+        } },
+        layout.root,
+    );
+
+    const archives = switch (added) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    const adapter = header.translateFile(
+        b,
+        translate_c.Translator,
+        b.dependency("translate_c", .{}),
+        target,
+        .{ .android = .{
+            .api_level = profile.api_level,
+            .include_dirs = found.include_dirs,
+        } },
+        "adapter",
+        b.path(codecs.png_adapter_header),
+    );
+
+    const imports: []const std.Build.Module.Import = &.{
+        .{ .name = "adapter", .module = adapter },
+        .{ .name = "engine", .module = androidEngine(b) },
+    };
+
+    const root = b.createModule(.{
+        .root_source_file = b.path(png_device_test_root),
+        .target = target,
+        .optimize = android.optimize,
+        .link_libc = false,
+        .imports = imports,
+    });
+
+    root.linkLibrary(archives.png);
+    root.linkLibrary(archives.zlib);
+
+    const device_library = library.add(b, .{
+        .name = "san_png_test",
+        .root_module = root,
+        .artifact = .png_device_test,
+        .ndk = found,
+    });
+
+    const inspected = addInspection(
+        b,
+        inspection,
+        android.abi,
+        .png_device_test,
+        device_library,
+    );
+
+    inspected.expectExitCode(0);
+
+    const harness = b.addExecutable(.{
+        .name = "san-png-harness",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(png_device_harness_root),
+            .target = target,
+            .optimize = android.optimize,
+            // A test executable of San links libc, with the crt objects
+            // of the generated libc description. It reads the decoder's
+            // types through the imports, and its decodes run in the
+            // library.
+            .link_libc = true,
+            .imports = imports,
+        }),
+        .use_llvm = true,
+        .use_lld = true,
+    });
+
+    // The harness needs the library through DT_NEEDED, by the library's
+    // SONAME. linkLibrary would also record the library's directory in
+    // the build cache as a RUNPATH, a host path that means nothing on
+    // the device, so the harness takes the linked file as an input.
+    harness.root_module.addObjectFile(device_library.getEmittedBin());
+    harness.setLibCFile(ndk.addLibcFile(b, found, android.abi.triple()));
+    // Android loads position-independent executables only, and segments
+    // aligned to the profile's page size map on both page sizes.
+    harness.pie = true;
+    harness.link_z_max_page_size = profile.page_size;
+
+    const prefix = addPrefixCheck(b, layout, android);
+
+    for ([_]*std.Build.Step.Compile{ device_library, harness }) |artifact| {
+        const install = b.addInstallArtifact(artifact, .{
+            .dest_dir = .{ .override = .prefix },
+        });
+
+        install.step.dependOn(&inspected.step);
+        install.step.dependOn(&prefix.step);
+        step.dependOn(&install.step);
+    }
+}
+
+/// Returns the check that the install prefix is build/work/<abi>-<mode>/
+/// of the selection, the directory from which a device run takes the
+/// files. Zig resolves the prefix only when the build runs, so the check
+/// is a host tool that receives it then.
+fn addPrefixCheck(
+    b: *std.Build,
+    layout: Layout,
+    android: Android,
+) *std.Build.Step.Run {
+    const tool = b.addExecutable(.{
+        .name = "install-prefix",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/install_prefix.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
+    const run = b.addRunArtifact(tool);
+
+    const expected = b.pathJoin(&.{
+        layout.work,
+        b.fmt("{t}-{t}", .{ android.abi, android.optimize }),
+    });
+
+    run.setName(b.fmt("check the install prefix {s}", .{expected}));
+    run.addArg(expected);
+    run.addDirectoryArg2(
+        .{ .relative = .{ .base = .install_prefix } },
+        .{ .make_absolute = true },
+    );
+    run.expectExitCode(0);
+
+    return run;
+}
+
+/// Returns the engine module for an Android library, which links no
+/// libc. It takes its target and mode from the root that imports it.
+fn androidEngine(b: *std.Build) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path(engine_root),
+        .link_libc = false,
+    });
+}
+
+/// Returns the inspection tool, a host tool that checks a linked Android
+/// library against the base rules of San's inspection.
+fn addInspectionTool(b: *std.Build) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = "inspect",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/inspect.zig"),
+            .target = b.graph.host,
+        }),
+    });
+}
+
+/// Runs the inspection tool on `artifact`, a library of the kind `kind`
+/// for `abi`. The run reads the file that the library's compile emits,
+/// which is the file that its install copies.
+fn addInspection(
+    b: *std.Build,
+    inspection: *std.Build.Step.Compile,
+    abi: profile.Abi,
+    kind: allowlist.Artifact,
+    artifact: *std.Build.Step.Compile,
+) *std.Build.Step.Run {
+    const run = b.addRunArtifact(inspection);
+
+    run.setName(b.fmt("inspect {s} for {t}", .{ artifact.name, abi }));
+    run.addArgs(&.{ @tagName(abi), @tagName(kind) });
+    run.addArtifactArg(artifact);
+
+    return run;
+}
+
+/// A deliberate defect of a library that check-inspect links, with the
+/// rule of the inspection that must reject it. `none` is the control:
+/// the same library without a defect, which passes every rule.
+const Defect = enum {
+    none,
+    extra_export,
+    getenv_import,
+    libm_needed,
+    small_pages,
+    svc,
+
+    fn rule(defect: Defect) ?inspect.Rule {
+        return switch (defect) {
+            .none => null,
+            .extra_export => .exports,
+            .getenv_import => .imports,
+            .libm_needed => .needed,
+            .small_pages => .load_align,
+            .svc => .svc,
+        };
+    }
+};
+
+/// The name that the library of the extra-export defect exports beside
+/// its declared export.
+const extra_export = "san_png_device_test_extra";
+
+/// Adds check-inspect: a library in the link shape of San's libraries
+/// for each defect, each inspected with the expectation that the tool
+/// exits 1 and names the defect's rule, and the control without a
+/// defect, which must pass. The svc rule scans arm64 code only, so its
+/// defect is linked for arm64-v8a only.
+fn addInspectCheck(
+    b: *std.Build,
+    step: *std.Build.Step,
+    selection: Selection,
+    inspection: *std.Build.Step.Compile,
+) void {
+    const android = switch (selectAndroid(b, selection)) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    const found = openNdk(b, step, selection, android.abi) orelse return;
+
+    const target = b.resolveTargetQuery(android.abi.targetQuery());
+
+    const engine = androidEngine(b);
+
+    for (std.enums.values(Defect)) |defect| {
+        if (defect == .svc and android.abi != .@"arm64-v8a") continue;
+
+        const options = b.addOptions();
+
+        options.addOption(Defect, "defect", defect);
+        options.addOption([]const u8, "extra_export", extra_export);
+
+        const root = b.createModule(.{
+            .root_source_file = b.path(inspect_defects_root),
+            .target = target,
+            .optimize = android.optimize,
+            .link_libc = false,
+            .imports = &.{
+                .{ .name = "options", .module = options.createModule() },
+                .{ .name = "engine", .module = engine },
+            },
+        });
+
+        const defective = library.add(b, .{
+            .name = b.fmt("san_defect_{t}", .{defect}),
+            .root_module = root,
+            .artifact = .png_device_test,
+            .ndk = found,
+        });
+
+        switch (defect) {
+            .none, .getenv_import, .svc => {},
+            .extra_export => defective.setVersionScript(
+                extraExportScript(b),
+            ),
+            .libm_needed => root.addObjectFile(b.graph.cwdRelativePath(
+                b.pathJoin(&.{ found.crt_dir, "libm.so" }),
+            )),
+            .small_pages => defective.link_z_max_page_size = 4096,
+        }
+
+        const run = addInspection(
+            b,
+            inspection,
+            android.abi,
+            .png_device_test,
+            defective,
+        );
+
+        if (defect.rule()) |rule| {
+            run.expectExitCode(1);
+            run.expectStdErrMatch(b.fmt("inspect: {t}: ", .{rule}));
+        } else {
+            run.expectExitCode(0);
+        }
+
+        step.dependOn(&run.step);
+    }
+}
+
+/// Returns the version script of the extra-export defect: the script that
+/// allowlist.zig derives for the device test library, with one more
+/// global name. If the derived script ever loses its `local:` line, the
+/// name stays hidden, the library passes, and check-inspect fails.
+fn extraExportScript(b: *std.Build) std.Build.LazyPath {
+    const script = std.mem.replaceOwned(
+        u8,
+        b.graph.arena,
+        allowlist.versionScript(.png_device_test),
+        "  local:\n",
+        "    " ++ extra_export ++ ";\n  local:\n",
+    ) catch @panic("OOM");
+
+    return b.addWriteFiles().add("extra-export.map", script);
 }
 
 fn dependOnArchives(step: *std.Build.Step, archives: codecs.Archives) void {

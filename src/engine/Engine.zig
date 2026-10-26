@@ -18,6 +18,12 @@ const std = @import("std");
 pub const Heap = @import("Heap.zig");
 pub const Ledger = @import("Ledger.zig");
 
+/// San's panic handler, which the root file of each Android artifact
+/// selects as its `panic`. It keeps another name here: a `panic`
+/// declaration in a root file selects that file's handler, and this file
+/// is also the root of the engine's host tests, which run on the host.
+pub const android_panic = @import("panic.zig");
+
 const Engine = @This();
 
 /// The engine's heap. Its first block holds this engine.
