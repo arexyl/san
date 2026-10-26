@@ -26,6 +26,8 @@ const host_test_roots = [_][]const u8{
     "src/build/table.zig",
     "src/build/clean.zig",
     "src/build/verify_store.zig",
+    "src/build/allowlist.zig",
+    "src/build/inspect.zig",
 };
 
 /// The root of the engine module, which also holds its host tests.

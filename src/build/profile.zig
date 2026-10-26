@@ -16,6 +16,12 @@ pub const ndk_major: u32 = 30;
 /// option selects it.
 pub const api_level: u32 = 33;
 
+/// The page size on which every Android artifact maps: the largest page
+/// size of its link, and the smallest alignment of its LOAD segments. A
+/// segment aligned to 16 KiB maps on devices with 4 KiB and with 16 KiB
+/// pages, while one aligned to 4 KiB cannot map on 16 KiB pages.
+pub const page_size: u64 = 16 * 1024;
+
 /// The ABIs of `Abi`, spelled as -Dabi takes them.
 pub const abi_names = names: {
     var text: []const u8 = "";
