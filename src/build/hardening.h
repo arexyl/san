@@ -13,7 +13,7 @@
  * _FORTIFY_SOURCE=2 for C in ReleaseSafe, and San's -U_FORTIFY_SOURCE
  * must come after that definition.
  */
-#if defined(_FORTIFY_SOURCE)
+#if defined( _FORTIFY_SOURCE )
 #error "_FORTIFY_SOURCE is defined: -U_FORTIFY_SOURCE must follow its -D"
 #endif
 
@@ -22,7 +22,7 @@
  * module without libc, and San's later -fstack-protector-strong must
  * win; clang then sets __SSP_STRONG__ to 2.
  */
-#if !defined(__SSP_STRONG__) || __SSP_STRONG__ != 2
+#if !defined( __SSP_STRONG__ ) || __SSP_STRONG__ != 2
 #error "the strong stack protector is off: pass -fstack-protector-strong"
 #endif
 
@@ -32,20 +32,20 @@
  * stack in x18, which the Android target reserves. Neither applies to
  * another target, such as an arm64 macOS host.
  */
-#if defined(__aarch64__) && defined(__ANDROID__)
+#if defined( __aarch64__ ) && defined( __ANDROID__ )
 
-#if !defined(__ARM_FEATURE_BTI_DEFAULT)
+#if !defined( __ARM_FEATURE_BTI_DEFAULT )
 #error "BTI is off: pass -mbranch-protection=standard"
 #endif
 
-#if !defined(__ARM_FEATURE_PAC_DEFAULT)
+#if !defined( __ARM_FEATURE_PAC_DEFAULT )
 #error "PAC is off: pass -mbranch-protection=standard"
 #endif
 
-#if !defined(__has_feature)
+#if !defined( __has_feature )
 #error "the compiler cannot report ShadowCallStack: compile with clang"
 #else
-#if !__has_feature(shadow_call_stack)
+#if !__has_feature( shadow_call_stack )
 #error "ShadowCallStack is off: pass -fsanitize=shadow-call-stack"
 #endif
 #endif

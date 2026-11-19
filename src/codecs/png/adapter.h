@@ -41,14 +41,14 @@ typedef int32_t san_png_verdict;
  * encoded row without its filter byte.
  */
 typedef struct san_png_header {
-    uint32_t width;
-    uint32_t height;
-    uint8_t bit_depth;
-    uint8_t color_type;
-    /* Zero for a noninterlaced image, one for Adam7. */
-    uint8_t interlace;
-    uint8_t channels;
-    uint64_t row_bytes;
+  uint32_t width;
+  uint32_t height;
+  uint8_t  bit_depth;
+  uint8_t  color_type;
+  /* Zero for a noninterlaced image, one for Adam7. */
+  uint8_t  interlace;
+  uint8_t  channels;
+  uint64_t row_bytes;
 } san_png_header;
 
 /*
@@ -59,15 +59,12 @@ typedef struct san_png_header {
  * runs for each row in order; its bytes stay valid only during the call.
  */
 typedef struct san_png_hooks {
-    void *ctx;
-    void *(*alloc)(void *ctx, size_t size);
-    void (*free)(void *ctx, void *block);
-    san_png_verdict (*header)(void *ctx, const san_png_header *header);
-    san_png_verdict (*row)(
-        void *ctx,
-        uint32_t index,
-        const uint8_t *bytes,
-        size_t len);
+  void *ctx;
+  void *( *alloc )( void *ctx, size_t size );
+  void ( *free )( void *ctx, void *block );
+  san_png_verdict ( *header )( void *ctx, const san_png_header *header );
+  san_png_verdict ( *row )( void *ctx, uint32_t index, const uint8_t *bytes,
+                            size_t len );
 } san_png_hooks;
 
 /* The status of a call. */
@@ -129,21 +126,21 @@ typedef int32_t san_png_reason;
 
 /* The records of a decoder that outlive its outcome. */
 typedef struct san_png_report {
-    san_png_reason reason;
-    /* Every warning of libpng, a diagnostic or a fault. */
-    uint32_t warnings;
-    /*
-     * One when optional color metadata (gAMA, cHRM, sRGB, iCCP, cICP,
-     * mDCV, or cLLI) drew a warning, so the color fallback applies.
-     */
-    uint8_t color_warning;
+  san_png_reason reason;
+  /* Every warning of libpng, a diagnostic or a fault. */
+  uint32_t warnings;
+  /*
+   * One when optional color metadata (gAMA, cHRM, sRGB, iCCP, cICP,
+   * mDCV, or cLLI) drew a warning, so the color fallback applies.
+   */
+  uint8_t color_warning;
 } san_png_report;
 
 /*
  * Creates a decoder that calls *hooks, which the call copies. Returns null
  * when an allocation failed or libpng refused the setup.
  */
-san_png_decoder *san_png_create(const san_png_hooks *hooks);
+san_png_decoder *san_png_create( const san_png_hooks *hooks );
 
 /*
  * Feeds the next len bytes of the encoded image, which the call only reads.
@@ -151,34 +148,29 @@ san_png_decoder *san_png_create(const san_png_hooks *hooks);
  * status. Bytes after IEND end the decode as SAN_PNG_STATUS_INVALID, in
  * this call or a later one.
  */
-san_png_status san_png_feed(
-    san_png_decoder *decoder,
-    const uint8_t *bytes,
-    size_t len);
+san_png_status san_png_feed( san_png_decoder *decoder, const uint8_t *bytes,
+                             size_t len );
 
 /*
  * Ends the input. Returns SAN_PNG_STATUS_DONE after SAN_PNG_STATUS_ENDED,
  * and otherwise a terminal status.
  */
-san_png_status san_png_finish(san_png_decoder *decoder);
+san_png_status san_png_finish( san_png_decoder *decoder );
 
 /*
  * Writes the image header to *header and returns one once libpng has read
  * IHDR. Returns zero before IHDR and after a terminal status.
  */
-int32_t san_png_get_header(
-    san_png_decoder *decoder,
-    san_png_header *header);
+int32_t san_png_get_header( san_png_decoder *decoder, san_png_header *header );
 
 /* Writes the records of the decoder to *report. */
-void san_png_get_report(
-    const san_png_decoder *decoder,
-    san_png_report *report);
+void san_png_get_report( const san_png_decoder *decoder,
+                         san_png_report        *report );
 
 /*
  * Releases the codec context and the decoder object through the free hook.
  * Ignores null.
  */
-void san_png_destroy(san_png_decoder *decoder);
+void san_png_destroy( san_png_decoder *decoder );
 
 #endif /* SAN_PNG_ADAPTER_H */
