@@ -31,7 +31,10 @@
     in
     {
       devShells.${system}.default = pkgs.mkShellNoCC {
-        packages = [ pkgs.zig_0_17 ];
+        packages = [
+          pkgs.zig_0_17
+          pkgs.llvmPackages_23.clang-tools
+        ];
 
         # build.zig takes the NDK root only through -Dndk, so the shell names the root for that flag.
         ANDROID_NDK_ROOT = "${android.androidsdk}/libexec/android-sdk/ndk/${ndkVersion}";
