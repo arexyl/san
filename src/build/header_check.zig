@@ -43,9 +43,30 @@ const prototypes = .{
         fn ([*c]const san.san_engine_limits, [*c]i64) callconv(.c) i32,
     },
     .{ "san_engine_shutdown", fn (i64) callconv(.c) i32 },
+    .{ "san_engine_counters", fn (i64, i32, [*c]i64) callconv(.c) i32 },
+    .{ "san_content_open", fn (i64, [*c]i64) callconv(.c) i32 },
+    .{
+        "san_content_feed",
+        fn (i64, i64, [*c]const u8, i32, i32) callconv(.c) i32,
+    },
+    .{ "san_content_close", fn (i64) callconv(.c) i32 },
+    .{
+        "san_job_request",
+        fn (i64, [*c]const san.san_output_request, [*c]i64) callconv(.c) i32,
+    },
+    .{ "san_job_step", fn (i64, [*c]i64) callconv(.c) i32 },
+    .{ "san_job_cancel", fn (i64) callconv(.c) i32 },
+    .{ "san_job_release", fn (i64) callconv(.c) i32 },
+    .{
+        "san_output_copy",
+        fn (i64, i32, i32, [*c]u8, i32, i32, i32, i32, i32) callconv(.c) i32,
+    },
+    .{ "san_output_release", fn (i64) callconv(.c) i32 },
 };
 
 const rows = parsed: {
+    @setEvalBranchQuota(200_000);
+
     var buffer: [table.rowCount(bindings.table)]table.Row = undefined;
     var diagnostic: table.Diagnostic = .{};
 

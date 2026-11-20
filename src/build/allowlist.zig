@@ -128,6 +128,16 @@ pub const Artifact = enum {
                 "san_binding_establish",
                 "san_engine_create",
                 "san_engine_shutdown",
+                "san_engine_counters",
+                "san_content_open",
+                "san_content_feed",
+                "san_content_close",
+                "san_job_request",
+                "san_job_step",
+                "san_job_cancel",
+                "san_job_release",
+                "san_output_copy",
+                "san_output_release",
             },
             .canary_device_test => &.{"san_canary_test"},
         };
@@ -291,7 +301,7 @@ test "each artifact exports its entry points and nothing else" {
         Artifact.png_device_test.exports()[0],
     );
 
-    try testing.expectEqual(3, Artifact.abi_device_test.exports().len);
+    try testing.expectEqual(13, Artifact.abi_device_test.exports().len);
 
     for (Artifact.abi_device_test.exports()) |name| {
         try testing.expect(std.mem.startsWith(u8, name, "san_"));

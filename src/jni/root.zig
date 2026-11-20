@@ -26,8 +26,18 @@ pub const class_name = "app/hakusan/reader/san/SanAbi";
 /// and the descriptors with the Bindings table.
 pub const natives = [_]jni.JNINativeMethod{
     native("bindingEstablish", "(I)I", bindingEstablish),
-    native("engineCreate", "(J[J)I", engineCreate),
+    native("engineCreate", "(JJJJJJJJJJJJJJJJ[J)I", engineCreate),
     native("engineShutdown", "(J)I", engineShutdown),
+    native("engineCounters", "(JZ[J)I", engineCounters),
+    native("contentOpen", "(J[J)I", contentOpen),
+    native("contentFeed", "(JJ[BIIZ)I", contentFeed),
+    native("contentClose", "(J)I", contentClose),
+    native("jobRequest", "(JIIIII[J)I", jobRequest),
+    native("jobStep", "(J[J)I", jobStep),
+    native("jobCancel", "(J)I", jobCancel),
+    native("jobRelease", "(J)I", jobRelease),
+    native("outputCopy", "(JIILandroid/graphics/Bitmap;I)I", outputCopy),
+    native("outputRelease", "(J)I", outputRelease),
 };
 
 pub export fn JNI_OnLoad(vm: [*c]jni.JavaVM, _: ?*anyopaque) jni.jint {
@@ -93,12 +103,42 @@ fn engineCreate(
     env: [*c]jni.JNIEnv,
     _: jni.jclass,
     aggregate_budget_bytes: jni.jlong,
+    content_count: jni.jlong,
+    job_count: jni.jlong,
+    content_length_bytes: jni.jlong,
+    input_portion_bytes: jni.jlong,
+    image_axis_pixels: jni.jlong,
+    image_area_pixels: jni.jlong,
+    metadata_bytes: jni.jlong,
+    metadata_expanded_bytes: jni.jlong,
+    metadata_payload_bytes: jni.jlong,
+    held_chunk_bytes: jni.jlong,
+    icc_tag_count: jni.jlong,
+    exif_entry_count: jni.jlong,
+    output_bytes: jni.jlong,
+    output_lease_bytes: jni.jlong,
+    output_lease_count: jni.jlong,
     engine_out: jni.jlongArray,
 ) callconv(.c) jni.jint {
     if (!holds(env, engine_out, 1)) return san.SAN_STATUS_BINDING_MISMATCH;
 
     const limits: san.san_engine_limits = .{
         .aggregate_budget_bytes = aggregate_budget_bytes,
+        .content_count = content_count,
+        .job_count = job_count,
+        .content_length_bytes = content_length_bytes,
+        .input_portion_bytes = input_portion_bytes,
+        .image_axis_pixels = image_axis_pixels,
+        .image_area_pixels = image_area_pixels,
+        .metadata_bytes = metadata_bytes,
+        .metadata_expanded_bytes = metadata_expanded_bytes,
+        .metadata_payload_bytes = metadata_payload_bytes,
+        .held_chunk_bytes = held_chunk_bytes,
+        .icc_tag_count = icc_tag_count,
+        .exif_entry_count = exif_entry_count,
+        .output_bytes = output_bytes,
+        .output_lease_bytes = output_lease_bytes,
+        .output_lease_count = output_lease_count,
     };
 
     var engine: san.san_handle = san.SAN_NO_HANDLE;
@@ -116,6 +156,235 @@ fn engineShutdown(
     engine: jni.jlong,
 ) callconv(.c) jni.jint {
     return abi.san_engine_shutdown(engine);
+}
+
+fn engineCounters(
+    env: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    engine: jni.jlong,
+    reset_peak: jni.jboolean,
+    counters_out: jni.jlongArray,
+) callconv(.c) jni.jint {
+    if (!holds(env, counters_out, san.SAN_ENGINE_COUNTERS_LENGTH)) {
+        return san.SAN_STATUS_BINDING_MISMATCH;
+    }
+
+    var counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(0);
+
+    const status = abi.san_engine_counters(
+        engine,
+        flag(reset_peak),
+        &counters,
+    );
+
+    // Only a successful read writes the counters.
+    if (status == san.SAN_STATUS_OK) {
+        env.*.*.SetLongArrayRegion.?(
+            env,
+            counters_out,
+            0,
+            counters.len,
+            &counters,
+        );
+    }
+
+    return status;
+}
+
+fn contentOpen(
+    env: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    engine: jni.jlong,
+    content_out: jni.jlongArray,
+) callconv(.c) jni.jint {
+    if (!holds(env, content_out, 1)) return san.SAN_STATUS_BINDING_MISMATCH;
+
+    var content: san.san_handle = san.SAN_NO_HANDLE;
+
+    const status = abi.san_content_open(engine, &content);
+
+    env.*.*.SetLongArrayRegion.?(env, content_out, 0, 1, &content);
+
+    return status;
+}
+
+fn contentFeed(
+    env: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    content: jni.jlong,
+    position: jni.jlong,
+    bytes: jni.jbyteArray,
+    offset: jni.jint,
+    length: jni.jint,
+    end_of_input: jni.jboolean,
+) callconv(.c) jni.jint {
+    const array = bytes orelse return san.SAN_STATUS_BINDING_MISMATCH;
+
+    if (offset < 0 or length < 0) return san.SAN_STATUS_BINDING_MISMATCH;
+
+    // Neither term is negative, so the difference cannot overflow.
+    if (length > env.*.*.GetArrayLength.?(env, array) - offset) {
+        return san.SAN_STATUS_BINDING_MISMATCH;
+    }
+
+    const functions = env.*;
+
+    const critical = functions.*.GetPrimitiveArrayCritical.?(
+        env,
+        array,
+        null,
+    ) orelse {
+        functions.*.ExceptionClear.?(env);
+
+        return san.SAN_STATUS_ALLOCATION_FAILED;
+    };
+
+    const elements: [*]const u8 = @ptrCast(critical);
+
+    // JNI forbids every other JNI call until the release, and the C ABI
+    // only copies the bytes.
+    const status = abi.san_content_feed(
+        content,
+        position,
+        elements + @as(usize, @intCast(offset)),
+        length,
+        flag(end_of_input),
+    );
+
+    // The call read the elements and wrote none, so nothing copies back.
+    functions.*.ReleasePrimitiveArrayCritical.?(
+        env,
+        array,
+        critical,
+        jni.JNI_ABORT,
+    );
+
+    return status;
+}
+
+fn contentClose(
+    _: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    content: jni.jlong,
+) callconv(.c) jni.jint {
+    return abi.san_content_close(content);
+}
+
+fn jobRequest(
+    env: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    content: jni.jlong,
+    left: jni.jint,
+    top: jni.jint,
+    right: jni.jint,
+    bottom: jni.jint,
+    max_output_width: jni.jint,
+    job_out: jni.jlongArray,
+) callconv(.c) jni.jint {
+    if (!holds(env, job_out, 1)) return san.SAN_STATUS_BINDING_MISMATCH;
+
+    const request: san.san_output_request = .{
+        .left = left,
+        .top = top,
+        .right = right,
+        .bottom = bottom,
+        .max_output_width = max_output_width,
+    };
+
+    var job: san.san_handle = san.SAN_NO_HANDLE;
+
+    const status = abi.san_job_request(content, &request, &job);
+
+    env.*.*.SetLongArrayRegion.?(env, job_out, 0, 1, &job);
+
+    return status;
+}
+
+fn jobStep(
+    env: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    job: jni.jlong,
+    report_out: jni.jlongArray,
+) callconv(.c) jni.jint {
+    if (!holds(env, report_out, san.SAN_JOB_REPORT_LENGTH)) {
+        return san.SAN_STATUS_BINDING_MISMATCH;
+    }
+
+    var report: [san.SAN_JOB_REPORT_LENGTH]i64 = @splat(0);
+
+    const status = abi.san_job_step(job, &report);
+
+    // A status that rejects the call writes no element.
+    switch (status) {
+        san.SAN_STATUS_INVALID_HANDLE,
+        san.SAN_STATUS_CLOSED,
+        san.SAN_STATUS_BINDING_MISMATCH,
+        => {},
+        else => env.*.*.SetLongArrayRegion.?(
+            env,
+            report_out,
+            0,
+            report.len,
+            &report,
+        ),
+    }
+
+    return status;
+}
+
+fn jobCancel(
+    _: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    job: jni.jlong,
+) callconv(.c) jni.jint {
+    return abi.san_job_cancel(job);
+}
+
+fn jobRelease(
+    _: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    job: jni.jlong,
+) callconv(.c) jni.jint {
+    return abi.san_job_release(job);
+}
+
+fn outputCopy(
+    _: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    lease: jni.jlong,
+    first_row: jni.jint,
+    row_count: jni.jint,
+    destination: jni.jobject,
+    destination_first_row: jni.jint,
+) callconv(.c) jni.jint {
+    if (destination == null) return san.SAN_STATUS_BINDING_MISMATCH;
+
+    // San issues no lease, so the C ABI rejects every handle before it
+    // reads a destination, and nothing locks the Bitmap.
+    return abi.san_output_copy(
+        lease,
+        first_row,
+        row_count,
+        null,
+        0,
+        0,
+        0,
+        destination_first_row,
+        san.SAN_ALPHA_PREMULTIPLIED,
+    );
+}
+
+fn outputRelease(
+    _: [*c]jni.JNIEnv,
+    _: jni.jclass,
+    lease: jni.jlong,
+) callconv(.c) jni.jint {
+    return abi.san_output_release(lease);
+}
+
+/// Returns a JNI boolean as the 0 or 1 that the C ABI takes.
+fn flag(value: jni.jboolean) i32 {
+    return @intFromBool(value != jni.JNI_FALSE);
 }
 
 /// Reports whether `array` is an array of exactly `len` elements. A
@@ -286,24 +555,61 @@ const fake = @import("fake.zig");
 /// wrote its output.
 const unwritten: jni.jlong = 0x5a5a_5a5a_5a5a_5a5a;
 
-const Establish = *const fn (
-    [*c]jni.JNIEnv,
-    jni.jclass,
-    jni.jint,
-) callconv(.c) jni.jint;
+/// The limits of engineCreate, which takes them in the field order of
+/// `san_engine_limits`.
+const limit_count = @typeInfo(san.san_engine_limits).@"struct".field_names.len;
 
-const Create = *const fn (
-    [*c]jni.JNIEnv,
-    jni.jclass,
-    jni.jlong,
-    jni.jlongArray,
-) callconv(.c) jni.jint;
+/// Returns roomy limits with an aggregate budget of `budget`.
+fn limitsUnder(budget: jni.jlong) [limit_count]jni.jlong {
+    var limits: [limit_count]jni.jlong = @splat(1 << 20);
 
-const Shutdown = *const fn (
-    [*c]jni.JNIEnv,
-    jni.jclass,
-    jni.jlong,
-) callconv(.c) jni.jint;
+    limits[0] = budget;
+
+    return limits;
+}
+
+/// Calls the registered engineCreate of `env` with `limits`, or fails
+/// when the method is not registered.
+fn createWith(
+    env: *fake.Env,
+    limits: [limit_count]jni.jlong,
+    engine_out: jni.jlongArray,
+) !jni.jint {
+    const create = try methodOf(env, "engineCreate", engineCreate);
+
+    return create(
+        env.pointer(),
+        null,
+        limits[0],
+        limits[1],
+        limits[2],
+        limits[3],
+        limits[4],
+        limits[5],
+        limits[6],
+        limits[7],
+        limits[8],
+        limits[9],
+        limits[10],
+        limits[11],
+        limits[12],
+        limits[13],
+        limits[14],
+        limits[15],
+        engine_out,
+    );
+}
+
+/// Returns the registered function of the method `name` of `env`, whose
+/// implementation is `function`, as the VM would call it.
+fn methodOf(
+    env: *const fake.Env,
+    comptime name: []const u8,
+    comptime function: anytype,
+) !*const @TypeOf(function) {
+    return env.method(*const @TypeOf(function), name) orelse
+        error.TestUnexpectedResult;
+}
 
 /// Loads the layer into a VM with `env` and checks that the load
 /// succeeds with no exception pending and no forbidden call.
@@ -322,10 +628,16 @@ fn expectLoaded(env: *fake.Env) !void {
 }
 
 test "the registration table matches the JNI rows of the Bindings table" {
-    var buffer: [table.rowCount(bindings.table)]table.Row = undefined;
+    // A count at compile time would exceed the default branch quota.
+    const buffer = try testing.allocator.alloc(
+        table.Row,
+        table.rowCount(bindings.table),
+    );
+    defer testing.allocator.free(buffer);
+
     var diagnostic: table.Diagnostic = .{};
 
-    const rows = try table.parse(bindings.table, &buffer, &diagnostic);
+    const rows = try table.parse(bindings.table, buffer, &diagnostic);
 
     var declared: usize = 0;
 
@@ -408,9 +720,10 @@ test "the methods convert their arguments and run the lifecycle" {
 
     try expectLoaded(&env);
 
-    const establish = env.method(Establish, "bindingEstablish").?;
-    const create = env.method(Create, "engineCreate").?;
-    const shutdown = env.method(Shutdown, "engineShutdown").?;
+    const establish = try methodOf(&env, "bindingEstablish", bindingEstablish);
+    const shutdown = try methodOf(&env, "engineShutdown", engineShutdown);
+    const counters = try methodOf(&env, "engineCounters", engineCounters);
+    const open = try methodOf(&env, "contentOpen", contentOpen);
 
     const jenv = env.pointer();
 
@@ -430,15 +743,15 @@ test "the methods convert their arguments and run the lifecycle" {
 
     try testing.expectEqual(
         san.SAN_STATUS_BINDING_MISMATCH,
-        create(jenv, null, 1 << 20, null),
+        try createWith(&env, limitsUnder(1 << 20), null),
     );
 
     for ([_]usize{ 0, 2 }) |len| {
-        var array: fake.LongArray = .{ .items = elements[0..len] };
+        var array: fake.Array = .{ .longs = elements[0..len] };
 
         try testing.expectEqual(
             san.SAN_STATUS_BINDING_MISMATCH,
-            create(jenv, null, 1 << 20, array.object()),
+            try createWith(&env, limitsUnder(1 << 20), array.object()),
         );
     }
 
@@ -448,21 +761,36 @@ test "the methods convert their arguments and run the lifecycle" {
         &elements,
     );
 
-    var out: fake.LongArray = .{ .items = elements[0..1] };
+    var out: fake.Array = .{ .longs = elements[0..1] };
 
     // A failure of the C ABI writes no handle.
     try testing.expectEqual(
         san.SAN_STATUS_BUDGET_EXCEEDED,
-        create(jenv, null, 0, out.object()),
+        try createWith(&env, limitsUnder(0), out.object()),
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
+
+    // Each parameter reaches a limit of its own.
+    for (0..limit_count) |index| {
+        var limits = limitsUnder(1 << 20);
+
+        limits[index] = 0;
+        elements[0] = unwritten;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_BUDGET_EXCEEDED,
+            try createWith(&env, limits, out.object()),
+        );
+
+        try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
+    }
 
     elements[0] = unwritten;
 
     try testing.expectEqual(
         san.SAN_STATUS_OK,
-        create(jenv, null, 1 << 20, out.object()),
+        try createWith(&env, limitsUnder(1 << 20), out.object()),
     );
 
     const engine = elements[0];
@@ -472,7 +800,32 @@ test "the methods convert their arguments and run the lifecycle" {
 
     try testing.expectEqual(
         san.SAN_STATUS_BUDGET_EXCEEDED,
-        create(jenv, null, 1 << 20, out.object()),
+        try createWith(&env, limitsUnder(1 << 20), out.object()),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
+
+    // The read of a live engine fails without a counter. Every value of
+    // the flag reaches the C ABI as 0 or 1, which rejects any other.
+    var counted: [san.SAN_ENGINE_COUNTERS_LENGTH]jni.jlong = @splat(unwritten);
+    var counted_array: fake.Array = .{ .longs = &counted };
+
+    const flags = [_]jni.jboolean{ jni.JNI_FALSE, jni.JNI_TRUE, 2, 0xff };
+
+    for (flags) |reset_peak| {
+        try testing.expectEqual(
+            san.SAN_STATUS_ENGINE_FAILURE,
+            counters(jenv, null, engine, reset_peak, counted_array.object()),
+        );
+    }
+
+    for (counted) |element| try testing.expectEqual(unwritten, element);
+
+    elements[0] = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        open(jenv, null, engine, out.object()),
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
@@ -486,12 +839,12 @@ test "the methods convert their arguments and run the lifecycle" {
     // The budget keeps its 64 bits and its sign on the way to the C ABI.
     try testing.expectEqual(
         san.SAN_STATUS_BUDGET_EXCEEDED,
-        create(jenv, null, -1, out.object()),
+        try createWith(&env, limitsUnder(-1), out.object()),
     );
 
     try testing.expectEqual(
         san.SAN_STATUS_OK,
-        create(jenv, null, 1 << 40, out.object()),
+        try createWith(&env, limitsUnder(1 << 40), out.object()),
     );
 
     try testing.expectEqual(
@@ -499,6 +852,245 @@ test "the methods convert their arguments and run the lifecycle" {
         shutdown(jenv, null, elements[0]),
     );
 
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+test "an output or report array of another length runs no function" {
+    var env: fake.Env = .{};
+
+    try expectLoaded(&env);
+
+    const counters = try methodOf(&env, "engineCounters", engineCounters);
+    const open = try methodOf(&env, "contentOpen", contentOpen);
+    const request = try methodOf(&env, "jobRequest", jobRequest);
+    const step = try methodOf(&env, "jobStep", jobStep);
+
+    const jenv = env.pointer();
+
+    var elements: [san.SAN_JOB_REPORT_LENGTH + 1]jni.jlong = @splat(unwritten);
+
+    const mismatch = san.SAN_STATUS_BINDING_MISMATCH;
+
+    try testing.expectEqual(mismatch, counters(jenv, null, 0, 0, null));
+    try testing.expectEqual(mismatch, open(jenv, null, 0, null));
+    try testing.expectEqual(mismatch, step(jenv, null, 0, null));
+
+    try testing.expectEqual(
+        mismatch,
+        request(jenv, null, 0, 0, 0, 0, 0, 0, null),
+    );
+
+    for (0..elements.len + 1) |len| {
+        var array: fake.Array = .{ .longs = elements[0..len] };
+
+        const object = array.object();
+
+        // An array of the declared length passes the check, and the C ABI
+        // then rejects the handle, which writes no report element.
+        const invalid = san.SAN_STATUS_INVALID_HANDLE;
+
+        try testing.expectEqual(
+            if (len == san.SAN_ENGINE_COUNTERS_LENGTH) invalid else mismatch,
+            counters(jenv, null, 0, 0, object),
+        );
+
+        try testing.expectEqual(
+            if (len == san.SAN_JOB_REPORT_LENGTH) invalid else mismatch,
+            step(jenv, null, 0, object),
+        );
+
+        if (len == 1) continue;
+
+        try testing.expectEqual(mismatch, open(jenv, null, 0, object));
+
+        try testing.expectEqual(
+            mismatch,
+            request(jenv, null, 0, 0, 0, 0, 0, 0, object),
+        );
+    }
+
+    for (elements) |element| try testing.expectEqual(unwritten, element);
+
+    // An output array of one element receives SAN_NO_HANDLE.
+    var out: fake.Array = .{ .longs = elements[0..1] };
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        open(jenv, null, 0, out.object()),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
+
+    elements[0] = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        request(jenv, null, 0, 0, 0, 0, 0, 0, out.object()),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+test "the feed checks its byte range before it requests the elements" {
+    var env: fake.Env = .{};
+
+    try expectLoaded(&env);
+
+    const feed = try methodOf(&env, "contentFeed", contentFeed);
+
+    const jenv = env.pointer();
+
+    var bytes: [8]jni.jbyte = @splat(0x5a);
+    var array: fake.Array = .{ .bytes = &bytes };
+
+    const max = std.math.maxInt(jni.jint);
+    const min = std.math.minInt(jni.jint);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feed(jenv, null, 0, 0, null, 0, 0, jni.JNI_TRUE),
+    );
+
+    const invalid_ranges = [_][2]jni.jint{
+        .{ -1, 0 },
+        .{ 0, -1 },
+        .{ min, 0 },
+        .{ 0, min },
+        .{ min, min },
+        .{ 0, 9 },
+        .{ 1, 8 },
+        .{ 8, 1 },
+        .{ 9, 0 },
+        .{ max, 0 },
+        .{ 0, max },
+        .{ max, max },
+        .{ 1, max },
+    };
+
+    for (invalid_ranges) |range| {
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            feed(jenv, null, 0, 0, array.object(), range[0], range[1], 0),
+        );
+    }
+
+    try testing.expectEqual(0, env.critical_regions);
+
+    // A valid range takes the elements for one call of the C ABI, which
+    // rejects the handle, and releases them without a copy back.
+    const valid_ranges = [_][2]jni.jint{
+        .{ 0, 8 },
+        .{ 0, 0 },
+        .{ 8, 0 },
+        .{ 3, 5 },
+        .{ 7, 1 },
+    };
+
+    for (valid_ranges, 1..) |range, regions| {
+        env.release_mode = null;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_INVALID_HANDLE,
+            feed(jenv, null, 0, 0, array.object(), range[0], range[1], 0),
+        );
+
+        try testing.expectEqual(regions, env.critical_regions);
+        try testing.expectEqual(null, env.critical);
+        try testing.expectEqual(jni.JNI_ABORT, env.release_mode.?);
+    }
+
+    // An empty array has one valid range.
+    var empty: fake.Array = .{ .bytes = bytes[0..0] };
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        feed(jenv, null, 0, 0, empty.object(), 0, 0, jni.JNI_TRUE),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feed(jenv, null, 0, 0, empty.object(), 0, 1, jni.JNI_TRUE),
+    );
+
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+test "a feed without the array's elements fails as AllocationFailed" {
+    var env: fake.Env = .{ .elements_available = false };
+
+    try expectLoaded(&env);
+
+    const feed = try methodOf(&env, "contentFeed", contentFeed);
+
+    var bytes: [8]jni.jbyte = @splat(0x5a);
+    var array: fake.Array = .{ .bytes = &bytes };
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ALLOCATION_FAILED,
+        feed(env.pointer(), null, 0, 0, array.object(), 0, 8, 0),
+    );
+
+    // The range check still comes first.
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feed(env.pointer(), null, 0, 0, array.object(), 0, 9, 0),
+    );
+
+    try testing.expectEqual(0, env.critical_regions);
+    try testing.expectEqual(null, env.critical);
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+test "the methods of a content, a job, and a lease reject every handle" {
+    var env: fake.Env = .{};
+
+    try expectLoaded(&env);
+
+    const close = try methodOf(&env, "contentClose", contentClose);
+    const cancel = try methodOf(&env, "jobCancel", jobCancel);
+    const release = try methodOf(&env, "jobRelease", jobRelease);
+    const copy = try methodOf(&env, "outputCopy", outputCopy);
+    const drop = try methodOf(&env, "outputRelease", outputRelease);
+
+    const jenv = env.pointer();
+
+    // Any non-null reference stands for the Bitmap.
+    var bitmap: u8 = 0;
+
+    const handles = [_]jni.jlong{
+        san.SAN_NO_HANDLE,
+        1,
+        -1,
+        unwritten,
+        std.math.minInt(jni.jlong),
+    };
+
+    for (handles) |handle| {
+        const statuses = [_]jni.jint{
+            close(jenv, null, handle),
+            cancel(jenv, null, handle),
+            release(jenv, null, handle),
+            copy(jenv, null, handle, 0, 1, &bitmap, 0),
+            drop(jenv, null, handle),
+        };
+
+        for (statuses) |status| {
+            try testing.expectEqual(san.SAN_STATUS_INVALID_HANDLE, status);
+        }
+
+        // A null Bitmap decides before the handle does.
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            copy(jenv, null, handle, 0, 1, null, 0),
+        );
+    }
+
+    try testing.expectEqual(0, bitmap);
     try testing.expect(!env.pending);
     try testing.expectEqual(0, env.forbidden_calls);
 }

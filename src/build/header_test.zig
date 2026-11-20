@@ -221,6 +221,129 @@ test "every type row matches the translated fixed-width type" {
     try testing.expect(checked > 0);
 }
 
+/// The suffix of the length macro of a report.
+const length_suffix = "_LENGTH";
+
+/// Checks the report rule of the Table format on `rows` and returns the
+/// count of reports. The i32 row `SAN_<REPORT>_LENGTH` names a report,
+/// and every other constant row that starts with `SAN_<REPORT>_` is one
+/// of its elements: an i32 row, whose values run from zero to the length
+/// minus one, each once.
+fn checkReports(rows: []const table.Row) !usize {
+    var reports: usize = 0;
+
+    for (rows) |length_row| {
+        if (length_row.kind != .i32) continue;
+
+        const report = std.mem.cutSuffix(
+            u8,
+            length_row.name,
+            length_suffix,
+        ) orelse continue;
+
+        const length = std.math.cast(usize, length_row.value.integer) orelse
+            return error.ReportLength;
+
+        const seen = try testing.allocator.alloc(bool, length);
+        defer testing.allocator.free(seen);
+
+        @memset(seen, false);
+
+        for (rows) |row| {
+            if (row.kind != .i32 and row.kind != .i64) continue;
+            if (row.line == length_row.line) continue;
+
+            const element = std.mem.cutPrefix(u8, row.name, report) orelse
+                continue;
+
+            if (!std.mem.startsWith(u8, element, "_")) continue;
+            if (row.kind != .i32) return error.ReportIndex;
+
+            const index = std.math.cast(usize, row.value.integer) orelse
+                return error.ReportIndex;
+
+            if (index >= length or seen[index]) return error.ReportIndex;
+
+            seen[index] = true;
+        }
+
+        if (std.mem.findScalar(bool, seen, false) != null) {
+            return error.ReportIndex;
+        }
+
+        reports += 1;
+    }
+
+    return reports;
+}
+
+/// Returns an i32 row of the name and the value on `line`.
+fn constantRow(line: usize, name: []const u8, value: i64) table.Row {
+    return .{
+        .line = line,
+        .kind = .i32,
+        .name = name,
+        .abi = .any,
+        .value = .{ .integer = value },
+    };
+}
+
+test "the elements of each report run from zero to its length minus one" {
+    const rows = try parseTable();
+    defer testing.allocator.free(rows);
+
+    // The counters report and the job report.
+    try testing.expectEqual(2, try checkReports(rows));
+}
+
+test "a report with a missing, repeated, or outlying element is refused" {
+    const valid = [_]table.Row{
+        constantRow(2, "SAN_A_REPORT_FIRST", 0),
+        constantRow(3, "SAN_A_REPORT_LENGTH", 2),
+        constantRow(4, "SAN_A_REPORT_SECOND", 1),
+        // Neither starts with the report's name and an underscore.
+        constantRow(5, "SAN_A_REPORTED", 7),
+        constantRow(6, "SAN_A_STATUS", 1),
+    };
+
+    try testing.expectEqual(1, try checkReports(&valid));
+    try testing.expectEqual(0, try checkReports(valid[3..]));
+
+    const refused = [_]struct { usize, table.Row }{
+        // A repeated index, which leaves another one missing.
+        .{ 2, constantRow(4, "SAN_A_REPORT_SECOND", 0) },
+        // An index at the length, and one below zero.
+        .{ 2, constantRow(4, "SAN_A_REPORT_SECOND", 2) },
+        .{ 0, constantRow(2, "SAN_A_REPORT_FIRST", -1) },
+        // A length that leaves an element out, and one that lacks one.
+        .{ 1, constantRow(3, "SAN_A_REPORT_LENGTH", 1) },
+        .{ 1, constantRow(3, "SAN_A_REPORT_LENGTH", 3) },
+        // An element that the report's prefix claims.
+        .{ 3, constantRow(5, "SAN_A_REPORT_THIRD", 7) },
+    };
+
+    for (refused) |case| {
+        var rows = valid;
+
+        rows[case[0]] = case[1];
+
+        try testing.expectError(error.ReportIndex, checkReports(&rows));
+    }
+
+    var negative = valid;
+
+    negative[1] = constantRow(3, "SAN_A_REPORT_LENGTH", -1);
+
+    try testing.expectError(error.ReportLength, checkReports(&negative));
+
+    // An element is an i32 row, also with an index that would fit.
+    var wide = valid;
+
+    wide[2].kind = .i64;
+
+    try testing.expectError(error.ReportIndex, checkReports(&wide));
+}
+
 test "every translated typedef and field has a type row" {
     const rows = try parseTable();
     defer testing.allocator.free(rows);

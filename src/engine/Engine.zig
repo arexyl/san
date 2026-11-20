@@ -29,18 +29,44 @@ const Engine = @This();
 /// The engine's heap. Its first block holds this engine.
 heap: Heap,
 
-/// The limits of an engine, as `san_engine_limits` carries them.
+/// The limits of an engine, under the names of `san_engine_limits`, each
+/// in the unit that its name ends in.
 pub const Limits = struct {
-    /// The aggregate budget of every native resource, in bytes.
     aggregate_budget_bytes: i64,
+    content_count: i64,
+    job_count: i64,
+    content_length_bytes: i64,
+    input_portion_bytes: i64,
+    image_axis_pixels: i64,
+    image_area_pixels: i64,
+    metadata_bytes: i64,
+    metadata_expanded_bytes: i64,
+    metadata_payload_bytes: i64,
+    held_chunk_bytes: i64,
+    icc_tag_count: i64,
+    exif_entry_count: i64,
+    output_bytes: i64,
+    output_lease_bytes: i64,
+    output_lease_count: i64,
+
+    pub const names = @typeInfo(Limits).@"struct".field_names;
+
+    /// Reports whether every limit admits something: none is below 1.
+    fn admitWork(limits: Limits) bool {
+        inline for (names) |name| {
+            if (@field(limits, name) < 1) return false;
+        }
+
+        return true;
+    }
 };
 
 /// The failures of creation, by category.
 pub const CreateError = error{
     /// The binding of the process is not established.
     BindingMismatch,
-    /// The limits cannot admit the engine's own state, or another engine
-    /// holds the slot.
+    /// A limit is below 1, the limits cannot admit the engine's own
+    /// state, or another engine holds the slot.
     BudgetExceeded,
     /// The backing failed to allocate the engine's own state.
     AllocationFailed,
@@ -62,6 +88,7 @@ pub fn create(
     limits: Limits,
 ) CreateError!Handle {
     if (!binding.established()) return error.BindingMismatch;
+    if (!limits.admitWork()) return error.BudgetExceeded;
 
     const budget: Ledger.Budget = try .init(limits.aggregate_budget_bytes);
 
@@ -86,10 +113,10 @@ pub fn create(
 
 /// Advances the shutdown of the engine of `handle`. A shutdown stops
 /// admission first and releases the engine's resources only after their
-/// holders return them. The pinned header defines no contexts, jobs,
-/// publications, or leases, so the first call completes the shutdown: it
-/// stops admission, releases the engine's state, and releases the slot.
-/// The handle is invalid from then on.
+/// holders return them. The engine admits no content, job, or lease, so
+/// the first call completes the shutdown: it stops admission, releases
+/// the engine's state, and releases the slot. The handle is invalid from
+/// then on.
 pub fn shutdown(slot: *Slot, handle: Handle) error{InvalidHandle}!void {
     const engine = try slot.close(handle);
 
@@ -163,8 +190,7 @@ pub const Handle = enum(u64) {
         unused: u24 = 0,
     };
 
-    /// The type tag of a handle. The pinned header defines only engine
-    /// handles.
+    /// The type tag of a handle. San issues only engine handles.
     const Tag = enum(u8) {
         engine = 1,
         _,
@@ -306,7 +332,25 @@ const testing = std.testing;
 const TestBacking = Heap.TestBacking;
 
 /// Limits that admit every engine of the tests below.
-const roomy: Limits = .{ .aggregate_budget_bytes = 1 << 20 };
+const roomy: Limits = uniform(1 << 20);
+
+/// Returns limits that all hold `value`.
+fn uniform(value: i64) Limits {
+    var limits: Limits = undefined;
+
+    inline for (Limits.names) |name| @field(limits, name) = value;
+
+    return limits;
+}
+
+/// Returns the roomy limits with an aggregate budget of `bytes`.
+fn budgeted(bytes: i64) Limits {
+    var limits = roomy;
+
+    limits.aggregate_budget_bytes = bytes;
+
+    return limits;
+}
 
 /// The binding flag and the slot of a process in a test.
 const Process = struct {
@@ -415,9 +459,7 @@ test "limits that admit nothing fail as BudgetExceeded" {
 
         try testing.expectError(
             error.BudgetExceeded,
-            process.createEngine(test_backing.backing(), .{
-                .aggregate_budget_bytes = bytes,
-            }),
+            process.createEngine(test_backing.backing(), budgeted(bytes)),
         );
 
         try testing.expectEqual(0, test_backing.peak);
@@ -427,14 +469,43 @@ test "limits that admit nothing fail as BudgetExceeded" {
     try expectAdmits(&process, roomy);
 }
 
+test "each limit below 1 fails as BudgetExceeded" {
+    var process: Process = .init();
+
+    inline for (Limits.names) |name| {
+        for ([_]i64{ 0, -1, std.math.minInt(i64) }) |value| {
+            var test_backing: TestBacking = .init(testing.allocator);
+            var limits = roomy;
+
+            @field(limits, name) = value;
+
+            try testing.expectError(
+                error.BudgetExceeded,
+                process.createEngine(test_backing.backing(), limits),
+            );
+
+            try testing.expectEqual(0, test_backing.peak);
+            try expectFree(&process.slot, 0);
+        }
+    }
+
+    var smallest = uniform(1);
+
+    smallest.aggregate_budget_bytes = footprint;
+
+    try expectAdmits(&process, smallest);
+    try expectAdmits(&process, uniform(std.math.maxInt(i64)));
+}
+
 test "the engine's own state counts against its budget" {
     var process: Process = .init();
 
     var test_backing: TestBacking = .init(testing.allocator);
 
-    const handle = try process.createEngine(test_backing.backing(), .{
-        .aggregate_budget_bytes = footprint,
-    });
+    const handle = try process.createEngine(
+        test_backing.backing(),
+        budgeted(footprint),
+    );
 
     const engine = try resolve(&process.slot, handle);
 
@@ -451,9 +522,10 @@ test "the largest int64 budget admits the engine" {
 
     var test_backing: TestBacking = .init(testing.allocator);
 
-    const handle = try process.createEngine(test_backing.backing(), .{
-        .aggregate_budget_bytes = std.math.maxInt(i64),
-    });
+    const handle = try process.createEngine(
+        test_backing.backing(),
+        budgeted(std.math.maxInt(i64)),
+    );
 
     const engine = try resolve(&process.slot, handle);
 

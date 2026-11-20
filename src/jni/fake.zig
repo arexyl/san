@@ -5,19 +5,32 @@
 //! against these.
 //!
 //! An environment records what the layer did with it: the class that it
-//! looked up, the methods that it registered, and each call that it made
-//! while an exception was pending, which JNI forbids for every function
-//! here except the two that inspect and clear the exception.
+//! looked up, the methods that it registered, the critical regions that
+//! it entered and left, and each call that JNI forbids. JNI forbids a
+//! call while an exception is pending, for every function here except
+//! the two that inspect and clear the exception, and it forbids every
+//! call inside a critical region except the one that leaves the region.
 
 const std = @import("std");
 const jni = @import("jni");
 
-/// A Java `long[]`. A `jlongArray` of the tests is a pointer to one.
-pub const LongArray = struct {
-    items: []jni.jlong,
+/// A Java primitive array. A `jarray` of the tests is a pointer to one.
+pub const Array = union(enum) {
+    longs: []jni.jlong,
+    bytes: []jni.jbyte,
 
-    pub fn object(array: *LongArray) jni.jlongArray {
+    pub fn object(array: *Array) jni.jarray {
         return array;
+    }
+
+    fn of(reference: jni.jarray) *Array {
+        return @ptrCast(@alignCast(reference.?));
+    }
+
+    fn len(array: Array) usize {
+        return switch (array) {
+            inline else => |items| items.len,
+        };
     }
 };
 
@@ -33,13 +46,25 @@ pub const Env = struct {
     /// exception pending and the methods registered, as a part of them
     /// would be.
     register_status: jni.jint = jni.JNI_OK,
+    /// Whether the VM provides the elements of an array. A refusal
+    /// leaves an exception pending, as an OutOfMemoryError would be.
+    elements_available: bool = true,
 
     /// The name of the class of the latest lookup.
     looked_up: ?[*:0]const u8 = null,
     /// The registered methods, or null when none is registered.
     registered: ?[]const jni.JNINativeMethod = null,
     pending: bool = false,
-    /// The calls that the layer made while an exception was pending.
+    /// The array of the open critical region, or null outside one.
+    critical: ?*const Array = null,
+    /// The elements that the open critical region handed out.
+    critical_elements: ?*anyopaque = null,
+    /// The critical regions that the layer entered.
+    critical_regions: u32 = 0,
+    /// The release mode of the latest critical region that it left.
+    release_mode: ?jni.jint = null,
+    /// The calls that the layer made while an exception was pending or
+    /// inside a critical region.
     forbidden_calls: u32 = 0,
     unregistrations: u32 = 0,
 
@@ -71,11 +96,12 @@ pub const Env = struct {
     }
 
     /// Returns the environment of a call that JNI forbids while an
-    /// exception is pending, and counts the call when one is.
+    /// exception is pending and inside a critical region, and counts the
+    /// call when either holds.
     fn entered(pointer_to_functions: [*c]jni.JNIEnv) *Env {
         const env = of(pointer_to_functions);
 
-        if (env.pending) env.forbidden_calls += 1;
+        if (env.pending or env.critical != null) env.forbidden_calls += 1;
 
         return env;
     }
@@ -108,6 +134,8 @@ const native_functions: jni.JNINativeInterface = std.mem.zeroInit(
         .UnregisterNatives = unregisterNatives,
         .GetArrayLength = getArrayLength,
         .SetLongArrayRegion = setLongArrayRegion,
+        .GetPrimitiveArrayCritical = getPrimitiveArrayCritical,
+        .ReleasePrimitiveArrayCritical = releasePrimitiveArrayCritical,
     },
 );
 
@@ -154,11 +182,19 @@ fn findClass(
 fn exceptionCheck(
     pointer_to_functions: [*c]jni.JNIEnv,
 ) callconv(.c) jni.jboolean {
-    return @intFromBool(Env.of(pointer_to_functions).pending);
+    const env = Env.of(pointer_to_functions);
+
+    if (env.critical != null) env.forbidden_calls += 1;
+
+    return @intFromBool(env.pending);
 }
 
 fn exceptionClear(pointer_to_functions: [*c]jni.JNIEnv) callconv(.c) void {
-    Env.of(pointer_to_functions).pending = false;
+    const env = Env.of(pointer_to_functions);
+
+    if (env.critical != null) env.forbidden_calls += 1;
+
+    env.pending = false;
 }
 
 fn registerNatives(
@@ -194,9 +230,7 @@ fn getArrayLength(
 ) callconv(.c) jni.jsize {
     _ = Env.entered(pointer_to_functions);
 
-    const long_array: *const LongArray = @ptrCast(@alignCast(array.?));
-
-    return @intCast(long_array.items.len);
+    return @intCast(Array.of(array).len());
 }
 
 fn setLongArrayRegion(
@@ -208,17 +242,63 @@ fn setLongArrayRegion(
 ) callconv(.c) void {
     const env = Env.entered(pointer_to_functions);
 
-    const long_array: *const LongArray = @ptrCast(@alignCast(array.?));
+    const items = Array.of(array).longs;
 
     const first: usize = @intCast(start);
     const count: usize = @intCast(len);
 
     // A real VM throws ArrayIndexOutOfBoundsException here.
-    if (first + count > long_array.items.len) {
+    if (first + count > items.len) {
         env.pending = true;
 
         return;
     }
 
-    @memcpy(long_array.items[first..][0..count], buffer[0..count]);
+    @memcpy(items[first..][0..count], buffer[0..count]);
+}
+
+fn getPrimitiveArrayCritical(
+    pointer_to_functions: [*c]jni.JNIEnv,
+    array: jni.jarray,
+    _: [*c]jni.jboolean,
+) callconv(.c) ?*anyopaque {
+    const env = Env.entered(pointer_to_functions);
+
+    if (!env.elements_available) {
+        env.pending = true;
+
+        return null;
+    }
+
+    const entered = Array.of(array);
+
+    env.critical = entered;
+    env.critical_regions += 1;
+
+    env.critical_elements = switch (entered.*) {
+        inline else => |items| items.ptr,
+    };
+
+    return env.critical_elements;
+}
+
+/// Leaves the critical region. A release of another array or of other
+/// elements than the region handed out counts as a forbidden call.
+fn releasePrimitiveArrayCritical(
+    pointer_to_functions: [*c]jni.JNIEnv,
+    array: jni.jarray,
+    elements: ?*anyopaque,
+    mode: jni.jint,
+) callconv(.c) void {
+    const env = Env.of(pointer_to_functions);
+
+    if (env.critical != Array.of(array) or
+        env.critical_elements != elements)
+    {
+        env.forbidden_calls += 1;
+    }
+
+    env.critical = null;
+    env.critical_elements = null;
+    env.release_mode = mode;
 }

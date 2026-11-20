@@ -9,7 +9,10 @@
 //! one for every function that the translation declares, so a function
 //! that drifts from the pinned header fails the compile.
 //!
-//! The pinned header declares the engine lifecycle only.
+//! San implements the engine lifecycle. It issues no content, job, or
+//! lease handle, so each function that takes one rejects every handle.
+//! san_engine_counters and san_content_open check their arguments and
+//! then fail as SAN_STATUS_ENGINE_FAILURE.
 
 const std = @import("std");
 const san = @import("san");
@@ -40,6 +43,75 @@ pub export fn san_engine_create(
 
 pub export fn san_engine_shutdown(engine: san.san_handle) san.san_status {
     return shutdown(&process, engine);
+}
+
+pub export fn san_engine_counters(
+    engine: san.san_handle,
+    reset_peak: i32,
+    _: [*c]i64,
+) san.san_status {
+    return counters(&process, engine, reset_peak);
+}
+
+pub export fn san_content_open(
+    engine: san.san_handle,
+    content: [*c]san.san_handle,
+) san.san_status {
+    return openContent(&process, engine, content);
+}
+
+pub export fn san_content_feed(
+    _: san.san_handle,
+    _: i64,
+    _: [*c]const u8,
+    _: i32,
+    _: i32,
+) san.san_status {
+    return san.SAN_STATUS_INVALID_HANDLE;
+}
+
+pub export fn san_content_close(_: san.san_handle) san.san_status {
+    return san.SAN_STATUS_INVALID_HANDLE;
+}
+
+pub export fn san_job_request(
+    _: san.san_handle,
+    _: [*c]const san.san_output_request,
+    job: [*c]san.san_handle,
+) san.san_status {
+    job.* = san.SAN_NO_HANDLE;
+
+    return san.SAN_STATUS_INVALID_HANDLE;
+}
+
+pub export fn san_job_step(_: san.san_handle, _: [*c]i64) san.san_status {
+    return san.SAN_STATUS_INVALID_HANDLE;
+}
+
+pub export fn san_job_cancel(_: san.san_handle) san.san_status {
+    return san.SAN_STATUS_INVALID_HANDLE;
+}
+
+pub export fn san_job_release(_: san.san_handle) san.san_status {
+    return san.SAN_STATUS_INVALID_HANDLE;
+}
+
+pub export fn san_output_copy(
+    _: san.san_handle,
+    _: i32,
+    _: i32,
+    _: [*c]u8,
+    _: i32,
+    _: i32,
+    _: i32,
+    _: i32,
+    _: i32,
+) san.san_status {
+    return san.SAN_STATUS_INVALID_HANDLE;
+}
+
+pub export fn san_output_release(_: san.san_handle) san.san_status {
+    return san.SAN_STATUS_INVALID_HANDLE;
 }
 
 comptime {
@@ -111,25 +183,92 @@ fn create(
 ) san.san_status {
     out.* = san.SAN_NO_HANDLE;
 
-    const handle = Engine.create(&state.binding, &state.slot, backing, .{
-        .aggregate_budget_bytes = limits.aggregate_budget_bytes,
-    }) catch |err| return statusOf(err);
+    const handle = Engine.create(
+        &state.binding,
+        &state.slot,
+        backing,
+        engineLimits(limits),
+    ) catch |err| return statusOf(err);
 
     out.* = @bitCast(@backingInt(handle));
 
     return san.SAN_STATUS_OK;
 }
 
-fn shutdown(state: *Process, engine: san.san_handle) san.san_status {
-    const handle: Engine.Handle = @fromBackingInt(@as(u64, @bitCast(engine)));
+/// Returns the limits of the header as the engine module takes them.
+fn engineLimits(limits: san.san_engine_limits) Engine.Limits {
+    var converted: Engine.Limits = undefined;
 
-    Engine.shutdown(&state.slot, handle) catch |err| return statusOf(err);
+    inline for (Engine.Limits.names) |name| {
+        @field(converted, name) = @field(limits, name);
+    }
+
+    return converted;
+}
+
+comptime {
+    const declared = @typeInfo(san.san_engine_limits).@"struct".field_names;
+
+    // The conversion reads every limit of the engine module from the
+    // header's struct, so equal counts leave no limit of the header out.
+    if (declared.len != Engine.Limits.names.len) {
+        @compileError("san_engine_limits and the engine module name " ++
+            "different limits");
+    }
+}
+
+fn shutdown(state: *Process, engine: san.san_handle) san.san_status {
+    Engine.shutdown(&state.slot, engineHandle(engine)) catch |err| {
+        return statusOf(err);
+    };
 
     return san.SAN_STATUS_OK;
 }
 
+/// Checks the arguments of a counters read in `state`, in the order of
+/// the header.
+fn counters(
+    state: *Process,
+    engine: san.san_handle,
+    reset_peak: i32,
+) san.san_status {
+    const resolved = Engine.resolve(&state.slot, engineHandle(engine));
+
+    if (resolved) |_| {} else |err| switch (err) {
+        error.InvalidHandle => return san.SAN_STATUS_INVALID_HANDLE,
+        // The read works while the engine shuts down.
+        error.Closed => {},
+    }
+
+    if (reset_peak != 0 and reset_peak != 1) {
+        return san.SAN_STATUS_BINDING_MISMATCH;
+    }
+
+    return san.SAN_STATUS_ENGINE_FAILURE;
+}
+
+/// Checks the engine of a content opening in `state` and writes
+/// SAN_NO_HANDLE to `out`.
+fn openContent(
+    state: *Process,
+    engine: san.san_handle,
+    out: *san.san_handle,
+) san.san_status {
+    out.* = san.SAN_NO_HANDLE;
+
+    _ = Engine.resolve(&state.slot, engineHandle(engine)) catch |err| {
+        return statusOf(err);
+    };
+
+    return san.SAN_STATUS_ENGINE_FAILURE;
+}
+
+fn engineHandle(engine: san.san_handle) Engine.Handle {
+    return @fromBackingInt(@as(u64, @bitCast(engine)));
+}
+
 /// A failure of the engine module that a function above can meet.
-const Failure = Engine.CreateError || error{InvalidHandle};
+const Failure = Engine.CreateError || error{ InvalidHandle, Closed };
 
 /// Returns the status of `failure`. Each category of the engine module
 /// has the status of the same name.
@@ -140,6 +279,7 @@ fn statusOf(failure: Failure) san.san_status {
         error.AllocationFailed => san.SAN_STATUS_ALLOCATION_FAILED,
         error.EngineFailure => san.SAN_STATUS_ENGINE_FAILURE,
         error.InvalidHandle => san.SAN_STATUS_INVALID_HANDLE,
+        error.Closed => san.SAN_STATUS_CLOSED,
     };
 }
 
@@ -147,7 +287,16 @@ const testing = std.testing;
 const TestBacking = Heap.TestBacking;
 
 /// Limits that admit every engine of the tests below.
-const roomy: san.san_engine_limits = .{ .aggregate_budget_bytes = 1 << 20 };
+const roomy: san.san_engine_limits = uniform(1 << 20);
+
+/// Returns limits that all hold `value`.
+fn uniform(value: i64) san.san_engine_limits {
+    var limits: san.san_engine_limits = undefined;
+
+    inline for (Engine.Limits.names) |name| @field(limits, name) = value;
+
+    return limits;
+}
 
 /// A value that no creation writes, so that a test sees whether a call
 /// wrote its output.
@@ -223,11 +372,151 @@ test "limits that admit nothing fail as BudgetExceeded" {
     var state = established();
 
     for ([_]i64{ 0, -1, std.math.minInt(i64), 1 }) |bytes| {
-        try expectRefused(
-            &state,
-            .{ .aggregate_budget_bytes = bytes },
-            san.SAN_STATUS_BUDGET_EXCEEDED,
+        var limits = roomy;
+
+        limits.aggregate_budget_bytes = bytes;
+
+        try expectRefused(&state, limits, san.SAN_STATUS_BUDGET_EXCEEDED);
+    }
+}
+
+test "each limit of the header reaches the engine" {
+    var state = established();
+
+    inline for (Engine.Limits.names) |name| {
+        var limits = roomy;
+
+        @field(limits, name) = 0;
+
+        try expectRefused(&state, limits, san.SAN_STATUS_BUDGET_EXCEEDED);
+    }
+
+    inline for (Engine.Limits.names, 0..) |name, index| {
+        var limits = uniform(0);
+
+        @field(limits, name) = 1 << 20;
+
+        const converted = engineLimits(limits);
+
+        inline for (Engine.Limits.names, 0..) |other, other_index| {
+            const expected: i64 = if (index == other_index) 1 << 20 else 0;
+
+            try testing.expectEqual(expected, @field(converted, other));
+        }
+    }
+}
+
+test "the counters read and the content opening check their arguments" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+    var engine = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        create(&state, test_backing.backing(), roomy, &engine),
+    );
+
+    const invalid = [_]san.san_handle{
+        san.SAN_NO_HANDLE,
+        engine + 1,
+        unwritten,
+    };
+
+    for (invalid) |handle| {
+        var content = unwritten;
+
+        // The handle decides before the flag does.
+        try testing.expectEqual(
+            san.SAN_STATUS_INVALID_HANDLE,
+            counters(&state, handle, 2),
         );
+
+        try testing.expectEqual(
+            san.SAN_STATUS_INVALID_HANDLE,
+            openContent(&state, handle, &content),
+        );
+
+        try testing.expectEqual(san.SAN_NO_HANDLE, content);
+    }
+
+    for ([_]i32{ 2, -1, std.math.maxInt(i32), std.math.minInt(i32) }) |flag| {
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            counters(&state, engine, flag),
+        );
+    }
+
+    for ([_]i32{ 0, 1 }) |flag| {
+        try testing.expectEqual(
+            san.SAN_STATUS_ENGINE_FAILURE,
+            counters(&state, engine, flag),
+        );
+    }
+
+    var content = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        openContent(&state, engine, &content),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, content);
+
+    // No call kept anything: the engine holds its own state alone.
+    try testing.expectEqual(1, test_backing.blocks);
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        counters(&state, engine, 0),
+    );
+}
+
+test "every content, job, and lease handle is invalid" {
+    const request: san.san_output_request = .{
+        .left = 0,
+        .top = 0,
+        .right = 0,
+        .bottom = 0,
+        .max_output_width = 0,
+    };
+
+    const byte: u8 = 0;
+
+    const handles = [_]san.san_handle{
+        san.SAN_NO_HANDLE,
+        1,
+        -1,
+        unwritten,
+        std.math.minInt(i64),
+    };
+
+    for (handles) |handle| {
+        var job = unwritten;
+        var report: [san.SAN_JOB_REPORT_LENGTH]i64 = @splat(unwritten);
+        var pixel: [4]u8 = @splat(0x5a);
+
+        const statuses = [_]san.san_status{
+            san_content_feed(handle, 0, &byte, 1, 0),
+            san_content_close(handle),
+            san_job_request(handle, &request, &job),
+            san_job_step(handle, &report),
+            san_job_cancel(handle),
+            san_job_release(handle),
+            san_output_copy(handle, 0, 1, &pixel, 1, 1, 4, 0, 0),
+            san_output_release(handle),
+        };
+
+        for (statuses) |status| {
+            try testing.expectEqual(san.SAN_STATUS_INVALID_HANDLE, status);
+        }
+
+        try testing.expectEqual(san.SAN_NO_HANDLE, job);
+        try testing.expectEqual(@as([4]u8, @splat(0x5a)), pixel);
+
+        for (report) |element| try testing.expectEqual(unwritten, element);
     }
 }
 
@@ -336,6 +625,7 @@ test "each failure has the status of its category" {
         .{ error.AllocationFailed, san.SAN_STATUS_ALLOCATION_FAILED },
         .{ error.EngineFailure, san.SAN_STATUS_ENGINE_FAILURE },
         .{ error.InvalidHandle, san.SAN_STATUS_INVALID_HANDLE },
+        .{ error.Closed, san.SAN_STATUS_CLOSED },
     };
 
     try testing.expectEqual(
@@ -386,6 +676,23 @@ test "the exported functions run the lifecycle of the process" {
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, second);
+
+    var counted: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(unwritten);
+    var content = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        san_engine_counters(engine, 0, &counted),
+    );
+
+    for (counted) |element| try testing.expectEqual(unwritten, element);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        san_content_open(engine, &content),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, content);
     try testing.expectEqual(san.SAN_STATUS_OK, san_engine_shutdown(engine));
 
     try testing.expectEqual(
