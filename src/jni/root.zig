@@ -805,21 +805,38 @@ test "the methods convert their arguments and run the lifecycle" {
 
     try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
 
-    // The read of a live engine fails without a counter. Every value of
-    // the flag reaches the C ABI as 0 or 1, which rejects any other.
+    // The read of a live engine writes every counter. Every value of the
+    // flag reaches the C ABI as 0 or 1, which rejects any other.
     var counted: [san.SAN_ENGINE_COUNTERS_LENGTH]jni.jlong = @splat(unwritten);
     var counted_array: fake.Array = .{ .longs = &counted };
 
     const flags = [_]jni.jboolean{ jni.JNI_FALSE, jni.JNI_TRUE, 2, 0xff };
 
     for (flags) |reset_peak| {
+        counted = @splat(unwritten);
+
         try testing.expectEqual(
-            san.SAN_STATUS_ENGINE_FAILURE,
+            san.SAN_STATUS_OK,
             counters(jenv, null, engine, reset_peak, counted_array.object()),
         );
-    }
 
-    for (counted) |element| try testing.expectEqual(unwritten, element);
+        for (counted) |element| try testing.expect(element != unwritten);
+
+        // The engine's own state is its one block, of the metadata kind.
+        const live = counted[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
+
+        try testing.expect(live > 0);
+
+        try testing.expectEqual(
+            live,
+            counted[san.SAN_ENGINE_COUNTERS_METADATA_BYTES],
+        );
+
+        try testing.expectEqual(
+            0,
+            counted[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT],
+        );
+    }
 
     elements[0] = unwritten;
 

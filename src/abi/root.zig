@@ -9,10 +9,10 @@
 //! one for every function that the translation declares, so a function
 //! that drifts from the pinned header fails the compile.
 //!
-//! San implements the engine lifecycle. It issues no content, job, or
-//! lease handle, so each function that takes one rejects every handle.
-//! san_engine_counters and san_content_open check their arguments and
-//! then fail as SAN_STATUS_ENGINE_FAILURE.
+//! San implements the engine lifecycle and the counters read. It issues
+//! no content, job, or lease handle, so each function that takes one
+//! rejects every handle, and san_content_open checks its engine and then
+//! fails as SAN_STATUS_ENGINE_FAILURE.
 
 const std = @import("std");
 const san = @import("san");
@@ -48,9 +48,14 @@ pub export fn san_engine_shutdown(engine: san.san_handle) san.san_status {
 pub export fn san_engine_counters(
     engine: san.san_handle,
     reset_peak: i32,
-    _: [*c]i64,
+    out: [*c]i64,
 ) san.san_status {
-    return counters(&process, engine, reset_peak);
+    return counters(
+        &process,
+        engine,
+        reset_peak,
+        out[0..san.SAN_ENGINE_COUNTERS_LENGTH],
+    );
 }
 
 pub export fn san_content_open(
@@ -225,26 +230,52 @@ fn shutdown(state: *Process, engine: san.san_handle) san.san_status {
     return san.SAN_STATUS_OK;
 }
 
-/// Checks the arguments of a counters read in `state`, in the order of
-/// the header.
+/// The counters report of the header.
+const Counters = [san.SAN_ENGINE_COUNTERS_LENGTH]i64;
+
+/// Writes the counters of an engine of `state` to `out`, then starts
+/// both peaks again when `reset_peak` is 1. The read works while the
+/// engine shuts down, and a failed call writes nothing.
 fn counters(
     state: *Process,
     engine: san.san_handle,
     reset_peak: i32,
+    out: *Counters,
 ) san.san_status {
-    const resolved = Engine.resolve(&state.slot, engineHandle(engine));
-
-    if (resolved) |_| {} else |err| switch (err) {
-        error.InvalidHandle => return san.SAN_STATUS_INVALID_HANDLE,
-        // The read works while the engine shuts down.
-        error.Closed => {},
-    }
+    const found = Engine.resolveClosing(
+        &state.slot,
+        engineHandle(engine),
+    ) catch |err| return statusOf(err);
 
     if (reset_peak != 0 and reset_peak != 1) {
         return san.SAN_STATUS_BINDING_MISMATCH;
     }
 
-    return san.SAN_STATUS_ENGINE_FAILURE;
+    const ledger = &found.heap.ledger;
+    const usage = ledger.usage;
+
+    // San admits no content, job, or lease, so their counts are 0.
+    out.* = @splat(0);
+    out[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] = reported(usage.live);
+    out[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES] = reported(usage.reserved);
+    out[san.SAN_ENGINE_COUNTERS_PEAK_LIVE_BYTES] = reported(usage.peak);
+
+    out[san.SAN_ENGINE_COUNTERS_PEAK_COMMITTED_BYTES] =
+        reported(usage.peak_committed);
+
+    out[san.SAN_ENGINE_COUNTERS_INPUT_BYTES] = reported(usage.input);
+    out[san.SAN_ENGINE_COUNTERS_METADATA_BYTES] = reported(usage.metadata);
+    out[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] = reported(usage.output);
+
+    if (reset_peak == 1) ledger.resetPeaks();
+
+    return san.SAN_STATUS_OK;
+}
+
+/// Returns a count of the ledger as a report carries it. The aggregate
+/// budget bounds every count, and it fits an int64.
+fn reported(count: u64) i64 {
+    return @intCast(count);
 }
 
 /// Checks the engine of a content opening in `state` and writes
@@ -406,7 +437,176 @@ test "each limit of the header reaches the engine" {
     }
 }
 
-test "the counters read and the content opening check their arguments" {
+/// A report that no read has written.
+const unread: Counters = @splat(unwritten);
+
+/// Returns the counters report of the given ledger counts, with every
+/// count of contents, jobs, and leases at 0.
+fn countersOf(counts: struct {
+    live: u64,
+    reserved: u64 = 0,
+    peak: u64,
+    peak_committed: u64,
+    metadata: u64,
+    output: u64 = 0,
+}) Counters {
+    var report: Counters = @splat(0);
+
+    report[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] = reported(counts.live);
+    report[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES] = reported(counts.reserved);
+    report[san.SAN_ENGINE_COUNTERS_PEAK_LIVE_BYTES] = reported(counts.peak);
+
+    report[san.SAN_ENGINE_COUNTERS_PEAK_COMMITTED_BYTES] =
+        reported(counts.peak_committed);
+
+    report[san.SAN_ENGINE_COUNTERS_METADATA_BYTES] = reported(counts.metadata);
+    report[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] = reported(counts.output);
+
+    return report;
+}
+
+test "the counters read checks its handle, then its flag, and writes nothing" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+    var engine = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        create(&state, test_backing.backing(), roomy, &engine),
+    );
+
+    var report = unread;
+
+    const invalid = [_]san.san_handle{
+        san.SAN_NO_HANDLE,
+        engine + 1,
+        unwritten,
+    };
+
+    // The handle decides before the flag does.
+    for (invalid) |handle| {
+        try testing.expectEqual(
+            san.SAN_STATUS_INVALID_HANDLE,
+            counters(&state, handle, 2, &report),
+        );
+    }
+
+    const flags = [_]i32{ 2, -1, std.math.maxInt(i32), std.math.minInt(i32) };
+
+    for (flags) |flag| {
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            counters(&state, engine, flag, &report),
+        );
+    }
+
+    try testing.expectEqual(unread, report);
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        counters(&state, engine, 0, &report),
+    );
+
+    try testing.expectEqual(unread, report);
+}
+
+test "the counters read reports the ledger and resets the peaks on request" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+    var handle = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        create(&state, test_backing.backing(), roomy, &handle),
+    );
+
+    // The engine's own state is its one block, of the metadata kind.
+    const own = test_backing.outstanding;
+
+    var report = unread;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        counters(&state, handle, 0, &report),
+    );
+
+    try testing.expectEqual(countersOf(.{
+        .live = own,
+        .peak = own,
+        .peak_committed = own,
+        .metadata = own,
+    }), report);
+
+    const engine = try Engine.resolve(&state.slot, engineHandle(handle));
+
+    // An output block of 64 bytes from a reservation of 256, and a codec
+    // block of 32 bytes. Each block has a header of 16 bytes.
+    var reservation = try engine.heap.ledger.reserve(.output, 256);
+
+    const output = engine.heap.allocReserved(&reservation, 64).?;
+
+    const codec = engine.heap.alloc(32).?;
+
+    const busy = countersOf(.{
+        .live = own + 80 + 48,
+        .reserved = 176,
+        .peak = own + 80 + 48,
+        .peak_committed = own + 256 + 48,
+        .metadata = own,
+        .output = 80,
+    });
+
+    // A read without a reset changes no peak.
+    for (0..2) |_| {
+        report = unread;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            counters(&state, handle, 0, &report),
+        );
+
+        try testing.expectEqual(busy, report);
+    }
+
+    engine.heap.free(codec);
+    engine.heap.ledger.cancel(&reservation);
+
+    // The read with a reset still reports the peaks before it.
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        counters(&state, handle, 1, &report),
+    );
+
+    try testing.expectEqual(countersOf(.{
+        .live = own + 80,
+        .peak = own + 80 + 48,
+        .peak_committed = own + 256 + 48,
+        .metadata = own,
+        .output = 80,
+    }), report);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        counters(&state, handle, 0, &report),
+    );
+
+    try testing.expectEqual(countersOf(.{
+        .live = own + 80,
+        .peak = own + 80,
+        .peak_committed = own + 80,
+        .metadata = own,
+        .output = 80,
+    }), report);
+
+    engine.heap.free(output);
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, handle));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "the content opening checks its engine and writes no handle" {
     var state = established();
 
     var test_backing: TestBacking = .init(testing.allocator);
@@ -426,32 +626,12 @@ test "the counters read and the content opening check their arguments" {
     for (invalid) |handle| {
         var content = unwritten;
 
-        // The handle decides before the flag does.
-        try testing.expectEqual(
-            san.SAN_STATUS_INVALID_HANDLE,
-            counters(&state, handle, 2),
-        );
-
         try testing.expectEqual(
             san.SAN_STATUS_INVALID_HANDLE,
             openContent(&state, handle, &content),
         );
 
         try testing.expectEqual(san.SAN_NO_HANDLE, content);
-    }
-
-    for ([_]i32{ 2, -1, std.math.maxInt(i32), std.math.minInt(i32) }) |flag| {
-        try testing.expectEqual(
-            san.SAN_STATUS_BINDING_MISMATCH,
-            counters(&state, engine, flag),
-        );
-    }
-
-    for ([_]i32{ 0, 1 }) |flag| {
-        try testing.expectEqual(
-            san.SAN_STATUS_ENGINE_FAILURE,
-            counters(&state, engine, flag),
-        );
     }
 
     var content = unwritten;
@@ -467,11 +647,6 @@ test "the counters read and the content opening check their arguments" {
     try testing.expectEqual(1, test_backing.blocks);
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
     try testing.expectEqual(0, test_backing.blocks);
-
-    try testing.expectEqual(
-        san.SAN_STATUS_INVALID_HANDLE,
-        counters(&state, engine, 0),
-    );
 }
 
 test "every content, job, and lease handle is invalid" {
@@ -677,15 +852,25 @@ test "the exported functions run the lifecycle of the process" {
 
     try testing.expectEqual(san.SAN_NO_HANDLE, second);
 
-    var counted: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(unwritten);
+    var counted = unread;
     var content = unwritten;
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
+        san.SAN_STATUS_OK,
         san_engine_counters(engine, 0, &counted),
     );
 
-    for (counted) |element| try testing.expectEqual(unwritten, element);
+    // On the system heap, the engine's own state is the one live block.
+    const live = counted[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
+
+    try testing.expect(live > 0);
+
+    try testing.expectEqual(countersOf(.{
+        .live = @intCast(live),
+        .peak = @intCast(live),
+        .peak_committed = @intCast(live),
+        .metadata = @intCast(live),
+    }), counted);
 
     try testing.expectEqual(
         san.SAN_STATUS_ENGINE_FAILURE,

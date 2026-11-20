@@ -182,8 +182,44 @@ fn limits() bool {
     return true;
 }
 
-/// Reports whether the counters read and the content opening of a live
-/// engine check their arguments and then fail without an output.
+/// Reports whether `counters` shows an engine that holds only its own
+/// state: one live block of metadata, which is also both peaks, and no
+/// reservation, input, output, content, job, or lease.
+fn ownStateAlone(counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64) bool {
+    const live = counters[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
+
+    if (live <= 0) return false;
+
+    const equal_to_live = [_]usize{
+        san.SAN_ENGINE_COUNTERS_PEAK_LIVE_BYTES,
+        san.SAN_ENGINE_COUNTERS_PEAK_COMMITTED_BYTES,
+        san.SAN_ENGINE_COUNTERS_METADATA_BYTES,
+    };
+
+    const zero = [_]usize{
+        san.SAN_ENGINE_COUNTERS_RESERVED_BYTES,
+        san.SAN_ENGINE_COUNTERS_INPUT_BYTES,
+        san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES,
+        san.SAN_ENGINE_COUNTERS_CONTENT_COUNT,
+        san.SAN_ENGINE_COUNTERS_JOB_COUNT,
+        san.SAN_ENGINE_COUNTERS_LEASE_COUNT,
+    };
+
+    for (equal_to_live) |index| {
+        if (counters[index] != live) return false;
+    }
+
+    for (zero) |index| {
+        if (counters[index] != 0) return false;
+    }
+
+    return true;
+}
+
+/// Reports whether the counters read of a live engine checks its
+/// arguments and reports the engine's own state on Bionic's heap, and
+/// whether the content opening checks its engine and then fails without
+/// a handle.
 fn engineCalls(engine: san.san_handle) bool {
     var counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(unwritten);
     var content = unwritten;
@@ -194,11 +230,18 @@ fn engineCalls(engine: san.san_handle) bool {
     if (san.san_engine_counters(engine, 2, &counters) !=
         san.SAN_STATUS_BINDING_MISMATCH) return false;
 
-    if (san.san_engine_counters(engine, 1, &counters) !=
-        san.SAN_STATUS_ENGINE_FAILURE) return false;
-
+    // A rejected read writes no counter.
     for (counters) |counter| {
         if (counter != unwritten) return false;
+    }
+
+    // A read with a reset changes no count of an engine whose peaks
+    // equal its live bytes, so the next read reports the same.
+    for (0..2) |_| {
+        if (san.san_engine_counters(engine, 1, &counters) !=
+            san.SAN_STATUS_OK) return false;
+
+        if (!ownStateAlone(counters)) return false;
     }
 
     if (san.san_content_open(engine + 1, &content) !=

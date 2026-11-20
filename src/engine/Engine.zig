@@ -94,7 +94,7 @@ pub fn create(
 
     var heap: Heap = .init(backing, budget);
 
-    var reservation = try heap.ledger.reserve(footprint);
+    var reservation = try heap.ledger.reserve(.metadata, footprint);
     errdefer heap.ledger.cancel(&reservation);
 
     const generation = try slot.claim();
@@ -132,6 +132,30 @@ pub fn resolve(
     slot: *const Slot,
     handle: Handle,
 ) error{ InvalidHandle, Closed }!*Engine {
+    return switch (try heldPhase(slot, handle)) {
+        .live => slot.engine.?,
+        .closing => error.Closed,
+    };
+}
+
+/// Returns the engine of `handle` for a call that works also while the
+/// engine shuts down: a live or a closing engine. Any other handle fails
+/// as InvalidHandle, as in `resolve`.
+pub fn resolveClosing(
+    slot: *const Slot,
+    handle: Handle,
+) error{InvalidHandle}!*Engine {
+    _ = try heldPhase(slot, handle);
+
+    return slot.engine.?;
+}
+
+/// Returns whether the engine of `handle` is live or closing, which are
+/// the phases in which the slot holds an engine.
+fn heldPhase(
+    slot: *const Slot,
+    handle: Handle,
+) error{InvalidHandle}!enum { live, closing } {
     const generation = handle.unpack() orelse return error.InvalidHandle;
 
     const word = slot.load(.acquire);
@@ -139,8 +163,8 @@ pub fn resolve(
     if (word.generation != generation) return error.InvalidHandle;
 
     return switch (word.phase) {
-        .live => slot.engine.?,
-        .closing => error.Closed,
+        .live => .live,
+        .closing => .closing,
         .free, .creating => error.InvalidHandle,
     };
 }
@@ -391,6 +415,7 @@ fn expectInvalid(slot: *Slot, handle: Handle) !void {
     const word = slot.load(.monotonic);
 
     try testing.expectError(error.InvalidHandle, resolve(slot, handle));
+    try testing.expectError(error.InvalidHandle, resolveClosing(slot, handle));
     try testing.expectError(error.InvalidHandle, shutdown(slot, handle));
     try testing.expectEqual(word, slot.load(.monotonic));
 }
@@ -403,10 +428,13 @@ fn expectOwnState(
 ) !void {
     const usage = engine.heap.ledger.usage;
 
-    try testing.expectEqual(
-        Ledger.Usage{ .live = footprint, .reserved = 0, .peak = footprint },
-        usage,
-    );
+    // The engine's own state is metadata.
+    try testing.expectEqual(Ledger.Usage{
+        .live = footprint,
+        .peak = footprint,
+        .peak_committed = footprint,
+        .metadata = footprint,
+    }, usage);
 
     try testing.expectEqual(test_backing.outstanding, usage.live);
     try testing.expectEqual(test_backing.peak, usage.peak);
@@ -594,7 +622,7 @@ test "shutdown completes once the engine's heap settles its other work" {
 
     const engine = try resolve(&process.slot, handle);
 
-    var reservation = try engine.heap.ledger.reserve(256);
+    var reservation = try engine.heap.ledger.reserve(.output, 256);
 
     const reserved = engine.heap.allocReserved(&reservation, 64).?;
 
@@ -671,8 +699,14 @@ test "a handle fails as Closed while its shutdown holds the slot" {
 
     const live = process.slot.load(.monotonic);
 
+    const engine = try resolve(&process.slot, handle);
+
+    try testing.expectEqual(engine, try resolveClosing(&process.slot, handle));
     process.slot.store(.{ .generation = 1, .phase = .closing }, .monotonic);
     try testing.expectError(error.Closed, resolve(&process.slot, handle));
+
+    // A call that works during the shutdown still finds the engine.
+    try testing.expectEqual(engine, try resolveClosing(&process.slot, handle));
     process.slot.store(live, .monotonic);
     try shutdown(&process.slot, handle);
 }

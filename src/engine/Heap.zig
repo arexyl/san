@@ -1,12 +1,14 @@
 //! The accounted heap of one engine. Every block starts with a header of
-//! 16 bytes that holds the requested size, so a release without a size,
-//! such as a codec's, settles exactly. The header keeps the 16-byte
-//! alignment that malloc guarantees on both ABIs, and the ledger counts
-//! it with the requested bytes.
+//! 16 bytes that holds the requested size and the kind of the block, so
+//! a release without either, such as a codec's, settles exactly. The
+//! header keeps the 16-byte alignment that malloc guarantees on both
+//! ABIs, and the ledger counts it with the requested bytes.
 //!
 //! The heap has two views: a std.mem.Allocator for Zig code, and `alloc`
 //! and `free` without a size for the allocation callbacks of the codecs.
-//! Both admit a block in the ledger before the backing allocates it.
+//! Both admit a block in the ledger before the backing allocates it, and
+//! both allocate codec state and workspace. A block of another kind
+//! comes from a reservation of that kind.
 //! When the heap refuses a block, it records the cause, the budget or the
 //! backing, so that a caller who sees only a null pointer or
 //! error.OutOfMemory reports the right category.
@@ -38,6 +40,7 @@ pub const Refusal = error{ BudgetExceeded, AllocationFailed };
 const Header = struct {
     /// The requested size, without the header.
     size: usize,
+    kind: Ledger.Kind,
 };
 
 comptime {
@@ -100,23 +103,24 @@ pub fn accounted(size: usize) ?u64 {
     return std.math.add(u64, size, header_size) catch null;
 }
 
-/// Returns `size` bytes aligned to 16 that the budget admits directly,
-/// or null after it records the cause of the refusal.
+/// Returns `size` bytes of codec state or workspace, aligned to 16, that
+/// the budget admits directly, or null after it records the cause of the
+/// refusal.
 pub fn alloc(heap: *Heap, size: usize) ?[*]align(header_size) u8 {
     const bytes = accounted(size) orelse
         return heap.refuse(error.BudgetExceeded);
 
-    var reservation = heap.ledger.reserve(bytes) catch |err|
+    var reservation = heap.ledger.reserve(.codec, bytes) catch |err|
         return heap.refuse(err);
     defer heap.ledger.cancel(&reservation);
 
     return heap.allocReserved(&reservation, size);
 }
 
-/// Returns `size` bytes aligned to 16 from what `reservation` holds, or
-/// null after it records the cause of the refusal. A block beyond the
-/// reservation is refused as BudgetExceeded, and a failed backing leaves
-/// the reservation intact.
+/// Returns `size` bytes aligned to 16 from what `reservation` holds, as
+/// a block of its kind, or null after it records the cause of the
+/// refusal. A block beyond the reservation is refused as BudgetExceeded,
+/// and a failed backing leaves the reservation intact.
 pub fn allocReserved(
     heap: *Heap,
     reservation: *Ledger.Reservation,
@@ -131,7 +135,7 @@ pub fn allocReserved(
         return heap.refuse(error.AllocationFailed);
 
     heap.ledger.convert(reservation, bytes);
-    headerOf(block).* = .{ .size = size };
+    headerOf(block).* = .{ .size = size, .kind = reservation.kind };
 
     return block + header_size;
 }
@@ -230,10 +234,11 @@ fn releaseSized(heap: *Heap, memory: []u8) error{SizeMismatch}!void {
 }
 
 fn release(heap: *Heap, block: [*]align(header_size) u8) void {
-    const bytes = accounted(headerOf(block).size).?;
+    const header = headerOf(block).*;
+    const bytes = accounted(header.size).?;
 
     heap.backing.vtable.free(heap.backing.ptr, block, bytes);
-    heap.ledger.release(bytes);
+    heap.ledger.release(header.kind, bytes);
 }
 
 fn blockOf(memory: [*]align(header_size) u8) [*]align(header_size) u8 {
@@ -331,7 +336,12 @@ test "a block carries its header in the budget and keeps 16-byte alignment" {
     }
 
     try testing.expectEqual(0, test_backing.blocks);
-    try testing.expectEqual(Ledger.Usage{ .peak = 4241 }, heap.ledger.usage);
+
+    try testing.expectEqual(Ledger.Usage{
+        .peak = 4241,
+        .peak_committed = 4241,
+    }, heap.ledger.usage);
+
     try testing.expectEqual(null, heap.takeRefusal());
 }
 
@@ -360,7 +370,11 @@ test "a block beyond the budget is refused before the backing runs" {
     try testing.expectEqual(error.BudgetExceeded, heap.takeRefusal().?);
     try testing.expectEqual(0, test_backing.blocks);
     try testing.expectEqual(100, test_backing.peak);
-    try testing.expectEqual(Ledger.Usage{ .peak = 100 }, heap.ledger.usage);
+
+    try testing.expectEqual(Ledger.Usage{
+        .peak = 100,
+        .peak_committed = 100,
+    }, heap.ledger.usage);
 }
 
 test "a later block leaves a recorded refusal in place" {
@@ -398,7 +412,7 @@ test "a size whose header overflows the arithmetic is refused" {
     try testing.expectEqual(Ledger.Usage{}, heap.ledger.usage);
 }
 
-test "a failed backing is recorded as AllocationFailed and changes no count" {
+test "a failed backing is recorded as AllocationFailed and holds no bytes" {
     var failing: testing.FailingAllocator = .init(testing.allocator, .{
         .fail_index = 0,
     });
@@ -409,7 +423,12 @@ test "a failed backing is recorded as AllocationFailed and changes no count" {
 
     try testing.expectEqual(null, heap.alloc(64));
     try testing.expectEqual(error.AllocationFailed, heap.takeRefusal().?);
-    try testing.expectEqual(Ledger.Usage{}, heap.ledger.usage);
+
+    try testing.expectEqual(
+        Ledger.Usage{ .peak_committed = 80 },
+        heap.ledger.usage,
+    );
+
     try testing.expectEqual(roomy.bytes, heap.ledger.available());
 }
 
@@ -440,7 +459,7 @@ test "reservations count apart from live blocks" {
 
     var heap: Heap = .init(test_backing.backing(), .{ .bytes = 1000 });
 
-    var reservation = try heap.ledger.reserve(500);
+    var reservation = try heap.ledger.reserve(.codec, 500);
     defer heap.ledger.cancel(&reservation);
 
     const first = heap.allocReserved(&reservation, 100).?;
@@ -448,7 +467,12 @@ test "reservations count apart from live blocks" {
     try testing.expectEqual(384, reservation.bytes);
 
     try testing.expectEqual(
-        Ledger.Usage{ .live = 116, .reserved = 384, .peak = 116 },
+        Ledger.Usage{
+            .live = 116,
+            .reserved = 384,
+            .peak = 116,
+            .peak_committed = 500,
+        },
         heap.ledger.usage,
     );
 
@@ -467,7 +491,12 @@ test "reservations count apart from live blocks" {
     try testing.expectEqual(0, heap.ledger.available());
 
     try testing.expectEqual(
-        Ledger.Usage{ .live = 1000, .reserved = 0, .peak = 1000 },
+        Ledger.Usage{
+            .live = 1000,
+            .reserved = 0,
+            .peak = 1000,
+            .peak_committed = 1000,
+        },
         heap.ledger.usage,
     );
 
@@ -475,7 +504,11 @@ test "reservations count apart from live blocks" {
     heap.free(second);
     heap.free(direct);
     heap.free(first);
-    try testing.expectEqual(Ledger.Usage{ .peak = 1000 }, heap.ledger.usage);
+
+    try testing.expectEqual(Ledger.Usage{
+        .peak = 1000,
+        .peak_committed = 1000,
+    }, heap.ledger.usage);
 }
 
 test "a failed backing leaves a reservation intact" {
@@ -487,14 +520,23 @@ test "a failed backing leaves a reservation intact" {
 
     var heap: Heap = .init(test_backing.backing(), .{ .bytes = 1000 });
 
-    var reservation = try heap.ledger.reserve(500);
+    var reservation = try heap.ledger.reserve(.codec, 500);
 
     try testing.expectEqual(null, heap.allocReserved(&reservation, 100));
     try testing.expectEqual(error.AllocationFailed, heap.takeRefusal().?);
     try testing.expectEqual(500, reservation.bytes);
-    try testing.expectEqual(Ledger.Usage{ .reserved = 500 }, heap.ledger.usage);
+
+    try testing.expectEqual(Ledger.Usage{
+        .reserved = 500,
+        .peak_committed = 500,
+    }, heap.ledger.usage);
+
     heap.ledger.cancel(&reservation);
-    try testing.expectEqual(Ledger.Usage{}, heap.ledger.usage);
+
+    try testing.expectEqual(
+        Ledger.Usage{ .peak_committed = 500 },
+        heap.ledger.usage,
+    );
 }
 
 test "the allocator view serves Zig containers and settles every block" {
@@ -551,7 +593,11 @@ test "the allocator view records a refusal of the backing" {
 
     try testing.expectError(error.OutOfMemory, view.alloc(u8, 48));
     try testing.expectEqual(error.AllocationFailed, heap.takeRefusal().?);
-    try testing.expectEqual(Ledger.Usage{}, heap.ledger.usage);
+
+    try testing.expectEqual(
+        Ledger.Usage{ .peak_committed = 64 },
+        heap.ledger.usage,
+    );
 }
 
 test "the system backing serves aligned blocks from libc" {
@@ -622,7 +668,7 @@ fn useEveryRoute(gpa: std.mem.Allocator, exits: *Exits) !void {
     const raw = heap.alloc(40) orelse try refused(&heap, &test_backing);
     defer heap.free(raw);
 
-    var reservation = try heap.ledger.reserve(1024);
+    var reservation = try heap.ledger.reserve(.codec, 1024);
     defer heap.ledger.cancel(&reservation);
 
     const first = heap.allocReserved(&reservation, 100) orelse
@@ -657,4 +703,54 @@ test "every allocation failure of the heap records its cause and settles" {
 
     try testing.expect(exits.runs > 4);
     try testing.expectEqual(exits.runs, exits.settled);
+}
+
+test "a block counts under the kind of its reservation until its release" {
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    var heap: Heap = .init(test_backing.backing(), roomy);
+
+    const kinds = [_]Ledger.Kind{ .input, .metadata, .output, .codec };
+    const sizes = [_]usize{ 100, 200, 300, 400 };
+    var blocks: [kinds.len + 1][*]align(header_size) u8 = undefined;
+
+    for (kinds, sizes, blocks[0..kinds.len]) |kind, size, *block| {
+        var reservation = try heap.ledger.reserve(kind, accounted(size).?);
+
+        block.* = heap.allocReserved(&reservation, size).?;
+        try testing.expectEqual(0, reservation.bytes);
+        heap.ledger.cancel(&reservation);
+    }
+
+    blocks[kinds.len] = heap.alloc(50).?;
+
+    // The two codec blocks count in `live` only.
+    try testing.expectEqual(116, heap.ledger.usage.input);
+    try testing.expectEqual(216, heap.ledger.usage.metadata);
+    try testing.expectEqual(316, heap.ledger.usage.output);
+    try testing.expectEqual(1130, heap.ledger.usage.live);
+    try testing.expectEqual(0, heap.ledger.usage.reserved);
+    try expectMatches(&heap, &test_backing);
+
+    // The block to free, then the live, input, metadata, and output counts
+    // that remain.
+    const steps = [_]struct { usize, u64, u64, u64, u64 }{
+        .{ 2, 814, 116, 216, 0 },
+        .{ 4, 748, 116, 216, 0 },
+        .{ 0, 632, 0, 216, 0 },
+        .{ 3, 216, 0, 216, 0 },
+        .{ 1, 0, 0, 0, 0 },
+    };
+
+    for (steps) |step| {
+        heap.free(blocks[step[0]]);
+        try testing.expectEqual(step[1], heap.ledger.usage.live);
+        try testing.expectEqual(step[2], heap.ledger.usage.input);
+        try testing.expectEqual(step[3], heap.ledger.usage.metadata);
+        try testing.expectEqual(step[4], heap.ledger.usage.output);
+        try testing.expectEqual(0, heap.ledger.usage.reserved);
+    }
+
+    try testing.expectEqual(0, test_backing.blocks);
+    try expectMatches(&heap, &test_backing);
 }

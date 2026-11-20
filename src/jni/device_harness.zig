@@ -381,16 +381,25 @@ fn lifecycle(env: *fake.Env) bool {
     if (createUnder(create, jenv, 1 << 20, out.object()) !=
         san.SAN_STATUS_BUDGET_EXCEEDED) return false;
 
-    // The read and the opening of a live engine fail without an output.
+    // The read of a live engine writes every counter: the engine's own
+    // state is its one block, of the metadata kind.
     var counted: [san.SAN_ENGINE_COUNTERS_LENGTH]jni.jlong = @splat(unwritten);
     var counted_array: fake.Array = .{ .longs = &counted };
 
     if (counters(jenv, null, engine, jni.JNI_TRUE, counted_array.object()) !=
-        san.SAN_STATUS_ENGINE_FAILURE) return false;
+        san.SAN_STATUS_OK) return false;
 
     for (counted) |element| {
-        if (element != unwritten) return false;
+        if (element == unwritten) return false;
     }
+
+    const live = counted[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
+
+    if (live <= 0 or
+        live != counted[san.SAN_ENGINE_COUNTERS_METADATA_BYTES] or
+        counted[san.SAN_ENGINE_COUNTERS_JOB_COUNT] != 0) return false;
+
+    // The opening of a content fails without a handle.
 
     if (open(jenv, null, engine, out.object()) !=
         san.SAN_STATUS_ENGINE_FAILURE) return false;
