@@ -103,6 +103,8 @@
             san-abi-harness
             libsan.so
             san-jni-harness
+            libsan_canary_test.so
+            san-canary-harness
           )
 
           runs=(
@@ -112,6 +114,7 @@
             "san-png-harness stress"
             "san-abi-harness"
             "san-jni-harness"
+            "san-canary-harness control"
           )
 
           for mode in debug safe; do
@@ -148,6 +151,26 @@
                 failed=1
               fi
             done
+
+            # The overflow run passes only when the stack protector ends the process.
+            # adb reports a death by a signal as 128 plus the signal: 5 is SIGTRAP, and 6 is SIGABRT.
+            adb logcat -b crash -c </dev/null
+            status=0
+            output=$(adb shell "cd $remote && LD_LIBRARY_PATH=. ./san-canary-harness overflow" </dev/null 2>&1) || status=$?
+
+            case $status in
+              133) echo "$mode san-canary-harness overflow: ended by SIGTRAP" ;;
+              134) echo "$mode san-canary-harness overflow: ended by SIGABRT" ;;
+              *)
+                echo "$mode san-canary-harness overflow: failed, exit status $status"
+                echo "$output"
+                failed=1
+                ;;
+            esac
+
+            # The system writes the crash log after the process ends. Its lines show what a tombstone of the failure holds.
+            sleep 2
+            adb logcat -b crash -d </dev/null | grep -E 'signal [0-9]|Abort message|#0[0-3] pc' || true
           done
 
           exit "$failed"

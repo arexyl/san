@@ -289,6 +289,35 @@ pub fn addArchives(
     } };
 }
 
+/// The warnings of a test-only C source of San: every warning is an
+/// error.
+const test_flags = [_][]const u8{ "-Wall", "-Wextra", "-Werror" };
+
+/// Adds the static archive `name` of `source`, a test-only C source of
+/// San that only a device test library links. It compiles as every C
+/// component does: in the safe mode with the undefined-behavior trap and
+/// with every flag of `cFlags`. `root` is the absolute San root.
+pub fn addTestArchive(
+    b: *std.Build,
+    name: []const u8,
+    source: []const u8,
+    target: std.Build.ResolvedTarget,
+    platform: Platform,
+    root: []const u8,
+) *std.Build.Step.Compile {
+    const module = codecModule(b, target, platform, &.{});
+
+    module.addCSourceFile(.{
+        .file = b.path(source),
+        .flags = std.mem.concat(b.graph.arena, []const u8, &.{
+            cFlags(b, platform, root),
+            &test_flags,
+        }) catch @panic("OOM"),
+    });
+
+    return archive(b, name, module, platform);
+}
+
 /// Returns a module for the C code of a codec on `platform`, with the
 /// codec's directories `codec_dirs` as system include paths. A system
 /// header raises no warning in a compile that enables warnings.

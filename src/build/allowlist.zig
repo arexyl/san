@@ -114,6 +114,10 @@ pub const Artifact = enum {
     /// library's link shape and exports the functions of the Bindings
     /// header in place of JNI.
     abi_device_test,
+    /// The test library of the stack protector's device test. It has the
+    /// San library's link shape, with one test entry point in place of
+    /// JNI.
+    canary_device_test,
 
     /// Returns the names that the artifact exports, and nothing else.
     pub fn exports(artifact: Artifact) []const []const u8 {
@@ -125,6 +129,7 @@ pub const Artifact = enum {
                 "san_engine_create",
                 "san_engine_shutdown",
             },
+            .canary_device_test => &.{"san_canary_test"},
         };
     }
 };
@@ -291,6 +296,13 @@ test "each artifact exports its entry points and nothing else" {
     for (Artifact.abi_device_test.exports()) |name| {
         try testing.expect(std.mem.startsWith(u8, name, "san_"));
     }
+
+    try testing.expectEqual(1, Artifact.canary_device_test.exports().len);
+
+    try testing.expectEqualStrings(
+        "san_canary_test",
+        Artifact.canary_device_test.exports()[0],
+    );
 }
 
 test "no artifact exports a name that it may import from the system" {

@@ -45,6 +45,12 @@ const engine_test_modes = [_]std.lang.Optimize{ .debug, .safe };
 /// The root of the C ABI module, which also holds its host tests.
 const abi_root = "src/abi/root.zig";
 
+/// The root of libsan_canary_test.so, the device test library of the
+/// stack protector, its test-only C source, and the root of its harness.
+const canary_device_test_root = "src/canary/device_test.zig";
+const canary_source = "src/canary/canary.c";
+const canary_device_harness_root = "src/canary/device_harness.zig";
+
 /// The root of the JNI layer, which also holds its host tests.
 const jni_root = "src/jni/root.zig";
 
@@ -1121,6 +1127,72 @@ fn addDeviceStage(
         abi_inspected,
         prefix,
     );
+
+    // The canary library links one test-only C source. Its report shows
+    // which __stack_chk_fail the C code binds in this mode.
+    const canary_root = b.createModule(.{
+        .root_source_file = b.path(canary_device_test_root),
+        .target = target,
+        .optimize = android.optimize,
+        .link_libc = false,
+        .imports = &.{.{ .name = "engine", .module = androidEngine(b) }},
+    });
+
+    canary_root.linkLibrary(codecs.addTestArchive(
+        b,
+        "canary",
+        canary_source,
+        target,
+        .{ .android = .{
+            .abi = android.abi,
+            .include_dirs = found.include_dirs,
+        } },
+        layout.root,
+    ));
+
+    const canary_library = library.add(b, .{
+        .name = "san_canary_test",
+        .root_module = canary_root,
+        .artifact = .canary_device_test,
+        .ndk = found,
+    });
+
+    const canary_inspected = addInspection(
+        b,
+        inspection,
+        android.abi,
+        .canary_device_test,
+        canary_library,
+    );
+
+    canary_inspected.expectExitCode(0);
+
+    const canary_harness = addHarness(b, .{
+        .name = "san-canary-harness",
+        .root = canary_device_harness_root,
+        .imports = &.{.{ .name = "engine", .module = androidEngine(b) }},
+        .library = canary_library,
+        .android = android,
+        .ndk = found,
+    });
+
+    stageInspected(
+        b,
+        step,
+        &.{ canary_library, canary_harness },
+        canary_inspected,
+        prefix,
+    );
+
+    const canary_report = b.addInstallFileWithDir(
+        addReport(b, android.abi, .canary_device_test, canary_library, found),
+        .prefix,
+        "libsan_canary_test.report.txt",
+    );
+
+    canary_report.step.dependOn(&canary_inspected.step);
+    canary_report.step.dependOn(&prefix.step);
+    step.dependOn(&canary_report.step);
 }
 
 /// The steps that take the San library.
