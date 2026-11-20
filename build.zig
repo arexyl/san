@@ -33,6 +33,7 @@ const host_test_roots = [_][]const u8{
     "src/build/inspect.zig",
     "src/build/install_prefix.zig",
     "src/build/report.zig",
+    "src/build/manifest.zig",
 };
 
 /// The root of the engine module, which also holds its host tests.
@@ -57,6 +58,9 @@ const jni_root = "src/jni/root.zig";
 /// The root of libsan.so, the San library, and the root of the harness
 /// that loads it on a device.
 const san_root = "src/san.zig";
+
+/// The name of the inspection report beside libsan.so.
+const san_report_name = "libsan.report.txt";
 const jni_device_harness_root = "src/jni/device_harness.zig";
 
 /// The root of libsan_abi_test.so, the device test library of the C ABI,
@@ -226,6 +230,14 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             "into --prefix, which must be build/work/<abi>-<mode>/",
     );
 
+    const stage_local = b.step(
+        "stage-local",
+        "Link and inspect the San library of every ABI for -Doptimize, " ++
+            "then stage them with a manifest in " ++
+            "build/artifacts/local/<commit>/; refuses a tree that " ++
+            "differs from its commit",
+    );
+
     const stage_device = b.step(
         "stage-device",
         "Link and inspect the San library and the device test libraries " ++
@@ -255,6 +267,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             check_codecs,
             check_inspect,
             stage_library,
+            stage_local,
             stage_device,
             clean_step,
             verify_store,
@@ -291,6 +304,15 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         .stage_library = stage_library,
         .stage_device = stage_device,
     }, layout, selection, inspection);
+
+    addLocalStage(
+        b,
+        stage_local,
+        verify_store,
+        layout,
+        selection,
+        inspection,
+    );
 
     try addCodecSteps(b, .{
         .test_codecs = test_codecs,
@@ -1228,6 +1250,83 @@ fn addLibraryStage(
 
     const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
 
+    const built = addSanLibrary(
+        b,
+        translate_c.Translator,
+        android,
+        found,
+        inspection,
+    );
+
+    const prefix = addPrefixCheck(b, layout, android);
+
+    stageInspected(b, step, &.{built.library}, built.inspected, prefix);
+
+    // The report lies beside the library that it describes, and it waits
+    // for the inspection as the library does.
+    const report = b.addInstallFileWithDir(
+        built.report,
+        .prefix,
+        san_report_name,
+    );
+
+    report.step.dependOn(&built.inspected.step);
+    report.step.dependOn(&prefix.step);
+    step.dependOn(&report.step);
+
+    // The harness has no Java VM. It calls the library's JNI_OnLoad
+    // against stand-ins that it builds from the same JNI header.
+    const harness = addHarness(b, .{
+        .name = "san-jni-harness",
+        .root = jni_device_harness_root,
+        .imports = &.{
+            .{ .name = "jni", .module = built.jni },
+            .{ .name = "san", .module = built.san },
+            .{ .name = "engine", .module = built.engine },
+        },
+        .library = built.library,
+        .android = android,
+        .ndk = found,
+    });
+
+    // One install copies the library, so stage-device takes it through
+    // stage-library.
+    steps.stage_device.dependOn(step);
+
+    stageInspected(
+        b,
+        steps.stage_device,
+        &.{harness},
+        built.inspected,
+        prefix,
+    );
+}
+
+/// The San library of one ABI, linked, inspected, and reported on.
+const SanLibrary = struct {
+    library: *std.Build.Step.Compile,
+    /// The inspection of the library. Whatever copies the library waits
+    /// for it.
+    inspected: *std.Build.Step.Run,
+    /// The inspection report of the library.
+    report: std.Build.LazyPath,
+    /// The modules that a test executable shares with the library: the
+    /// translations of the JNI header and of the Bindings header, and
+    /// the engine.
+    jni: *std.Build.Module,
+    san: *std.Build.Module,
+    engine: *std.Build.Module,
+};
+
+/// Adds libsan.so for `android` with its inspection and its report.
+/// `Translator` is the Translator type of the translate_c package.
+fn addSanLibrary(
+    b: *std.Build,
+    comptime Translator: type,
+    android: Android,
+    found: ndk.Root,
+    inspection: *std.Build.Step.Compile,
+) SanLibrary {
     const target = b.resolveTargetQuery(android.abi.targetQuery());
 
     const translator = b.dependency("translate_c", .{});
@@ -1239,7 +1338,7 @@ fn addLibraryStage(
 
     const translation = header.translate(
         b,
-        translate_c.Translator,
+        Translator,
         translator,
         target,
         system,
@@ -1247,7 +1346,7 @@ fn addLibraryStage(
 
     const jni = header.translateFile(
         b,
-        translate_c.Translator,
+        Translator,
         translator,
         target,
         system,
@@ -1302,41 +1401,118 @@ fn addLibraryStage(
 
     inspected.expectExitCode(0);
 
-    const prefix = addPrefixCheck(b, layout, android);
-
-    stageInspected(b, step, &.{san_library}, inspected, prefix);
-
-    // The report lies beside the library that it describes, and it waits
-    // for the inspection as the library does.
-    const report = b.addInstallFileWithDir(
-        addReport(b, android.abi, .san, san_library, found),
-        .prefix,
-        "libsan.report.txt",
-    );
-
-    report.step.dependOn(&inspected.step);
-    report.step.dependOn(&prefix.step);
-    step.dependOn(&report.step);
-
-    // The harness has no Java VM. It calls the library's JNI_OnLoad
-    // against stand-ins that it builds from the same JNI header.
-    const harness = addHarness(b, .{
-        .name = "san-jni-harness",
-        .root = jni_device_harness_root,
-        .imports = &.{
-            .{ .name = "jni", .module = jni },
-            .{ .name = "san", .module = translation.san },
-            .{ .name = "engine", .module = engine },
-        },
+    return .{
         .library = san_library,
-        .android = android,
-        .ndk = found,
+        .inspected = inspected,
+        .report = addReport(b, android.abi, .san, san_library, found),
+        .jni = jni,
+        .san = translation.san,
+        .engine = engine,
+    };
+}
+
+/// Adds stage-local: the San library of every ABI in the mode of
+/// -Doptimize, each linked, inspected, and reported on as stage-library
+/// does, and the manifest tool, which copies them into
+/// build/artifacts/local/<San commit>/ and writes the manifest of that
+/// set. The tool refuses a checkout that differs from its commit, once
+/// before the first compile and once after the last inspection, and the
+/// second run also refuses a commit other than the first one's, so a set
+/// describes the one commit that it names.
+fn addLocalStage(
+    b: *std.Build,
+    step: *std.Build.Step,
+    verify_store: *std.Build.Step,
+    layout: Layout,
+    selection: Selection,
+    inspection: *std.Build.Step.Compile,
+) void {
+    const abis = comptime std.enums.values(profile.Abi);
+
+    const optimize = selection.optimize orelse
+        return failSteps(b, &.{step}, missing_optimize);
+
+    var roots: [abis.len]ndk.Root = undefined;
+
+    for (abis, &roots) |abi, *found| {
+        if (!profile.combinationSupported(abi, optimize)) return failSteps(
+            b,
+            &.{step},
+            b.fmt("unsupported -Doptimize={t} for stage-local on {t}; " ++
+                "supported: {s}", .{ optimize, abi, profile.optimize_names }),
+        );
+
+        found.* = openNdk(b, step, selection, abi) orelse return;
+    }
+
+    if (failMissingPackage(b, step, layout)) return;
+
+    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
+
+    const tool = b.addExecutable(.{
+        .name = "manifest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/manifest.zig"),
+            .target = b.graph.host,
+        }),
     });
 
-    // One install copies the library, so stage-device takes it through
-    // stage-library.
-    steps.stage_device.dependOn(step);
-    stageInspected(b, steps.stage_device, &.{harness}, inspected, prefix);
+    // The tool reads the state of the checkout in both runs and writes
+    // outside the cache in the second, so no earlier run stands for
+    // either. The first run waits for the store verification, because
+    // the store holds build inputs that Git ignores.
+    const check = b.addRunArtifact(tool);
+
+    check.setName("check that the checkout is at its commit");
+    check.addArgs(&.{ "check", layout.root });
+
+    const record = check.addOutputFileArg("commit");
+
+    check.has_side_effects = true;
+    check.step.dependOn(verify_store);
+
+    const run = b.addRunArtifact(tool);
+
+    const revision = roots[0].revision;
+
+    run.setName("stage the local set with its manifest");
+    run.addArgs(&.{ "stage", layout.root });
+    run.addFileArg(record);
+
+    run.addArgs(&.{
+        b.pathJoin(&.{ layout.build, "artifacts", "local" }),
+        "local",
+        @import("build.zig.zon").version,
+        b.fmt("{f}", .{builtin.zig_version}),
+        b.fmt("{d}.{d}.{d}", .{
+            revision.major,
+            revision.minor,
+            revision.build,
+        }),
+        @tagName(optimize),
+    });
+
+    for (abis, roots) |abi, found| {
+        const built = addSanLibrary(
+            b,
+            translate_c.Translator,
+            .{ .abi = abi, .optimize = optimize },
+            found,
+            inspection,
+        );
+
+        // No library compiles before the checkout passed its check.
+        built.library.step.dependOn(&check.step);
+
+        run.addArg(b.fmt("{t}/libsan.so", .{abi}));
+        run.addArtifactArg(built.library);
+        run.addArg(b.fmt("{t}/{s}", .{ abi, san_report_name }));
+        run.addFileArg(built.report);
+        run.step.dependOn(&built.inspected.step);
+    }
+
+    run.has_side_effects = true;
+    step.dependOn(&run.step);
 }
 
 /// A test executable that runs beside a device test library.
