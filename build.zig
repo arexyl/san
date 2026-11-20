@@ -47,6 +47,11 @@ const abi_root = "src/abi/root.zig";
 /// The root of the JNI layer, which also holds its host tests.
 const jni_root = "src/jni/root.zig";
 
+/// The root of libsan.so, the San library, and the root of the harness
+/// that loads it on a device.
+const san_root = "src/san.zig";
+const jni_device_harness_root = "src/jni/device_harness.zig";
+
 /// The root of libsan_abi_test.so, the device test library of the C ABI,
 /// and the root of its harness.
 const abi_device_test_root = "src/abi/device_test.zig";
@@ -132,7 +137,8 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         profile.Abi,
         "abi",
         "Android ABI of check-header, check-engine, check-codecs, " ++
-            "check-inspect, and stage-device: " ++ profile.abi_names,
+            "check-inspect, stage-library, and stage-device: " ++
+            profile.abi_names,
     );
 
     const optimize = b.option(
@@ -207,11 +213,17 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             "base rule for -Dabi",
     );
 
+    const stage_library = b.step(
+        "stage-library",
+        "Link and inspect the San library for -Dabi, then install it " ++
+            "into --prefix, which must be build/work/<abi>-<mode>/",
+    );
+
     const stage_device = b.step(
         "stage-device",
-        "Link and inspect the device test libraries for -Dabi, then " ++
-            "install them and their harnesses into --prefix, which must " ++
-            "be build/work/<abi>-<mode>/",
+        "Link and inspect the San library and the device test libraries " ++
+            "for -Dabi, then install them and their harnesses into " ++
+            "--prefix, which must be build/work/<abi>-<mode>/",
     );
 
     const clean_step = b.step("clean", "Remove build/work and build/reports");
@@ -235,6 +247,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             test_codecs,
             check_codecs,
             check_inspect,
+            stage_library,
             stage_device,
             clean_step,
             verify_store,
@@ -266,6 +279,11 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     const inspection = addInspectionTool(b);
 
     addInspectCheck(b, check_inspect, selection, inspection);
+
+    addLibraryStage(b, .{
+        .stage_library = stage_library,
+        .stage_device = stage_device,
+    }, layout, selection, inspection);
 
     try addCodecSteps(b, .{
         .test_codecs = test_codecs,
@@ -1102,6 +1120,138 @@ fn addDeviceStage(
         abi_inspected,
         prefix,
     );
+}
+
+/// The steps that take the San library.
+const LibrarySteps = struct {
+    stage_library: *std.Build.Step,
+    stage_device: *std.Build.Step,
+};
+
+/// Adds the San library: libsan.so, whose root holds the JNI layer over
+/// the C ABI and the engine. stage-library installs it, and stage-device
+/// installs it with the harness that loads it on a device. The
+/// inspection runs on the exact file that each install copies, and the
+/// installs wait for it, so only an inspected library reaches the
+/// install prefix. A rejected selection fails stage-library here; the
+/// device test libraries fail stage-device for it.
+fn addLibraryStage(
+    b: *std.Build,
+    steps: LibrarySteps,
+    layout: Layout,
+    selection: Selection,
+    inspection: *std.Build.Step.Compile,
+) void {
+    const step = steps.stage_library;
+
+    const android = switch (selectAndroid(b, selection)) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
+    const found = openNdk(b, step, selection, android.abi) orelse return;
+
+    if (failMissingPackage(b, step, layout)) return;
+
+    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
+
+    const target = b.resolveTargetQuery(android.abi.targetQuery());
+
+    const translator = b.dependency("translate_c", .{});
+
+    const system: header.System = .{ .android = .{
+        .api_level = profile.api_level,
+        .include_dirs = found.include_dirs,
+    } };
+
+    const translation = header.translate(
+        b,
+        translate_c.Translator,
+        translator,
+        target,
+        system,
+    );
+
+    const jni = header.translateFile(
+        b,
+        translate_c.Translator,
+        translator,
+        target,
+        system,
+        "jni",
+        jniHeader(b, found),
+    );
+
+    const engine = androidEngine(b);
+
+    const abi = b.createModule(.{
+        .root_source_file = b.path(abi_root),
+        .link_libc = false,
+        .imports = &.{
+            .{ .name = "san", .module = translation.san },
+            .{ .name = "engine", .module = engine },
+        },
+    });
+
+    const layer = b.createModule(.{
+        .root_source_file = b.path(jni_root),
+        .link_libc = false,
+        .imports = &.{
+            .{ .name = "jni", .module = jni },
+            .{ .name = "san", .module = translation.san },
+            .{ .name = "abi", .module = abi },
+        },
+    });
+
+    const san_library = library.add(b, .{
+        .name = "san",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(san_root),
+            .target = target,
+            .optimize = android.optimize,
+            .link_libc = false,
+            .imports = &.{
+                .{ .name = "engine", .module = engine },
+                .{ .name = "jni_layer", .module = layer },
+            },
+        }),
+        .artifact = .san,
+        .ndk = found,
+    });
+
+    const inspected = addInspection(
+        b,
+        inspection,
+        android.abi,
+        .san,
+        san_library,
+    );
+
+    inspected.expectExitCode(0);
+
+    const prefix = addPrefixCheck(b, layout, android);
+
+    stageInspected(b, step, &.{san_library}, inspected, prefix);
+
+    // The harness has no Java VM. It calls the library's JNI_OnLoad
+    // against stand-ins that it builds from the same JNI header.
+    const harness = addHarness(b, .{
+        .name = "san-jni-harness",
+        .root = jni_device_harness_root,
+        .imports = &.{
+            .{ .name = "jni", .module = jni },
+            .{ .name = "san", .module = translation.san },
+            .{ .name = "engine", .module = engine },
+        },
+        .library = san_library,
+        .android = android,
+        .ndk = found,
+    });
+
+    // One install copies the library, so stage-device takes it through
+    // stage-library.
+    steps.stage_device.dependOn(step);
+    stageInspected(b, steps.stage_device, &.{harness}, inspected, prefix);
 }
 
 /// A test executable that runs beside a device test library.

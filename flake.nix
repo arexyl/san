@@ -96,7 +96,14 @@
           page=$(adb shell getconf PAGE_SIZE </dev/null)
           echo "API $level, ABI $abi, page size $page"
 
-          names=(libsan_png_test.so san-png-harness libsan_abi_test.so san-abi-harness)
+          names=(
+            libsan_png_test.so
+            san-png-harness
+            libsan_abi_test.so
+            san-abi-harness
+            libsan.so
+            san-jni-harness
+          )
 
           runs=(
             "san-png-harness generated"
@@ -104,6 +111,7 @@
             "san-png-harness cancel"
             "san-png-harness stress"
             "san-abi-harness"
+            "san-jni-harness"
           )
 
           for mode in debug safe; do
