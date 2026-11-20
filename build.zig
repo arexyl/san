@@ -32,6 +32,7 @@ const host_test_roots = [_][]const u8{
     "src/build/allowlist.zig",
     "src/build/inspect.zig",
     "src/build/install_prefix.zig",
+    "src/build/report.zig",
 };
 
 /// The root of the engine module, which also holds its host tests.
@@ -1233,6 +1234,18 @@ fn addLibraryStage(
 
     stageInspected(b, step, &.{san_library}, inspected, prefix);
 
+    // The report lies beside the library that it describes, and it waits
+    // for the inspection as the library does.
+    const report = b.addInstallFileWithDir(
+        addReport(b, android.abi, .san, san_library, found),
+        .prefix,
+        "libsan.report.txt",
+    );
+
+    report.step.dependOn(&inspected.step);
+    report.step.dependOn(&prefix.step);
+    step.dependOn(&report.step);
+
     // The harness has no Java VM. It calls the library's JNI_OnLoad
     // against stand-ins that it builds from the same JNI header.
     const harness = addHarness(b, .{
@@ -1395,6 +1408,35 @@ fn addInspection(
     run.addArtifactArg(artifact);
 
     return run;
+}
+
+/// Runs the report tool on `artifact`, a library of the kind `kind` for
+/// `abi`, and returns the report. The tool reads the unstripped file that
+/// the library's compile emits, and the libc stub that the library links
+/// against, whose exports are the libc names.
+fn addReport(
+    b: *std.Build,
+    abi: profile.Abi,
+    kind: allowlist.Artifact,
+    artifact: *std.Build.Step.Compile,
+    found: ndk.Root,
+) std.Build.LazyPath {
+    const tool = b.addExecutable(.{
+        .name = "report",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/build/report.zig"),
+            .target = b.graph.host,
+        }),
+    });
+
+    const run = b.addRunArtifact(tool);
+
+    run.setName(b.fmt("report on {s} for {t}", .{ artifact.name, abi }));
+    run.addArgs(&.{ @tagName(abi), @tagName(kind) });
+    run.addArtifactArg(artifact);
+    run.addFileArg(b.graph.cwdRelativePath(found.libc_stub));
+
+    return run.addOutputFileArg(b.fmt("lib{s}.report.txt", .{artifact.name}));
 }
 
 /// A deliberate defect of a library that check-inspect links, with the

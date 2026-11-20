@@ -171,7 +171,7 @@ const Failures = struct {
 };
 
 /// A section header with its name and its bytes in the file.
-const Section = struct {
+pub const Section = struct {
     name: []const u8,
     type: elf.SHT,
     flags: u64,
@@ -185,7 +185,7 @@ const Section = struct {
 };
 
 /// A dynamic symbol, decoded from its Elf64.Sym record.
-const Symbol = struct {
+pub const Symbol = struct {
     name: []const u8,
     bind: elf.STB,
     defined: bool,
@@ -218,7 +218,7 @@ const Symbol = struct {
     /// hidden or internal symbol local in a linked object, so one in the
     /// dynamic table is malformed. The tool counts it rather than trust
     /// that the loader reads the visibility before it binds the name.
-    fn exported(symbol: Symbol) bool {
+    pub fn exported(symbol: Symbol) bool {
         const binding = symbol.bind == .GLOBAL or symbol.bind == .WEAK;
 
         return symbol.defined and binding;
@@ -227,7 +227,7 @@ const Symbol = struct {
 
 /// The parts of a 64-bit little-endian ELF file that the rules read, with
 /// every offset, size, and name checked against the file.
-const Image = struct {
+pub const Image = struct {
     header: elf.Header,
     segments: []const elf.Elf64.Phdr,
     sections: []const Section,
@@ -240,11 +240,11 @@ const Image = struct {
     /// The union of every DT_FLAGS value.
     flags: u64,
 
-    const ReadError = Allocator.Error || error{Malformed};
+    pub const ReadError = Allocator.Error || error{Malformed};
 
     /// Reads `bytes`, whose identification already names a 64-bit
     /// little-endian file. On error.Malformed, `problem` holds the reason.
-    fn read(
+    pub fn read(
         arena: Allocator,
         bytes: []const u8,
         problem: *[]const u8,
@@ -324,7 +324,7 @@ fn within(bytes: []const u8, offset: u64, size: u64) bool {
 
 /// Returns the NUL-terminated string at `offset` of `table`, or null when
 /// it does not lie inside the table.
-fn stringAt(table: []const u8, offset: u64) ?[]const u8 {
+pub fn stringAt(table: []const u8, offset: u64) ?[]const u8 {
     if (offset >= table.len) return null;
 
     const rest = table[@intCast(offset)..];
