@@ -44,6 +44,9 @@ const engine_test_modes = [_]std.lang.Optimize{ .debug, .safe };
 /// The root of the C ABI module, which also holds its host tests.
 const abi_root = "src/abi/root.zig";
 
+/// The root of the JNI layer, which also holds its host tests.
+const jni_root = "src/jni/root.zig";
+
 /// The root of libsan_abi_test.so, the device test library of the C ABI,
 /// and the root of its harness.
 const abi_device_test_root = "src/abi/device_test.zig";
@@ -172,6 +175,11 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         "Run the host tests of the C ABI against the translated header",
     );
 
+    const test_jni = b.step(
+        "test-jni",
+        "Run the host tests of the JNI layer against the NDK's JNI header",
+    );
+
     const check_header = b.step(
         "check-header",
         "Assert the translated header layout in an Android object for -Dabi",
@@ -221,6 +229,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             test_step,
             test_header,
             test_abi,
+            test_jni,
             check_header,
             check_engine,
             test_codecs,
@@ -250,6 +259,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         .guard_ndk_major = guard_ndk_major,
     };
 
+    addJniTest(b, test_jni, layout, selection);
     addHeaderCheck(b, check_header, layout, selection);
     addEngineCheck(b, check_engine, selection);
 
@@ -495,6 +505,89 @@ fn addAbiTest(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
 
         step.dependOn(&b.addRunArtifact(tests).step);
     }
+}
+
+/// Adds the host tests of the JNI layer, in the modes of the Zig core.
+/// The JNI header comes from the NDK, and it includes only <stdarg.h>
+/// and <stdint.h>, so the host translates it alone, without another NDK
+/// header.
+fn addJniTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    layout: Layout,
+    selection: Selection,
+) void {
+    // The header lies in the include directory that every ABI shares, so
+    // any ABI opens the NDK for it.
+    const found = openNdk(b, step, selection, .@"arm64-v8a") orelse return;
+
+    if (failMissingPackage(b, step, layout)) return;
+
+    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
+
+    const target = b.resolveTargetQuery(
+        profile.hostQuery(b.graph.host.result),
+    );
+
+    const translator = b.dependency("translate_c", .{});
+
+    const jni = header.translateFile(
+        b,
+        translate_c.Translator,
+        translator,
+        target,
+        .host,
+        "jni",
+        jniHeader(b, found),
+    );
+
+    const translation = header.translate(
+        b,
+        translate_c.Translator,
+        translator,
+        target,
+        .host,
+    );
+
+    const abi = b.createModule(.{
+        .root_source_file = b.path(abi_root),
+        .imports = &.{
+            .{ .name = "san", .module = translation.san },
+            .{ .name = "engine", .module = b.createModule(.{
+                .root_source_file = b.path(engine_root),
+            }) },
+        },
+    });
+
+    for (engine_test_modes) |optimize| {
+        const tests = b.addTest(.{
+            .name = b.fmt("jni-{t}", .{optimize}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(jni_root),
+                .target = target,
+                .optimize = optimize,
+                // The methods run the C ABI on the system backing, which
+                // is the host libc here.
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "jni", .module = jni },
+                    .{ .name = "san", .module = translation.san },
+                    .{ .name = "abi", .module = abi },
+                    .{ .name = "bindings", .module = header.bindingsModule(b) },
+                    .{ .name = "table", .module = tableModule(b) },
+                },
+            }),
+        });
+
+        step.dependOn(&b.addRunArtifact(tests).step);
+    }
+}
+
+/// Returns the JNI header of the NDK.
+fn jniHeader(b: *std.Build, found: ndk.Root) std.Build.LazyPath {
+    return b.graph.cwdRelativePath(
+        b.pathJoin(&.{ found.include_dirs[0], "jni.h" }),
+    );
 }
 
 /// An Android ABI and an optimization mode that the profile permits.
