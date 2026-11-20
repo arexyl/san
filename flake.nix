@@ -74,7 +74,7 @@
         '';
       };
 
-      # Runs the staged PNG harness of both modes on the attached device.
+      # Runs the staged device harnesses of both modes on the attached device.
       # adb comes from the shell that booted the device: a second adb version would restart its server.
       sanDevice = pkgs.writeShellApplication {
         name = "san-device";
@@ -96,25 +96,40 @@
           page=$(adb shell getconf PAGE_SIZE </dev/null)
           echo "API $level, ABI $abi, page size $page"
 
+          names=(libsan_png_test.so san-png-harness libsan_abi_test.so san-abi-harness)
+
+          runs=(
+            "san-png-harness generated"
+            "san-png-harness inject"
+            "san-png-harness cancel"
+            "san-png-harness stress"
+            "san-abi-harness"
+          )
+
           for mode in debug safe; do
             staged=build/work/$abi-$mode
+            files=()
 
-            if [ ! -f "$staged/san-png-harness" ]; then
-              echo "$staged holds no staged harness." >&2
-              exit 2
-            fi
+            for name in "''${names[@]}"; do
+              if [ ! -f "$staged/$name" ]; then
+                echo "$staged holds no staged $name." >&2
+                exit 2
+              fi
+
+              files+=("$staged/$name")
+            done
 
             adb shell "rm -rf $remote && mkdir $remote" </dev/null
 
             # adb reports the progress of a push on the error stream.
-            if ! pushed=$(adb push "$staged/libsan_png_test.so" "$staged/san-png-harness" "$remote/" 2>&1); then
+            if ! pushed=$(adb push "''${files[@]}" "$remote/" 2>&1); then
               echo "$pushed" >&2
               exit 1
             fi
 
-            for run in generated inject cancel stress; do
+            for run in "''${runs[@]}"; do
               status=0
-              output=$(adb shell "cd $remote && LD_LIBRARY_PATH=. ./san-png-harness $run" </dev/null 2>&1) || status=$?
+              output=$(adb shell "cd $remote && LD_LIBRARY_PATH=. ./$run" </dev/null 2>&1) || status=$?
               summary=''${output##*$'\n'}
 
               if [ "$status" -eq 0 ] && [[ $summary == *failed=0 ]]; then

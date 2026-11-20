@@ -1706,5 +1706,8 @@ test "the arguments name an abi, an artifact, and a file" {
         try testing.expectEqual(null, parseArguments(args));
     }
 
-    try testing.expectEqualStrings("san, png_device_test", artifact_names);
+    try testing.expectEqualStrings(
+        "san, png_device_test, abi_device_test",
+        artifact_names,
+    );
 }

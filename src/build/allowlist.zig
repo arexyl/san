@@ -110,12 +110,21 @@ pub const Artifact = enum {
     /// San library's link shape, with one test entry point in place of
     /// JNI.
     png_device_test,
+    /// The test library of the C ABI's device tests. It has the San
+    /// library's link shape and exports the functions of the Bindings
+    /// header in place of JNI.
+    abi_device_test,
 
     /// Returns the names that the artifact exports, and nothing else.
     pub fn exports(artifact: Artifact) []const []const u8 {
         return switch (artifact) {
             .san => &.{"JNI_OnLoad"},
             .png_device_test => &.{"san_png_device_test"},
+            .abi_device_test => &.{
+                "san_binding_establish",
+                "san_engine_create",
+                "san_engine_shutdown",
+            },
         };
     }
 };
@@ -266,7 +275,7 @@ test "libc.so is the one allowed library" {
     try testing.expect(!allowsLibrary("libc.so.6"));
 }
 
-test "each artifact exports one entry point" {
+test "each artifact exports its entry points and nothing else" {
     try testing.expectEqual(1, Artifact.san.exports().len);
     try testing.expectEqualStrings("JNI_OnLoad", Artifact.san.exports()[0]);
 
@@ -276,6 +285,12 @@ test "each artifact exports one entry point" {
         "san_png_device_test",
         Artifact.png_device_test.exports()[0],
     );
+
+    try testing.expectEqual(3, Artifact.abi_device_test.exports().len);
+
+    for (Artifact.abi_device_test.exports()) |name| {
+        try testing.expect(std.mem.startsWith(u8, name, "san_"));
+    }
 }
 
 test "no artifact exports a name that it may import from the system" {

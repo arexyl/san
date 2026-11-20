@@ -37,9 +37,17 @@ const host_test_roots = [_][]const u8{
 /// The root of the engine module, which also holds its host tests.
 const engine_root = "src/engine/Engine.zig";
 
-/// The modes of the engine's host tests: Debug, and the safe mode that
-/// the core keeps in published builds.
+/// The modes of the host tests of the Zig core: Debug, and the safe mode
+/// that the core keeps in published builds.
 const engine_test_modes = [_]std.lang.Optimize{ .debug, .safe };
+
+/// The root of the C ABI module, which also holds its host tests.
+const abi_root = "src/abi/root.zig";
+
+/// The root of libsan_abi_test.so, the device test library of the C ABI,
+/// and the root of its harness.
+const abi_device_test_root = "src/abi/device_test.zig";
+const abi_device_harness_root = "src/abi/device_harness.zig";
 
 /// The root of the PNG decoder, which also holds its host tests.
 const png_decoder_root = "src/codecs/png/Decoder.zig";
@@ -159,6 +167,11 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         "Check the host translation of the Bindings header against abi.tsv",
     );
 
+    const test_abi = b.step(
+        "test-abi",
+        "Run the host tests of the C ABI against the translated header",
+    );
+
     const check_header = b.step(
         "check-header",
         "Assert the translated header layout in an Android object for -Dabi",
@@ -188,9 +201,9 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
 
     const stage_device = b.step(
         "stage-device",
-        "Link and inspect the PNG device test library for -Dabi, then " ++
-            "install it and its harness into --prefix, which must be " ++
-            "build/work/<abi>-<mode>/",
+        "Link and inspect the device test libraries for -Dabi, then " ++
+            "install them and their harnesses into --prefix, which must " ++
+            "be build/work/<abi>-<mode>/",
     );
 
     const clean_step = b.step("clean", "Remove build/work and build/reports");
@@ -207,6 +220,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             b.getInstallStep(),
             test_step,
             test_header,
+            test_abi,
             check_header,
             check_engine,
             test_codecs,
@@ -227,6 +241,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     addClean(b, clean_step, layout);
     addVerifyStore(b, verify_store, layout);
     addHeaderTest(b, test_header, layout);
+    addAbiTest(b, test_abi, layout);
 
     const selection: Selection = .{
         .abi = abi,
@@ -437,6 +452,49 @@ fn addHeaderTest(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
     });
 
     step.dependOn(&b.addRunArtifact(tests).step);
+}
+
+/// Adds the host tests of the C ABI, in the modes of the Zig core. The
+/// module reaches the header through its host translation.
+fn addAbiTest(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
+    if (failMissingPackage(b, step, layout)) return;
+
+    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
+
+    const target = b.resolveTargetQuery(
+        profile.hostQuery(b.graph.host.result),
+    );
+
+    const translation = header.translate(
+        b,
+        translate_c.Translator,
+        b.dependency("translate_c", .{}),
+        target,
+        .host,
+    );
+
+    const engine = b.createModule(.{
+        .root_source_file = b.path(engine_root),
+    });
+
+    for (engine_test_modes) |optimize| {
+        const tests = b.addTest(.{
+            .name = b.fmt("abi-{t}", .{optimize}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(abi_root),
+                .target = target,
+                .optimize = optimize,
+                // The tests run the system backing on the host libc.
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "san", .module = translation.san },
+                    .{ .name = "engine", .module = engine },
+                },
+            }),
+        });
+
+        step.dependOn(&b.addRunArtifact(tests).step);
+    }
 }
 
 /// An Android ABI and an optimization mode that the profile permits.
@@ -791,11 +849,11 @@ fn addCodecCheck(
     dependOnArchives(step, archives);
 }
 
-/// Adds stage-device: libsan_png_test.so, the device test library of the
-/// PNG decoder in the link shape of the San library, and its harness.
-/// The inspection runs on the exact file that the install copies, and
-/// both installs wait for it, so only an inspected library reaches the
-/// install prefix.
+/// Adds stage-device: the device test libraries, each in the link shape
+/// of the San library and with its harness. libsan_png_test.so holds the
+/// PNG decoder, and libsan_abi_test.so the C ABI. Each inspection runs on
+/// the exact file that the install copies, and the installs wait for it,
+/// so only an inspected library reaches the install prefix.
 fn addDeviceStage(
     b: *std.Build,
     step: *std.Build.Step,
@@ -879,37 +937,138 @@ fn addDeviceStage(
 
     inspected.expectExitCode(0);
 
-    const harness = b.addExecutable(.{
+    // The harness reads the decoder's types through the imports, and its
+    // decodes run in the library.
+    const harness = addHarness(b, .{
         .name = "san-png-harness",
+        .root = png_device_harness_root,
+        .imports = imports,
+        .library = device_library,
+        .android = android,
+        .ndk = found,
+    });
+
+    const prefix = addPrefixCheck(b, layout, android);
+
+    stageInspected(b, step, &.{ device_library, harness }, inspected, prefix);
+
+    const translation = header.translate(
+        b,
+        translate_c.Translator,
+        b.dependency("translate_c", .{}),
+        target,
+        .{ .android = .{
+            .api_level = profile.api_level,
+            .include_dirs = found.include_dirs,
+        } },
+    );
+
+    const abi_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "san", .module = translation.san },
+        .{ .name = "engine", .module = androidEngine(b) },
+    };
+
+    const abi_library = library.add(b, .{
+        .name = "san_abi_test",
         .root_module = b.createModule(.{
-            .root_source_file = b.path(png_device_harness_root),
+            .root_source_file = b.path(abi_device_test_root),
             .target = target,
             .optimize = android.optimize,
-            // A test executable of San links libc, with the crt objects
-            // of the generated libc description. It reads the decoder's
-            // types through the imports, and its decodes run in the
-            // library.
+            .link_libc = false,
+            .imports = abi_imports,
+        }),
+        .artifact = .abi_device_test,
+        .ndk = found,
+    });
+
+    const abi_inspected = addInspection(
+        b,
+        inspection,
+        android.abi,
+        .abi_device_test,
+        abi_library,
+    );
+
+    abi_inspected.expectExitCode(0);
+
+    // The harness reads the header's types and constants through the
+    // translation, whose functions the library defines.
+    const abi_harness = addHarness(b, .{
+        .name = "san-abi-harness",
+        .root = abi_device_harness_root,
+        .imports = abi_imports,
+        .library = abi_library,
+        .android = android,
+        .ndk = found,
+    });
+
+    stageInspected(
+        b,
+        step,
+        &.{ abi_library, abi_harness },
+        abi_inspected,
+        prefix,
+    );
+}
+
+/// A test executable that runs beside a device test library.
+const Harness = struct {
+    name: []const u8,
+    /// The root source file, relative to the San root.
+    root: []const u8,
+    imports: []const std.Build.Module.Import,
+    /// The device test library that the executable needs.
+    library: *std.Build.Step.Compile,
+    android: Android,
+    ndk: ndk.Root,
+};
+
+/// Adds the test executable of `harness`. A test executable of San links
+/// libc, with the crt objects of the generated libc description.
+fn addHarness(b: *std.Build, harness: Harness) *std.Build.Step.Compile {
+    const executable = b.addExecutable(.{
+        .name = harness.name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(harness.root),
+            .target = b.resolveTargetQuery(harness.android.abi.targetQuery()),
+            .optimize = harness.android.optimize,
             .link_libc = true,
-            .imports = imports,
+            .imports = harness.imports,
         }),
         .use_llvm = true,
         .use_lld = true,
     });
 
-    // The harness needs the library through DT_NEEDED, by the library's
-    // SONAME. linkLibrary would also record the library's directory in
-    // the build cache as a RUNPATH, a host path that means nothing on
-    // the device, so the harness takes the linked file as an input.
-    harness.root_module.addObjectFile(device_library.getEmittedBin());
-    harness.setLibCFile(ndk.addLibcFile(b, found, android.abi.triple()));
+    // The executable needs the library through DT_NEEDED, by the
+    // library's SONAME. linkLibrary would also record the library's
+    // directory in the build cache as a RUNPATH, a host path that means
+    // nothing on the device, so the executable takes the linked file as
+    // an input.
+    executable.root_module.addObjectFile(harness.library.getEmittedBin());
+
+    executable.setLibCFile(
+        ndk.addLibcFile(b, harness.ndk, harness.android.abi.triple()),
+    );
+
     // Android loads position-independent executables only, and segments
     // aligned to the profile's page size map on both page sizes.
-    harness.pie = true;
-    harness.link_z_max_page_size = profile.page_size;
+    executable.pie = true;
+    executable.link_z_max_page_size = profile.page_size;
 
-    const prefix = addPrefixCheck(b, layout, android);
+    return executable;
+}
 
-    for ([_]*std.Build.Step.Compile{ device_library, harness }) |artifact| {
+/// Installs `artifacts` into the prefix for `step`. Each install waits
+/// for the inspection of the library among them and for the check of the
+/// prefix, so only an inspected library reaches the install prefix.
+fn stageInspected(
+    b: *std.Build,
+    step: *std.Build.Step,
+    artifacts: []const *std.Build.Step.Compile,
+    inspected: *std.Build.Step.Run,
+    prefix: *std.Build.Step.Run,
+) void {
+    for (artifacts) |artifact| {
         const install = b.addInstallArtifact(artifact, .{
             .dest_dir = .{ .override = .prefix },
         });
