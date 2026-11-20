@@ -156,8 +156,35 @@ pub fn createReserved(
     return @ptrCast(memory);
 }
 
-/// Releases the block of `ptr`, which `alloc`, `allocReserved`, or
-/// `createReserved` returned, by the size in its header. A null `ptr`
+/// Returns `count` values of `T` from what `reservation` holds, as
+/// `allocReserved` does. A size that overflows is refused as
+/// BudgetExceeded. The caller releases the slice by its pointer.
+pub fn allocReservedSlice(
+    heap: *Heap,
+    comptime T: type,
+    reservation: *Ledger.Reservation,
+    count: usize,
+) ?[]T {
+    if (comptime @alignOf(T) > header_size) {
+        @compileError("the heap aligns its blocks to 16 bytes only");
+    }
+
+    const size = std.math.mul(usize, count, @sizeOf(T)) catch {
+        heap.refusal = error.BudgetExceeded;
+
+        return null;
+    };
+
+    const memory = heap.allocReserved(reservation, size) orelse return null;
+
+    const items: [*]T = @ptrCast(memory);
+
+    return items[0..count];
+}
+
+/// Releases the block of `ptr`, which `alloc`, `allocReserved`,
+/// `createReserved`, or `allocReservedSlice` returned, by the size in its
+/// header. A null `ptr`
 /// releases nothing, as with C's free.
 pub fn free(heap: *Heap, ptr: ?*anyopaque) void {
     const payload = ptr orelse return;
@@ -753,4 +780,46 @@ test "a block counts under the kind of its reservation until its release" {
 
     try testing.expectEqual(0, test_backing.blocks);
     try expectMatches(&heap, &test_backing);
+}
+
+test "a slice comes from its reservation as one block of its kind" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), roomy);
+
+    var reservation = try heap.ledger.reserve(.metadata, 100);
+
+    const items = heap.allocReservedSlice(u64, &reservation, 5).?;
+
+    // Five values of 8 bytes and one header of 16.
+    try testing.expectEqual(5, items.len);
+    try testing.expectEqual(56, heap.ledger.usage.metadata);
+    try testing.expectEqual(44, reservation.bytes);
+    try testing.expectEqual(1, test_backing.blocks);
+
+    for (items, 0..) |*item, index| item.* = index;
+
+    // A slice beyond the reservation, and a size that overflows.
+    for ([_]usize{ 4, std.math.maxInt(usize) }) |count| {
+        try testing.expectEqual(
+            null,
+            heap.allocReservedSlice(u64, &reservation, count),
+        );
+
+        try testing.expectEqual(error.BudgetExceeded, heap.takeRefusal().?);
+        try testing.expectEqual(44, reservation.bytes);
+    }
+
+    // An empty slice is a block of its header alone.
+    const none = heap.allocReservedSlice(u64, &reservation, 0).?;
+
+    try testing.expectEqual(0, none.len);
+    try testing.expectEqual(72, heap.ledger.usage.metadata);
+    heap.free(none.ptr);
+    heap.free(items.ptr);
+    heap.ledger.cancel(&reservation);
+    try testing.expectEqual(Ledger.Usage{
+        .peak = 72,
+        .peak_committed = 100,
+    }, heap.ledger.usage);
+    try testing.expectEqual(0, test_backing.blocks);
 }

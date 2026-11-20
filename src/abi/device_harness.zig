@@ -6,9 +6,9 @@
 //! The binding flag and the engine slot belong to the process, so the
 //! cases run in one fixed order: the calls before the binding is
 //! established, the binding, the limits, one engine and the handles that
-//! do not name it, the functions that reject every handle, a run of
-//! engines one after another, and creations that race from several
-//! threads.
+//! do not name it, the functions that reject every handle, the contents
+//! of an engine, a run of engines one after another, and creations that
+//! race from several threads.
 //!
 //! The harness prints one line per case, ending in `ok` or `FAIL`, then
 //! a summary. It exits 0 only when every case passes, 1 when a case
@@ -27,11 +27,21 @@ pub const std_options: std.Options = .{
 
 const limit_names = @typeInfo(san.san_engine_limits).@"struct".field_names;
 
-/// Limits that admit every engine of the harness: each one is 1 << 20.
+/// The content slots of an engine of the harness, the staging of each
+/// content, and the header that its block adds.
+const content_slots = 4;
+const portion_bytes = 4096;
+const block_header = 16;
+
+/// Limits that admit every engine of the harness: each one is 1 << 20,
+/// except the content slots and the staging of a content.
 const roomy: san.san_engine_limits = uniform: {
     var admitting: san.san_engine_limits = undefined;
 
     for (limit_names) |name| @field(admitting, name) = 1 << 20;
+
+    admitting.content_count = content_slots;
+    admitting.input_portion_bytes = portion_bytes;
 
     break :uniform admitting;
 };
@@ -39,6 +49,10 @@ const roomy: san.san_engine_limits = uniform: {
 /// A value that no creation writes, so that a case sees whether a call
 /// wrote its output.
 const unwritten: san.san_handle = 0x5a5a_5a5a_5a5a_5a5a;
+
+/// What turns an engine handle into the handle of the next generation:
+/// the kind fills the lowest byte, and the generation starts above it.
+const next_generation = 0x100;
 
 /// The engines of the run, one after another.
 const run_engines = 1000;
@@ -71,6 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
     try harness.case("limits", limits());
     try harness.case("one engine", oneEngine());
     try harness.case("no content, job, or lease", noOtherHandle());
+    try harness.case("contents", contents());
     try harness.case("engines in turn", enginesInTurn());
     try harness.case("racing creations", try racingCreations());
 
@@ -183,7 +198,7 @@ fn limits() bool {
 }
 
 /// Reports whether `counters` shows an engine that holds only its own
-/// state: one live block of metadata, which is also both peaks, and no
+/// state: two live blocks of metadata, which are also both peaks, and no
 /// reservation, input, output, content, job, or lease.
 fn ownStateAlone(counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64) bool {
     const live = counters[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
@@ -218,13 +233,13 @@ fn ownStateAlone(counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64) bool {
 
 /// Reports whether the counters read of a live engine checks its
 /// arguments and reports the engine's own state on Bionic's heap, and
-/// whether the content opening checks its engine and then fails without
-/// a handle.
+/// whether the content opening checks its engine and writes no handle
+/// for an engine handle that is invalid.
 fn engineCalls(engine: san.san_handle) bool {
     var counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(unwritten);
     var content = unwritten;
 
-    if (san.san_engine_counters(engine + 1, 0, &counters) !=
+    if (san.san_engine_counters(engine + next_generation, 0, &counters) !=
         san.SAN_STATUS_INVALID_HANDLE) return false;
 
     if (san.san_engine_counters(engine, 2, &counters) !=
@@ -244,15 +259,41 @@ fn engineCalls(engine: san.san_handle) bool {
         if (!ownStateAlone(counters)) return false;
     }
 
-    if (san.san_content_open(engine + 1, &content) !=
+    if (san.san_content_open(engine + next_generation, &content) !=
         san.SAN_STATUS_INVALID_HANDLE) return false;
 
-    if (content != san.SAN_NO_HANDLE) return false;
+    return content == san.SAN_NO_HANDLE;
+}
 
-    content = unwritten;
+/// Reports whether `engine` counts `count` open contents, with the
+/// staging of each in its input bytes and nothing else in its live bytes
+/// beyond its own metadata.
+fn holds(engine: san.san_handle, count: i64) bool {
+    var counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(unwritten);
 
-    return san.san_content_open(engine, &content) ==
-        san.SAN_STATUS_ENGINE_FAILURE and content == san.SAN_NO_HANDLE;
+    if (san.san_engine_counters(engine, 0, &counters) !=
+        san.SAN_STATUS_OK) return false;
+
+    const input = counters[san.SAN_ENGINE_COUNTERS_INPUT_BYTES];
+
+    return counters[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT] == count and
+        input == count * (portion_bytes + block_header) and
+        counters[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] ==
+            counters[san.SAN_ENGINE_COUNTERS_METADATA_BYTES] + input;
+}
+
+/// Opens a content in `engine` and returns its handle, or null when the
+/// opening fails or writes no handle.
+fn openContent(engine: san.san_handle) ?san.san_handle {
+    var content = unwritten;
+
+    if (san.san_content_open(engine, &content) != san.SAN_STATUS_OK) {
+        return null;
+    }
+
+    if (content == san.SAN_NO_HANDLE or content == unwritten) return null;
+
+    return content;
 }
 
 /// Reports whether each function of a content, a job, and a lease
@@ -301,7 +342,7 @@ fn noOtherHandle() bool {
     const handles = [_]san.san_handle{
         san.SAN_NO_HANDLE,
         engine,
-        engine + 1,
+        engine + next_generation,
         unwritten,
         std.math.minInt(i64),
     };
@@ -313,6 +354,64 @@ fn noOtherHandle() bool {
     return san.san_engine_shutdown(engine) == san.SAN_STATUS_OK;
 }
 
+/// Reports whether the contents of an engine fill its table, refuse the
+/// next opening, reuse a freed slot under a new handle, and end with their
+/// engine, so that no handle of them names a content of a later engine.
+fn contents() bool {
+    const engine = createEngine() orelse return false;
+
+    var opened: [content_slots + 1]san.san_handle = undefined;
+
+    for (opened[0..content_slots], 1..) |*content, count| {
+        content.* = openContent(engine) orelse return false;
+
+        if (!holds(engine, @intCast(count))) return false;
+    }
+
+    var refused = unwritten;
+
+    if (san.san_content_open(engine, &refused) !=
+        san.SAN_STATUS_BUDGET_EXCEEDED) return false;
+
+    if (refused != san.SAN_NO_HANDLE or !holds(engine, content_slots)) {
+        return false;
+    }
+
+    // The freed slot serves the next opening under another handle, and
+    // the handle that named it before names nothing.
+    if (san.san_content_close(opened[1]) != san.SAN_STATUS_OK) return false;
+    if (!holds(engine, content_slots - 1)) return false;
+    if (!rejects(opened[1])) return false;
+
+    opened[content_slots] = openContent(engine) orelse return false;
+
+    if (!holds(engine, content_slots)) return false;
+
+    for (opened, 0..) |content, at| {
+        if (std.mem.findScalar(san.san_handle, opened[at + 1 ..], content) !=
+            null) return false;
+    }
+
+    if (san.san_engine_shutdown(engine) != san.SAN_STATUS_OK) return false;
+
+    for (opened) |content| {
+        if (!rejects(content)) return false;
+    }
+
+    // A later engine, with a content in the slot of the first one,
+    // still rejects every handle of the earlier engine.
+    const later = createEngine() orelse return false;
+
+    const content = openContent(later) orelse return false;
+
+    for (opened) |earlier| {
+        if (earlier == content or !rejects(earlier)) return false;
+    }
+
+    return holds(later, 1) and
+        san.san_engine_shutdown(later) == san.SAN_STATUS_OK;
+}
+
 fn oneEngine() bool {
     const engine = createEngine() orelse return false;
 
@@ -321,7 +420,7 @@ fn oneEngine() bool {
 
     const invalid = [_]san.san_handle{
         san.SAN_NO_HANDLE,
-        engine + 1,
+        engine + next_generation,
         -engine,
         unwritten,
         std.math.minInt(i64),

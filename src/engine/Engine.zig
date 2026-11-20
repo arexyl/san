@@ -15,8 +15,10 @@
 
 const std = @import("std");
 
+pub const Content = @import("Content.zig");
 pub const Heap = @import("Heap.zig");
 pub const Ledger = @import("Ledger.zig");
+pub const handles = @import("handles.zig");
 
 /// San's panic handler, which the root file of each Android artifact
 /// selects as its `panic`. It keeps another name here: a `panic`
@@ -28,6 +30,12 @@ const Engine = @This();
 
 /// The engine's heap. Its first block holds this engine.
 heap: Heap,
+/// The slots of the contents, one block of the heap. They never move.
+contents: []Content,
+/// The serial of the process while this engine lives.
+serial: handles.Serial,
+/// The staging that the opening of a content admits, in bytes.
+input_portion_bytes: usize,
 
 /// The limits of an engine, under the names of `san_engine_limits`, each
 /// in the unit that its name ends in.
@@ -51,13 +59,43 @@ pub const Limits = struct {
 
     pub const names = @typeInfo(Limits).@"struct".field_names;
 
-    /// Reports whether every limit admits something: none is below 1.
-    fn admitWork(limits: Limits) bool {
+    /// Validates the limits. A limit below 1 admits nothing, a count of
+    /// contents beyond the range of a slot index names more slots than a
+    /// handle can, and both fail as BudgetExceeded.
+    fn admit(limits: Limits) error{BudgetExceeded}!Config {
         inline for (names) |name| {
-            if (@field(limits, name) < 1) return false;
+            if (@field(limits, name) < 1) return error.BudgetExceeded;
         }
 
-        return true;
+        return .{
+            .budget = try .init(limits.aggregate_budget_bytes),
+            .metadata_bytes = @intCast(limits.metadata_bytes),
+            .content_count = std.math.cast(
+                handles.Index,
+                limits.content_count,
+            ) orelse return error.BudgetExceeded,
+            .input_portion_bytes = std.math.cast(
+                usize,
+                limits.input_portion_bytes,
+            ) orelse return error.BudgetExceeded,
+        };
+    }
+};
+
+/// The limits that the engine reads, validated.
+const Config = struct {
+    budget: Ledger.Budget,
+    metadata_bytes: u64,
+    content_count: handles.Index,
+    input_portion_bytes: usize,
+
+    /// Returns the bytes that the engine's own state takes from its
+    /// budget: the engine and the slots of its contents, each a block.
+    /// The sizes are bounded, so the sum cannot overflow.
+    fn footprint(config: Config) u64 {
+        const slots = @as(usize, config.content_count) * @sizeOf(Content);
+
+        return Heap.accounted(@sizeOf(Engine)).? + Heap.accounted(slots).?;
     }
 };
 
@@ -75,9 +113,6 @@ pub const CreateError = error{
     EngineFailure,
 };
 
-/// The bytes that the engine's own state takes from its budget.
-const footprint = Heap.accounted(@sizeOf(Engine)).?;
-
 /// Creates an engine under `limits` in `slot`, with memory from
 /// `backing`, and returns its handle. A failure releases every partial
 /// resource and leaves the slot as it was.
@@ -88,13 +123,16 @@ pub fn create(
     limits: Limits,
 ) CreateError!Handle {
     if (!binding.established()) return error.BindingMismatch;
-    if (!limits.admitWork()) return error.BudgetExceeded;
 
-    const budget: Ledger.Budget = try .init(limits.aggregate_budget_bytes);
+    const config = try limits.admit();
 
-    var heap: Heap = .init(backing, budget);
+    var heap: Heap = .init(backing, config.budget);
 
-    var reservation = try heap.ledger.reserve(.metadata, footprint);
+    heap.ledger.ceilings = .{ .metadata = config.metadata_bytes };
+
+    // One reservation admits the engine and its slots before either
+    // exists, and the two blocks take all of it.
+    var reservation = try heap.ledger.reserve(.metadata, config.footprint());
     errdefer heap.ledger.cancel(&reservation);
 
     const generation = try slot.claim();
@@ -102,10 +140,25 @@ pub fn create(
 
     const engine = heap.createReserved(Engine, &reservation) orelse
         return error.AllocationFailed;
+    errdefer heap.free(engine);
+
+    const contents = heap.allocReservedSlice(
+        Content,
+        &reservation,
+        config.content_count,
+    ) orelse return error.AllocationFailed;
+
+    @memset(contents, .{});
 
     // The heap moves into the block that it already counts. Nothing after
     // this point fails, so no cleanup touches the moved heap.
-    engine.* = .{ .heap = heap };
+    engine.* = .{
+        .heap = heap,
+        .contents = contents,
+        .serial = slot.serial,
+        .input_portion_bytes = config.input_portion_bytes,
+    };
+
     slot.publish(generation, engine);
 
     return .pack(generation);
@@ -113,13 +166,15 @@ pub fn create(
 
 /// Advances the shutdown of the engine of `handle`. A shutdown stops
 /// admission first and releases the engine's resources only after their
-/// holders return them. The engine admits no content, job, or lease, so
-/// the first call completes the shutdown: it stops admission, releases
-/// the engine's state, and releases the slot. The handle is invalid from
-/// then on.
+/// holders return them. The engine admits no job and no lease, so the
+/// first call completes the shutdown: it stops admission, closes every
+/// content, releases the engine's state, and releases the slot. The
+/// handle is invalid from then on.
 pub fn shutdown(slot: *Slot, handle: Handle) error{InvalidHandle}!void {
     const engine = try slot.close(handle);
 
+    Content.shutAll(engine);
+    slot.serial = engine.serial;
     engine.destroy();
     slot.release();
 }
@@ -132,10 +187,9 @@ pub fn resolve(
     slot: *const Slot,
     handle: Handle,
 ) error{ InvalidHandle, Closed }!*Engine {
-    return switch (try heldPhase(slot, handle)) {
-        .live => slot.engine.?,
-        .closing => error.Closed,
-    };
+    const held = try heldBy(slot, handle);
+
+    return if (held.closing) error.Closed else held.engine;
 }
 
 /// Returns the engine of `handle` for a call that works also while the
@@ -145,28 +199,22 @@ pub fn resolveClosing(
     slot: *const Slot,
     handle: Handle,
 ) error{InvalidHandle}!*Engine {
-    _ = try heldPhase(slot, handle);
+    const held = try heldBy(slot, handle);
 
-    return slot.engine.?;
+    return held.engine;
 }
 
-/// Returns whether the engine of `handle` is live or closing, which are
-/// the phases in which the slot holds an engine.
-fn heldPhase(
-    slot: *const Slot,
-    handle: Handle,
-) error{InvalidHandle}!enum { live, closing } {
+/// Returns the engine that `slot` holds when `handle` names it. The
+/// generation is compared on the word alone, so the handle of a
+/// completed engine fails before the slot's engine is read.
+fn heldBy(slot: *const Slot, handle: Handle) error{InvalidHandle}!Slot.Held {
     const generation = handle.unpack() orelse return error.InvalidHandle;
 
     const word = slot.load(.acquire);
 
     if (word.generation != generation) return error.InvalidHandle;
 
-    return switch (word.phase) {
-        .live => .live,
-        .closing => .closing,
-        .free, .creating => error.InvalidHandle,
-    };
+    return slot.heldAt(word) orelse error.InvalidHandle;
 }
 
 /// Releases the engine's state. The heap leaves the block before it
@@ -176,6 +224,7 @@ fn heldPhase(
 fn destroy(engine: *Engine) void {
     var heap = engine.heap;
 
+    heap.free(engine.contents.ptr);
     heap.free(engine);
 
     if (!heap.ledger.settled()) {
@@ -209,15 +258,9 @@ pub const Handle = enum(u64) {
 
     /// San's packing of a handle.
     const Bits = packed struct(u64) {
+        tag: handles.Tag,
         generation: u32,
-        tag: Tag,
         unused: u24 = 0,
-    };
-
-    /// The type tag of a handle. San issues only engine handles.
-    const Tag = enum(u8) {
-        engine = 1,
-        _,
     };
 
     fn pack(generation: u32) Handle {
@@ -247,6 +290,39 @@ pub const Slot = struct {
     /// the release store of the word that publishes it, and a reader
     /// reads it only after an acquire of that word.
     engine: ?*Engine = null,
+    /// The serial of the process while no engine lives. A creation takes
+    /// it into its engine after its claim, and a shutdown returns it
+    /// before it frees the slot, under the same ordering as `engine`.
+    serial: handles.Serial = .{},
+
+    /// The engine of a slot that holds one.
+    pub const Held = struct {
+        engine: *Engine,
+        generation: u32,
+        /// Whether a shutdown of the engine has begun.
+        closing: bool,
+    };
+
+    /// Returns the engine that the slot holds, live or closing, or null.
+    pub fn held(slot: *const Slot) ?Held {
+        return slot.heldAt(slot.load(.acquire));
+    }
+
+    /// Returns the engine of the slot at `word`, which an acquire of the
+    /// slot's word returned.
+    fn heldAt(slot: *const Slot, word: Word) ?Held {
+        const closing = switch (word.phase) {
+            .live => false,
+            .closing => true,
+            .free, .creating => return null,
+        };
+
+        return .{
+            .engine = slot.engine.?,
+            .generation = word.generation,
+            .closing = closing,
+        };
+    }
 
     const Word = packed struct(u64) {
         generation: u32,
@@ -356,7 +432,18 @@ const testing = std.testing;
 const TestBacking = Heap.TestBacking;
 
 /// Limits that admit every engine of the tests below.
-const roomy: Limits = uniform(1 << 20);
+const roomy: Limits = limits: {
+    var limits = uniform(1 << 20);
+
+    limits.content_count = 4;
+    limits.input_portion_bytes = 4096;
+
+    break :limits limits;
+};
+
+/// The bytes that an engine under the roomy limits takes for its own
+/// state.
+const footprint = (roomy.admit() catch unreachable).footprint();
 
 /// Returns limits that all hold `value`.
 fn uniform(value: i64) Limits {
@@ -420,25 +507,42 @@ fn expectInvalid(slot: *Slot, handle: Handle) !void {
     try testing.expectEqual(word, slot.load(.monotonic));
 }
 
-/// Checks that `engine` holds only its own state and that the ledger
-/// counts exactly what the backing holds.
+/// Returns the bytes that an engine under `limits` takes for its own
+/// state.
+fn footprintOf(limits: Limits) !u64 {
+    return (try limits.admit()).footprint();
+}
+
+/// Checks that `engine` holds only its own state, under the roomy limits,
+/// and that the ledger counts exactly what the backing holds.
 fn expectOwnState(
     engine: *const Engine,
     test_backing: *const TestBacking,
+) !void {
+    try expectOwnStateOf(engine, test_backing, footprint);
+}
+
+/// Checks the same for an engine whose own state takes `bytes`.
+fn expectOwnStateOf(
+    engine: *const Engine,
+    test_backing: *const TestBacking,
+    bytes: u64,
 ) !void {
     const usage = engine.heap.ledger.usage;
 
     // The engine's own state is metadata.
     try testing.expectEqual(Ledger.Usage{
-        .live = footprint,
-        .peak = footprint,
-        .peak_committed = footprint,
-        .metadata = footprint,
+        .live = bytes,
+        .peak = bytes,
+        .peak_committed = bytes,
+        .metadata = bytes,
     }, usage);
 
     try testing.expectEqual(test_backing.outstanding, usage.live);
     try testing.expectEqual(test_backing.peak, usage.peak);
-    try testing.expectEqual(1, test_backing.blocks);
+
+    // The engine and the slots of its contents.
+    try testing.expectEqual(2, test_backing.blocks);
 }
 
 /// Creates and shuts down an engine with `limits` in `process`, which
@@ -448,9 +552,28 @@ fn expectAdmits(process: *Process, limits: Limits) !void {
 
     const handle = try process.createEngine(test_backing.backing(), limits);
 
-    try expectOwnState(try resolve(&process.slot, handle), &test_backing);
+    try expectOwnStateOf(
+        try resolve(&process.slot, handle),
+        &test_backing,
+        try footprintOf(limits),
+    );
+
     try shutdown(&process.slot, handle);
     try testing.expectEqual(0, test_backing.blocks);
+}
+
+/// Checks that a creation under `limits` fails as BudgetExceeded and
+/// leaves `process` untouched.
+fn expectRefused(process: *Process, limits: Limits) !void {
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    try testing.expectError(
+        error.BudgetExceeded,
+        process.createEngine(test_backing.backing(), limits),
+    );
+
+    try testing.expectEqual(0, test_backing.peak);
+    try expectFree(&process.slot, 0);
 }
 
 test "creation fails as BindingMismatch until the binding is established" {
@@ -517,12 +640,56 @@ test "each limit below 1 fails as BudgetExceeded" {
         }
     }
 
+    try expectAdmits(&process, roomy);
+}
+
+test "the smallest and the largest admitted limits create an engine" {
+    var process: Process = .init();
+
+    // One slot is the smallest table, and the two limits that hold the
+    // engine's own state are the only ones above 1.
     var smallest = uniform(1);
 
-    smallest.aggregate_budget_bytes = footprint;
+    const smallest_bytes: i64 = @intCast(try footprintOf(smallest));
+
+    smallest.aggregate_budget_bytes = smallest_bytes;
+    smallest.metadata_bytes = smallest_bytes;
 
     try expectAdmits(&process, smallest);
-    try expectAdmits(&process, uniform(std.math.maxInt(i64)));
+
+    var largest = uniform(std.math.maxInt(i64));
+
+    largest.content_count = std.math.maxInt(handles.Index);
+
+    try expectAdmits(&process, largest);
+}
+
+test "a content count beyond the slot index fails as BudgetExceeded" {
+    var process: Process = .init();
+
+    var limits = uniform(std.math.maxInt(i64));
+
+    limits.content_count = std.math.maxInt(handles.Index) + 1;
+
+    try expectRefused(&process, limits);
+
+    limits.content_count = std.math.maxInt(i64);
+
+    try expectRefused(&process, limits);
+}
+
+test "the metadata ceiling admits exactly the engine's own state" {
+    var process: Process = .init();
+
+    var limits = roomy;
+
+    limits.metadata_bytes = footprint - 1;
+
+    try expectRefused(&process, limits);
+
+    limits.metadata_bytes = footprint;
+
+    try expectAdmits(&process, limits);
 }
 
 test "the engine's own state counts against its budget" {
@@ -628,7 +795,7 @@ test "shutdown completes once the engine's heap settles its other work" {
 
     const direct = engine.heap.alloc(32).?;
 
-    try testing.expectEqual(3, test_backing.blocks);
+    try testing.expectEqual(4, test_backing.blocks);
     engine.heap.free(direct);
     engine.heap.free(reserved);
     engine.heap.ledger.cancel(&reservation);
@@ -709,6 +876,66 @@ test "a handle fails as Closed while its shutdown holds the slot" {
     try testing.expectEqual(engine, try resolveClosing(&process.slot, handle));
     process.slot.store(live, .monotonic);
     try shutdown(&process.slot, handle);
+}
+
+test "a content handle fails as Closed while its shutdown holds the slot" {
+    var process: Process = .init();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const handle = try process.createEngine(test_backing.backing(), roomy);
+
+    const live = process.slot.load(.monotonic);
+
+    const engine = try resolve(&process.slot, handle);
+
+    const earlier = try Content.open(engine);
+
+    const content = try Content.open(engine);
+
+    // A content that its own close ended holds no slot at the shutdown.
+    Content.close(try Content.resolve(&process.slot, earlier));
+
+    var other: handles.Slotted = @bitCast(@backingInt(content));
+
+    other.generation += 1;
+
+    const stale: Content.Handle = @fromBackingInt(@as(u64, @bitCast(other)));
+    const zero: Content.Handle = @fromBackingInt(@as(u64, 0));
+
+    try testing.expectEqual(
+        engine,
+        (try Content.resolve(&process.slot, content)).engine,
+    );
+
+    // The steps of a shutdown up to the point where it would wait: the
+    // slot word, then the contents.
+    process.slot.store(.{ .generation = 1, .phase = .closing }, .monotonic);
+
+    for (0..2) |step| {
+        try testing.expectError(
+            error.Closed,
+            Content.resolve(&process.slot, content),
+        );
+
+        // A handle that names no content is invalid in every phase.
+        for ([_]Content.Handle{ earlier, stale, zero }) |invalid| {
+            try testing.expectError(
+                error.InvalidHandle,
+                Content.resolve(&process.slot, invalid),
+            );
+        }
+
+        if (step == 0) Content.shutAll(engine);
+    }
+
+    // The shut content holds its slot and its generation, and no staging.
+    try testing.expectEqual(0, Content.countOpen(engine));
+    try testing.expectEqual(0, engine.heap.ledger.usage.input);
+    try testing.expectEqual(2, test_backing.blocks);
+    process.slot.store(live, .monotonic);
+    try shutdown(&process.slot, handle);
+    try testing.expectEqual(0, test_backing.blocks);
 }
 
 test "a creating slot rejects a guessed handle and admits no creation" {
@@ -833,7 +1060,7 @@ test "racing creations on one slot admit exactly one engine" {
         for (outcomes, backings) |outcome, test_backing| {
             if (outcome) |handle| {
                 try testing.expectEqual(null, winner);
-                try testing.expectEqual(1, test_backing.blocks);
+                try testing.expectEqual(2, test_backing.blocks);
                 winner = handle;
             } else |err| {
                 try testing.expectEqual(error.BudgetExceeded, err);
@@ -907,6 +1134,8 @@ const Churn = struct {
 const Tally = struct {
     /// The engines that it created.
     created: u32 = 0,
+    /// The contents that it opened, one in each engine.
+    opened: u32 = 0,
     /// Its creations while another thread held an engine.
     overlaps: u32 = 0,
     /// Its outcomes that the contract of the slot excludes.
@@ -927,9 +1156,20 @@ test "creations and shutdowns that churn on one slot keep one engine" {
     try race(churnAtOnce, &churn, &backings, &tallies);
 
     for (tallies, backings) |tally, test_backing| {
-        try testing.expectEqual(Tally{ .created = churn_engines }, tally);
+        try testing.expectEqual(Tally{
+            .created = churn_engines,
+            .opened = churn_engines,
+        }, tally);
+
         try testing.expectEqual(0, test_backing.blocks);
     }
+
+    // Each opening took one generation of the one serial, whichever
+    // thread and engine made it.
+    try testing.expectEqual(
+        1 + race_threads * churn_engines,
+        churn.process.slot.serial.next,
+    );
 
     try expectFree(&churn.process.slot, race_threads * churn_engines);
 }
@@ -990,9 +1230,23 @@ fn hold(
     };
 
     const own = engine.heap.ledger.usage.live == footprint and
-        test_backing.blocks == 1;
+        test_backing.blocks == 2;
 
     tally.unexpected += @intFromBool(!own);
+
+    // The shutdown closes the content.
+    if (Content.open(engine)) |content| {
+        tally.opened += 1;
+
+        _ = Content.resolve(&churn.process.slot, content) catch {
+            tally.unexpected += 1;
+        };
+
+        tally.unexpected += @intFromBool(test_backing.blocks != 3);
+    } else |_| {
+        tally.unexpected += 1;
+    }
+
     _ = churn.holders.fetchSub(1, .acq_rel);
 
     shutdown(&churn.process.slot, handle) catch {
@@ -1001,6 +1255,8 @@ fn hold(
 }
 
 test {
+    _ = Content;
     _ = Heap;
+    _ = handles;
     _ = Ledger;
 }

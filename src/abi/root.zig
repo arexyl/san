@@ -9,15 +9,17 @@
 //! one for every function that the translation declares, so a function
 //! that drifts from the pinned header fails the compile.
 //!
-//! San implements the engine lifecycle and the counters read. It issues
-//! no content, job, or lease handle, so each function that takes one
-//! rejects every handle, and san_content_open checks its engine and then
-//! fails as SAN_STATUS_ENGINE_FAILURE.
+//! San implements the engine lifecycle, the counters read, and the
+//! opening and the close of a content. It issues no job and no lease
+//! handle, so each function that takes one rejects every handle. The
+//! feed and the job request check their content and then fail as
+//! SAN_STATUS_ENGINE_FAILURE.
 
 const std = @import("std");
 const san = @import("san");
 const Engine = @import("engine");
 
+const Content = Engine.Content;
 const Heap = Engine.Heap;
 
 /// The binding flag and the engine slot of one process.
@@ -66,27 +68,27 @@ pub export fn san_content_open(
 }
 
 pub export fn san_content_feed(
-    _: san.san_handle,
+    content: san.san_handle,
     _: i64,
     _: [*c]const u8,
     _: i32,
     _: i32,
 ) san.san_status {
-    return san.SAN_STATUS_INVALID_HANDLE;
+    return unimplementedOn(&process, content);
 }
 
-pub export fn san_content_close(_: san.san_handle) san.san_status {
-    return san.SAN_STATUS_INVALID_HANDLE;
+pub export fn san_content_close(content: san.san_handle) san.san_status {
+    return closeContent(&process, content);
 }
 
 pub export fn san_job_request(
-    _: san.san_handle,
+    content: san.san_handle,
     _: [*c]const san.san_output_request,
     job: [*c]san.san_handle,
 ) san.san_status {
     job.* = san.SAN_NO_HANDLE;
 
-    return san.SAN_STATUS_INVALID_HANDLE;
+    return unimplementedOn(&process, content);
 }
 
 pub export fn san_job_step(_: san.san_handle, _: [*c]i64) san.san_status {
@@ -254,8 +256,12 @@ fn counters(
     const ledger = &found.heap.ledger;
     const usage = ledger.usage;
 
-    // San admits no content, job, or lease, so their counts are 0.
+    // San admits no job and no lease, so their counts are 0.
     out.* = @splat(0);
+
+    out[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT] =
+        reported(Content.countOpen(found));
+
     out[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] = reported(usage.live);
     out[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES] = reported(usage.reserved);
     out[san.SAN_ENGINE_COUNTERS_PEAK_LIVE_BYTES] = reported(usage.peak);
@@ -278,8 +284,8 @@ fn reported(count: u64) i64 {
     return @intCast(count);
 }
 
-/// Checks the engine of a content opening in `state` and writes
-/// SAN_NO_HANDLE to `out`.
+/// Opens a content in an engine of `state` and writes its handle to
+/// `out`, or SAN_NO_HANDLE on a failure.
 fn openContent(
     state: *Process,
     engine: san.san_handle,
@@ -287,7 +293,34 @@ fn openContent(
 ) san.san_status {
     out.* = san.SAN_NO_HANDLE;
 
-    _ = Engine.resolve(&state.slot, engineHandle(engine)) catch |err| {
+    const found = Engine.resolve(
+        &state.slot,
+        engineHandle(engine),
+    ) catch |err| return statusOf(err);
+
+    const content = Content.open(found) catch |err| return statusOf(err);
+
+    out.* = @bitCast(@backingInt(content));
+
+    return san.SAN_STATUS_OK;
+}
+
+fn closeContent(state: *Process, content: san.san_handle) san.san_status {
+    const live = Content.resolve(
+        &state.slot,
+        contentHandle(content),
+    ) catch |err| return statusOf(err);
+
+    Content.close(live);
+
+    return san.SAN_STATUS_OK;
+}
+
+/// The status of a function that San does not implement yet, called on
+/// a content of `state`: the checks of the handle, then
+/// SAN_STATUS_ENGINE_FAILURE.
+fn unimplementedOn(state: *Process, content: san.san_handle) san.san_status {
+    _ = Content.resolve(&state.slot, contentHandle(content)) catch |err| {
         return statusOf(err);
     };
 
@@ -296,6 +329,10 @@ fn openContent(
 
 fn engineHandle(engine: san.san_handle) Engine.Handle {
     return @fromBackingInt(@as(u64, @bitCast(engine)));
+}
+
+fn contentHandle(content: san.san_handle) Content.Handle {
+    return @fromBackingInt(@as(u64, @bitCast(content)));
 }
 
 /// A failure of the engine module that a function above can meet.
@@ -318,7 +355,21 @@ const testing = std.testing;
 const TestBacking = Heap.TestBacking;
 
 /// Limits that admit every engine of the tests below.
-const roomy: san.san_engine_limits = uniform(1 << 20);
+const roomy: san.san_engine_limits = limits: {
+    var limits = uniform(1 << 20);
+
+    limits.content_count = contents;
+    limits.input_portion_bytes = portion;
+
+    break :limits limits;
+};
+
+/// The content slots and the staging of each content under `roomy`.
+const contents = 4;
+const portion = 4096;
+
+/// What a staging takes from the ledger: its portion and its header.
+const staged = portion + Heap.header_size;
 
 /// Returns limits that all hold `value`.
 fn uniform(value: i64) san.san_engine_limits {
@@ -332,6 +383,10 @@ fn uniform(value: i64) san.san_engine_limits {
 /// A value that no creation writes, so that a test sees whether a call
 /// wrote its output.
 const unwritten: san.san_handle = 0x5a5a_5a5a_5a5a_5a5a;
+
+/// What turns an engine handle into the handle of the next generation:
+/// the kind fills the lowest byte, and the generation starts above it.
+const next_generation = 0x100;
 
 /// Returns a state whose binding is established.
 fn established() Process {
@@ -441,7 +496,7 @@ test "each limit of the header reaches the engine" {
 const unread: Counters = @splat(unwritten);
 
 /// Returns the counters report of the given ledger counts, with every
-/// count of contents, jobs, and leases at 0.
+/// count of jobs and leases at 0.
 fn countersOf(counts: struct {
     live: u64,
     reserved: u64 = 0,
@@ -449,8 +504,13 @@ fn countersOf(counts: struct {
     peak_committed: u64,
     metadata: u64,
     output: u64 = 0,
+    contents: u64 = 0,
+    input: u64 = 0,
 }) Counters {
     var report: Counters = @splat(0);
+
+    report[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT] = reported(counts.contents);
+    report[san.SAN_ENGINE_COUNTERS_INPUT_BYTES] = reported(counts.input);
 
     report[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] = reported(counts.live);
     report[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES] = reported(counts.reserved);
@@ -480,7 +540,7 @@ test "the counters read checks its handle, then its flag, and writes nothing" {
 
     const invalid = [_]san.san_handle{
         san.SAN_NO_HANDLE,
-        engine + 1,
+        engine + next_generation,
         unwritten,
     };
 
@@ -523,7 +583,7 @@ test "the counters read reports the ledger and resets the peaks on request" {
         create(&state, test_backing.backing(), roomy, &handle),
     );
 
-    // The engine's own state is its one block, of the metadata kind.
+    // The engine's own state is its two blocks, of the metadata kind.
     const own = test_backing.outstanding;
 
     var report = unread;
@@ -619,7 +679,7 @@ test "the content opening checks its engine and writes no handle" {
 
     const invalid = [_]san.san_handle{
         san.SAN_NO_HANDLE,
-        engine + 1,
+        engine + next_generation,
         unwritten,
     };
 
@@ -634,18 +694,313 @@ test "the content opening checks its engine and writes no handle" {
         try testing.expectEqual(san.SAN_NO_HANDLE, content);
     }
 
+    // No call kept anything: the engine holds its own state alone.
+    try testing.expectEqual(2, test_backing.blocks);
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+/// Creates an engine under `roomy` in `state` and returns its handle.
+fn createRoomy(state: *Process, test_backing: *TestBacking) !san.san_handle {
+    var engine = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        create(state, test_backing.backing(), roomy, &engine),
+    );
+
+    return engine;
+}
+
+/// Reads the counters of `engine` in `state`.
+fn readCounters(state: *Process, engine: san.san_handle) !Counters {
+    var report = unread;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        counters(state, engine, 0, &report),
+    );
+
+    return report;
+}
+
+/// Returns the count of the open contents that `engine` reports.
+fn openCount(state: *Process, engine: san.san_handle) !i64 {
+    const report = try readCounters(state, engine);
+
+    return report[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT];
+}
+
+const input_bytes = san.SAN_ENGINE_COUNTERS_INPUT_BYTES;
+const metadata_bytes = san.SAN_ENGINE_COUNTERS_METADATA_BYTES;
+
+/// Opens a content in `engine` and returns its handle.
+fn openOk(state: *Process, engine: san.san_handle) !san.san_handle {
     var content = unwritten;
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
+        san.SAN_STATUS_OK,
+        openContent(state, engine, &content),
+    );
+
+    try testing.expect(content != san.SAN_NO_HANDLE);
+
+    return content;
+}
+
+test "a content opens, is counted, and closes once" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const own = try readCounters(&state, engine);
+
+    const metadata = own[metadata_bytes];
+
+    const first = try openOk(&state, engine);
+
+    var report = try readCounters(&state, engine);
+
+    try testing.expectEqual(1, report[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT]);
+    try testing.expectEqual(staged, report[input_bytes]);
+    try testing.expectEqual(metadata, report[metadata_bytes]);
+
+    try testing.expectEqual(
+        metadata + staged,
+        report[san.SAN_ENGINE_COUNTERS_LIVE_BYTES],
+    );
+
+    const second = try openOk(&state, engine);
+
+    report = try readCounters(&state, engine);
+
+    try testing.expect(second != first);
+    try testing.expectEqual(2, report[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT]);
+
+    try testing.expectEqual(
+        2 * staged,
+        report[input_bytes],
+    );
+
+    try testing.expectEqual(metadata, report[metadata_bytes]);
+    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, first));
+
+    report = try readCounters(&state, engine);
+
+    try testing.expectEqual(1, report[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT]);
+    try testing.expectEqual(staged, report[input_bytes]);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        closeContent(&state, first),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, second));
+
+    try testing.expectEqual(countersOf(.{
+        .live = @intCast(metadata),
+        .peak = @intCast(metadata + 2 * staged),
+        .peak_committed = @intCast(metadata + 2 * staged),
+        .metadata = @intCast(metadata),
+    }), try readCounters(&state, engine));
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "a refused opening writes no handle and keeps nothing" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    var opened: [contents]san.san_handle = undefined;
+
+    for (&opened) |*content| content.* = try openOk(&state, engine);
+
+    const before = try readCounters(&state, engine);
+
+    var content = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BUDGET_EXCEEDED,
         openContent(&state, engine, &content),
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, content);
+    try testing.expectEqual(contents + 2, test_backing.blocks);
 
-    // No call kept anything: the engine holds its own state alone.
-    try testing.expectEqual(1, test_backing.blocks);
+    try testing.expectEqual(
+        before[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT],
+        try openCount(&state, engine),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        closeContent(&state, opened[contents - 1]),
+    );
+
+    // The freed slot is the one that the next opening takes.
+    const reopened = try openOk(&state, engine);
+
+    try testing.expect(reopened != opened[contents - 1]);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        closeContent(&state, opened[contents - 1]),
+    );
+
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "a refused backing allocation fails an opening as AllocationFailed" {
+    var state = established();
+
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{
+        .fail_index = 2,
+    });
+
+    var test_backing: TestBacking = .init(failing.allocator());
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    var content = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ALLOCATION_FAILED,
+        openContent(&state, engine, &content),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, content);
+    try testing.expectEqual(2, test_backing.blocks);
+
+    try testing.expectEqual(0, try openCount(&state, engine));
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "the feed and the job request on an open content fail as EngineFailure" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        unimplementedOn(&state, content),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, content));
+
+    for ([_]san.san_handle{ content, engine, san.SAN_NO_HANDLE }) |handle| {
+        try testing.expectEqual(
+            san.SAN_STATUS_INVALID_HANDLE,
+            unimplementedOn(&state, handle),
+        );
+    }
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+}
+
+test "an engine handle and a content handle are not interchangeable" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    var opened = unwritten;
+    var report = unread;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        openContent(&state, content, &opened),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, opened);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        counters(&state, content, 0, &report),
+    );
+
+    try testing.expectEqual(unread, report);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        shutdown(&state, content),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        closeContent(&state, engine),
+    );
+
+    // Neither misuse changed the engine or its content.
+    try testing.expectEqual(1, try openCount(&state, engine));
+
+    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, content));
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+}
+
+test "a shutdown closes the open contents and ends their handles" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const first_engine = try createRoomy(&state, &test_backing);
+
+    const first = try openOk(&state, first_engine);
+
+    _ = try openOk(&state, first_engine);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        shutdown(&state, first_engine),
+    );
+
+    try testing.expectEqual(0, test_backing.blocks);
+    try testing.expectEqual(0, test_backing.outstanding);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        closeContent(&state, first),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        unimplementedOn(&state, first),
+    );
+
+    const second_engine = try createRoomy(&state, &test_backing);
+
+    // The new content sits in the slot that the old one held.
+    const second = try openOk(&state, second_engine);
+
+    try testing.expect(second != first);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        closeContent(&state, first),
+    );
+
+    try testing.expectEqual(1, try openCount(&state, second_engine));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        shutdown(&state, second_engine),
+    );
+
     try testing.expectEqual(0, test_backing.blocks);
 }
 
@@ -708,7 +1063,7 @@ test "a second engine fails as BudgetExceeded and leaves the first" {
 
     try testing.expect(engine != san.SAN_NO_HANDLE);
     try expectRefused(&state, roomy, san.SAN_STATUS_BUDGET_EXCEEDED);
-    try testing.expectEqual(1, test_backing.blocks);
+    try testing.expectEqual(2, test_backing.blocks);
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
     try testing.expectEqual(0, test_backing.blocks);
 }
@@ -767,7 +1122,7 @@ test "a shutdown ends the engine and its handle" {
         );
     }
 
-    try testing.expectEqual(1, test_backing.blocks);
+    try testing.expectEqual(2, test_backing.blocks);
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, first));
     try testing.expectEqual(0, test_backing.blocks);
 
@@ -873,15 +1228,87 @@ test "the exported functions run the lifecycle of the process" {
     }), counted);
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
-        san_content_open(engine, &content),
+        san.SAN_STATUS_INVALID_HANDLE,
+        san_content_open(engine + next_generation, &content),
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, content);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        san_content_open(engine, &content),
+    );
+
+    try testing.expect(content != san.SAN_NO_HANDLE);
+
+    const byte: u8 = 0;
+
+    const request: san.san_output_request = .{
+        .left = 0,
+        .top = 0,
+        .right = 0,
+        .bottom = 0,
+        .max_output_width = 0,
+    };
+
+    var job = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        san_content_feed(content, 0, &byte, 1, 0),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        san_job_request(content, &request, &job),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, job);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        san_engine_counters(engine, 0, &counted),
+    );
+
+    try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT]);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        san_content_close(content),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        san_content_close(content),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        san_content_feed(content, 0, &byte, 1, 0),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        san_job_request(content, &request, &job),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, job);
+
+    // A content still open at the shutdown closes with it.
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        san_content_open(engine, &content),
+    );
+
     try testing.expectEqual(san.SAN_STATUS_OK, san_engine_shutdown(engine));
 
     try testing.expectEqual(
         san.SAN_STATUS_INVALID_HANDLE,
         san_engine_shutdown(engine),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        san_content_close(content),
     );
 }

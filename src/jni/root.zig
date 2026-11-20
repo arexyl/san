@@ -564,6 +564,8 @@ fn limitsUnder(budget: jni.jlong) [limit_count]jni.jlong {
     var limits: [limit_count]jni.jlong = @splat(1 << 20);
 
     limits[0] = budget;
+    limits[1] = 4;
+    limits[4] = 4096;
 
     return limits;
 }
@@ -724,6 +726,7 @@ test "the methods convert their arguments and run the lifecycle" {
     const shutdown = try methodOf(&env, "engineShutdown", engineShutdown);
     const counters = try methodOf(&env, "engineCounters", engineCounters);
     const open = try methodOf(&env, "contentOpen", contentOpen);
+    const close = try methodOf(&env, "contentClose", contentClose);
 
     const jenv = env.pointer();
 
@@ -822,7 +825,7 @@ test "the methods convert their arguments and run the lifecycle" {
 
         for (counted) |element| try testing.expect(element != unwritten);
 
-        // The engine's own state is its one block, of the metadata kind.
+        // The engine's own state is its two blocks, of the metadata kind.
         const live = counted[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
 
         try testing.expect(live > 0);
@@ -840,12 +843,43 @@ test "the methods convert their arguments and run the lifecycle" {
 
     elements[0] = unwritten;
 
+    // The engine handle of the next generation: the kind fills the
+    // lowest byte.
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
-        open(jenv, null, engine, out.object()),
+        san.SAN_STATUS_INVALID_HANDLE,
+        open(jenv, null, engine + 0x100, out.object()),
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, elements[0]);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        open(jenv, null, engine, out.object()),
+    );
+
+    const content = elements[0];
+
+    try testing.expect(content != san.SAN_NO_HANDLE and content != unwritten);
+
+    counted = @splat(unwritten);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        counters(jenv, null, engine, jni.JNI_FALSE, counted_array.object()),
+    );
+
+    try testing.expectEqual(
+        1,
+        counted[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT],
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, close(jenv, null, content));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        close(jenv, null, content),
+    );
+
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(jenv, null, engine));
 
     try testing.expectEqual(

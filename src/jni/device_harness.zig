@@ -148,7 +148,8 @@ const Copy = *const fn (
 const limit_count = 16;
 
 /// Calls `create` with roomy limits, except that the limit `index` is
-/// `value`.
+/// `value`. Roomy means 1 << 20 for each limit but the four content slots
+/// and the staging of 4096 bytes of each content.
 fn createWith(
     create: Create,
     env: [*c]jni.JNIEnv,
@@ -158,6 +159,8 @@ fn createWith(
 ) jni.jint {
     var limits: [limit_count]jni.jlong = @splat(1 << 20);
 
+    limits[1] = 4;
+    limits[4] = 4096;
     limits[index] = value;
 
     return create(
@@ -319,6 +322,7 @@ fn lifecycle(env: *fake.Env) bool {
     const shutdown = env.method(OfHandle, "engineShutdown") orelse return false;
     const counters = env.method(Counters, "engineCounters") orelse return false;
     const open = env.method(IntoArray, "contentOpen") orelse return false;
+    const close = env.method(OfHandle, "contentClose") orelse return false;
 
     const jenv = env.pointer();
 
@@ -382,7 +386,7 @@ fn lifecycle(env: *fake.Env) bool {
         san.SAN_STATUS_BUDGET_EXCEEDED) return false;
 
     // The read of a live engine writes every counter: the engine's own
-    // state is its one block, of the metadata kind.
+    // state is its two blocks, of the metadata kind.
     var counted: [san.SAN_ENGINE_COUNTERS_LENGTH]jni.jlong = @splat(unwritten);
     var counted_array: fake.Array = .{ .longs = &counted };
 
@@ -399,12 +403,33 @@ fn lifecycle(env: *fake.Env) bool {
         live != counted[san.SAN_ENGINE_COUNTERS_METADATA_BYTES] or
         counted[san.SAN_ENGINE_COUNTERS_JOB_COUNT] != 0) return false;
 
-    // The opening of a content fails without a handle.
-
-    if (open(jenv, null, engine, out.object()) !=
-        san.SAN_STATUS_ENGINE_FAILURE) return false;
+    // The opening of a content on the engine handle of the next
+    // generation, whose kind fills the lowest byte, writes no handle.
+    if (open(jenv, null, engine + 0x100, out.object()) !=
+        san.SAN_STATUS_INVALID_HANDLE) return false;
 
     if (elements[0] != san.SAN_NO_HANDLE) return false;
+
+    if (open(jenv, null, engine, out.object()) != san.SAN_STATUS_OK) {
+        return false;
+    }
+
+    const content = elements[0];
+
+    if (content == san.SAN_NO_HANDLE or content == unwritten) return false;
+
+    counted = @splat(unwritten);
+
+    if (counters(jenv, null, engine, jni.JNI_FALSE, counted_array.object()) !=
+        san.SAN_STATUS_OK) return false;
+
+    if (counted[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT] != 1) return false;
+    if (close(jenv, null, content) != san.SAN_STATUS_OK) return false;
+
+    if (close(jenv, null, content) != san.SAN_STATUS_INVALID_HANDLE) {
+        return false;
+    }
+
     if (shutdown(jenv, null, engine) != san.SAN_STATUS_OK) return false;
 
     if (shutdown(jenv, null, engine) != san.SAN_STATUS_INVALID_HANDLE) {
