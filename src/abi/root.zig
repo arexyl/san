@@ -9,11 +9,11 @@
 //! one for every function that the translation declares, so a function
 //! that drifts from the pinned header fails the compile.
 //!
-//! San implements the engine lifecycle, the counters read, and the
-//! opening and the close of a content. It issues no job and no lease
-//! handle, so each function that takes one rejects every handle. The
-//! feed and the job request check their content and then fail as
-//! SAN_STATUS_ENGINE_FAILURE.
+//! San implements the engine lifecycle, the counters read, the contents
+//! with their feed, and the lifecycle of a job. No decode exists: a step
+//! ends its job as canceled when the cancellation flag is set, and as
+//! SAN_STATUS_ENGINE_FAILURE otherwise. San issues no lease handle, so
+//! each function that takes one rejects every handle.
 
 const std = @import("std");
 const san = @import("san");
@@ -21,6 +21,7 @@ const Engine = @import("engine");
 
 const Content = Engine.Content;
 const Heap = Engine.Heap;
+const Job = Engine.Job;
 
 /// The binding flag and the engine slot of one process.
 const Process = struct {
@@ -69,12 +70,17 @@ pub export fn san_content_open(
 
 pub export fn san_content_feed(
     content: san.san_handle,
-    _: i64,
-    _: [*c]const u8,
-    _: i32,
-    _: i32,
+    position: i64,
+    bytes: [*c]const u8,
+    length: i32,
+    end_of_input: i32,
 ) san.san_status {
-    return unimplementedOn(&process, content);
+    return feedContent(&process, content, .{
+        .position = position,
+        .bytes = bytes,
+        .length = length,
+        .end_of_input = end_of_input,
+    });
 }
 
 pub export fn san_content_close(content: san.san_handle) san.san_status {
@@ -83,24 +89,25 @@ pub export fn san_content_close(content: san.san_handle) san.san_status {
 
 pub export fn san_job_request(
     content: san.san_handle,
-    _: [*c]const san.san_output_request,
+    request: [*c]const san.san_output_request,
     job: [*c]san.san_handle,
 ) san.san_status {
-    job.* = san.SAN_NO_HANDLE;
-
-    return unimplementedOn(&process, content);
+    return requestJob(&process, content, request.*, job);
 }
 
-pub export fn san_job_step(_: san.san_handle, _: [*c]i64) san.san_status {
-    return san.SAN_STATUS_INVALID_HANDLE;
+pub export fn san_job_step(
+    job: san.san_handle,
+    report: [*c]i64,
+) san.san_status {
+    return stepJob(&process, job, report[0..san.SAN_JOB_REPORT_LENGTH]);
 }
 
-pub export fn san_job_cancel(_: san.san_handle) san.san_status {
-    return san.SAN_STATUS_INVALID_HANDLE;
+pub export fn san_job_cancel(job: san.san_handle) san.san_status {
+    return cancelJob(&process, job);
 }
 
-pub export fn san_job_release(_: san.san_handle) san.san_status {
-    return san.SAN_STATUS_INVALID_HANDLE;
+pub export fn san_job_release(job: san.san_handle) san.san_status {
+    return releaseJob(&process, job);
 }
 
 pub export fn san_output_copy(
@@ -225,11 +232,15 @@ comptime {
 }
 
 fn shutdown(state: *Process, engine: san.san_handle) san.san_status {
-    Engine.shutdown(&state.slot, engineHandle(engine)) catch |err| {
-        return statusOf(err);
-    };
+    const reached = Engine.shutdown(
+        &state.slot,
+        engineHandle(engine),
+    ) catch |err| return statusOf(err);
 
-    return san.SAN_STATUS_OK;
+    return switch (reached) {
+        .pending => san.SAN_STATUS_PENDING,
+        .complete => san.SAN_STATUS_OK,
+    };
 }
 
 /// The counters report of the header.
@@ -256,11 +267,11 @@ fn counters(
     const ledger = &found.heap.ledger;
     const usage = ledger.usage;
 
-    // San admits no job and no lease, so their counts are 0.
-    out.* = @splat(0);
-
     out[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT] =
         reported(Content.countOpen(found));
+
+    out[san.SAN_ENGINE_COUNTERS_JOB_COUNT] = reported(Job.countOwned(found));
+    out[san.SAN_ENGINE_COUNTERS_LEASE_COUNT] = reported(Job.countLeased(found));
 
     out[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] = reported(usage.live);
     out[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES] = reported(usage.reserved);
@@ -316,15 +327,172 @@ fn closeContent(state: *Process, content: san.san_handle) san.san_status {
     return san.SAN_STATUS_OK;
 }
 
-/// The status of a function that San does not implement yet, called on
-/// a content of `state`: the checks of the handle, then
-/// SAN_STATUS_ENGINE_FAILURE.
-fn unimplementedOn(state: *Process, content: san.san_handle) san.san_status {
-    _ = Content.resolve(&state.slot, contentHandle(content)) catch |err| {
-        return statusOf(err);
+/// The arguments of san_content_feed after its handle, as the caller
+/// passed them.
+const Feed = struct {
+    position: i64,
+    bytes: [*c]const u8,
+    length: i32,
+    end_of_input: i32,
+};
+
+/// Supplies one portion of input to a content of `state`. The checks
+/// run in the order of the header, and a failed check changes nothing.
+fn feedContent(
+    state: *Process,
+    content: san.san_handle,
+    fed: Feed,
+) san.san_status {
+    const live = Content.resolve(
+        &state.slot,
+        contentHandle(content),
+    ) catch |err| return statusOf(err);
+
+    const target = Content.feedable(live) catch |err| return statusOf(err);
+
+    const input = portionOf(target, fed) catch |err| return statusOf(err);
+
+    Content.feed(target, input) catch |err| return statusOf(err);
+
+    return san.SAN_STATUS_OK;
+}
+
+/// Returns the portion that `fed` names for `target`. An end flag that
+/// is neither 0 nor 1, a negative position, a length outside 1 to the
+/// staging or 0 without the end, and null bytes of a length above 0 fail
+/// as BindingMismatch.
+fn portionOf(
+    target: Content.Feedable,
+    fed: Feed,
+) error{BindingMismatch}!Content.Portion {
+    const end = switch (fed.end_of_input) {
+        0 => false,
+        1 => true,
+        else => return error.BindingMismatch,
     };
 
-    return san.SAN_STATUS_ENGINE_FAILURE;
+    const position = std.math.cast(u64, fed.position) orelse
+        return error.BindingMismatch;
+
+    const length = std.math.cast(usize, fed.length) orelse
+        return error.BindingMismatch;
+
+    if (length > target.open.staging.len) return error.BindingMismatch;
+    if (length == 0 and !end) return error.BindingMismatch;
+    if (length != 0 and fed.bytes == null) return error.BindingMismatch;
+
+    // A feed of no byte may pass a null pointer, which has no slice.
+    const bytes: []const u8 = if (length == 0) &.{} else fed.bytes[0..length];
+
+    return .{ .position = position, .bytes = bytes, .end = end };
+}
+
+/// Admits the job of a content of `state` and writes its handle to
+/// `out`, or SAN_NO_HANDLE on a failure.
+fn requestJob(
+    state: *Process,
+    content: san.san_handle,
+    request: san.san_output_request,
+    out: *san.san_handle,
+) san.san_status {
+    out.* = san.SAN_NO_HANDLE;
+
+    const live = Content.resolve(
+        &state.slot,
+        contentHandle(content),
+    ) catch |err| return statusOf(err);
+
+    const wanted = requestOf(request) catch |err| return statusOf(err);
+
+    const job = Job.request(live, wanted) catch |err| return statusOf(err);
+
+    out.* = @bitCast(@backingInt(job));
+
+    return san.SAN_STATUS_OK;
+}
+
+/// Returns the request of the header as the engine module takes it. A
+/// negative width and a region that is neither four zeros nor
+/// 0 <= left < right and 0 <= top < bottom fail as BindingMismatch.
+fn requestOf(
+    request: san.san_output_request,
+) error{BindingMismatch}!Job.Request {
+    const max_output_width = std.math.cast(u31, request.max_output_width) orelse
+        return error.BindingMismatch;
+
+    const edges = [_]i32{
+        request.left,
+        request.top,
+        request.right,
+        request.bottom,
+    };
+
+    if (std.mem.allEqual(i32, &edges, 0)) {
+        return .{ .region = null, .max_output_width = max_output_width };
+    }
+
+    const left = std.math.cast(u31, request.left) orelse
+        return error.BindingMismatch;
+
+    const top = std.math.cast(u31, request.top) orelse
+        return error.BindingMismatch;
+
+    if (request.right <= request.left or request.bottom <= request.top) {
+        return error.BindingMismatch;
+    }
+
+    return .{
+        .region = .{
+            .left = left,
+            .top = top,
+            .right = @intCast(request.right),
+            .bottom = @intCast(request.bottom),
+        },
+        .max_output_width = max_output_width,
+    };
+}
+
+/// The job report of the header.
+const Report = [san.SAN_JOB_REPORT_LENGTH]i64;
+
+/// Advances a job of `state` and writes its report to `out`. A status
+/// that rejects the call writes nothing.
+fn stepJob(
+    state: *Process,
+    job: san.san_handle,
+    out: *Report,
+) san.san_status {
+    const live = Job.resolve(
+        &state.slot,
+        jobHandle(job),
+    ) catch |err| return statusOf(err);
+
+    const outcome = Job.step(live);
+
+    // No admission step ran and no lease exists, so every element is 0.
+    out.* = @splat(0);
+
+    return switch (outcome) {
+        .canceled => san.SAN_STATUS_CANCELED,
+        .engine_failure => san.SAN_STATUS_ENGINE_FAILURE,
+    };
+}
+
+fn cancelJob(state: *Process, job: san.san_handle) san.san_status {
+    Job.cancel(&state.slot, jobHandle(job)) catch |err| return statusOf(err);
+
+    return san.SAN_STATUS_OK;
+}
+
+fn releaseJob(state: *Process, job: san.san_handle) san.san_status {
+    const owned = Job.resolveOwned(
+        &state.slot,
+        jobHandle(job),
+    ) catch |err| return statusOf(err);
+
+    Job.release(owned) catch |err| return statusOf(err);
+
+    return san.SAN_STATUS_OK;
 }
 
 fn engineHandle(engine: san.san_handle) Engine.Handle {
@@ -335,13 +503,19 @@ fn contentHandle(content: san.san_handle) Content.Handle {
     return @fromBackingInt(@as(u64, @bitCast(content)));
 }
 
+fn jobHandle(job: san.san_handle) Job.Handle {
+    return @fromBackingInt(@as(u64, @bitCast(job)));
+}
+
 /// A failure of the engine module that a function above can meet.
-const Failure = Engine.CreateError || error{ InvalidHandle, Closed };
+const Failure = Engine.CreateError || Job.RequestError ||
+    error{ InvalidHandle, Closed };
 
 /// Returns the status of `failure`. Each category of the engine module
 /// has the status of the same name.
 fn statusOf(failure: Failure) san.san_status {
     return switch (failure) {
+        error.UnsupportedOperation => san.SAN_STATUS_UNSUPPORTED_OPERATION,
         error.BindingMismatch => san.SAN_STATUS_BINDING_MISMATCH,
         error.BudgetExceeded => san.SAN_STATUS_BUDGET_EXCEEDED,
         error.AllocationFailed => san.SAN_STATUS_ALLOCATION_FAILED,
@@ -359,6 +533,8 @@ const roomy: san.san_engine_limits = limits: {
     var limits = uniform(1 << 20);
 
     limits.content_count = contents;
+    limits.job_count = job_slots;
+    limits.output_lease_count = lease_limit;
     limits.input_portion_bytes = portion;
 
     break :limits limits;
@@ -367,6 +543,14 @@ const roomy: san.san_engine_limits = limits: {
 /// The content slots and the staging of each content under `roomy`.
 const contents = 4;
 const portion = 4096;
+
+/// The job slots and the count limit of leases under `roomy`.
+const job_slots = 2;
+const lease_limit = 2;
+
+/// The blocks of an engine's own state: the engine, the slots of its
+/// contents, and the slots of its jobs.
+const own_blocks = 3;
 
 /// What a staging takes from the ledger: its portion and its header.
 const staged = portion + Heap.header_size;
@@ -495,8 +679,7 @@ test "each limit of the header reaches the engine" {
 /// A report that no read has written.
 const unread: Counters = @splat(unwritten);
 
-/// Returns the counters report of the given ledger counts, with every
-/// count of jobs and leases at 0.
+/// Returns the counters report of the given counts.
 fn countersOf(counts: struct {
     live: u64,
     reserved: u64 = 0,
@@ -506,10 +689,14 @@ fn countersOf(counts: struct {
     output: u64 = 0,
     contents: u64 = 0,
     input: u64 = 0,
+    jobs: u64 = 0,
+    leases: u64 = 0,
 }) Counters {
     var report: Counters = @splat(0);
 
     report[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT] = reported(counts.contents);
+    report[san.SAN_ENGINE_COUNTERS_JOB_COUNT] = reported(counts.jobs);
+    report[san.SAN_ENGINE_COUNTERS_LEASE_COUNT] = reported(counts.leases);
     report[san.SAN_ENGINE_COUNTERS_INPUT_BYTES] = reported(counts.input);
 
     report[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] = reported(counts.live);
@@ -583,7 +770,7 @@ test "the counters read reports the ledger and resets the peaks on request" {
         create(&state, test_backing.backing(), roomy, &handle),
     );
 
-    // The engine's own state is its two blocks, of the metadata kind.
+    // The engine's own state is its three blocks, of the metadata kind.
     const own = test_backing.outstanding;
 
     var report = unread;
@@ -695,7 +882,7 @@ test "the content opening checks its engine and writes no handle" {
     }
 
     // No call kept anything: the engine holds its own state alone.
-    try testing.expectEqual(2, test_backing.blocks);
+    try testing.expectEqual(own_blocks, test_backing.blocks);
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
     try testing.expectEqual(0, test_backing.blocks);
 }
@@ -831,7 +1018,7 @@ test "a refused opening writes no handle and keeps nothing" {
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, content);
-    try testing.expectEqual(contents + 2, test_backing.blocks);
+    try testing.expectEqual(contents + own_blocks, test_backing.blocks);
 
     try testing.expectEqual(
         before[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT],
@@ -860,8 +1047,9 @@ test "a refused opening writes no handle and keeps nothing" {
 test "a refused backing allocation fails an opening as AllocationFailed" {
     var state = established();
 
+    // The staging is the first allocation after the engine's own blocks.
     var failing: testing.FailingAllocator = .init(testing.allocator, .{
-        .fail_index = 2,
+        .fail_index = own_blocks,
     });
 
     var test_backing: TestBacking = .init(failing.allocator());
@@ -876,7 +1064,7 @@ test "a refused backing allocation fails an opening as AllocationFailed" {
     );
 
     try testing.expectEqual(san.SAN_NO_HANDLE, content);
-    try testing.expectEqual(2, test_backing.blocks);
+    try testing.expectEqual(own_blocks, test_backing.blocks);
 
     try testing.expectEqual(0, try openCount(&state, engine));
 
@@ -884,7 +1072,64 @@ test "a refused backing allocation fails an opening as AllocationFailed" {
     try testing.expectEqual(0, test_backing.blocks);
 }
 
-test "the feed and the job request on an open content fail as EngineFailure" {
+/// The request of the whole image at a scale of 1:1.
+const whole: san.san_output_request = .{
+    .left = 0,
+    .top = 0,
+    .right = 0,
+    .bottom = 0,
+    .max_output_width = 0,
+};
+
+/// A report that no step has written.
+const unstepped: Report = @splat(unwritten);
+
+/// Feeds `bytes` to `content` in `state` as its bytes from `position`.
+fn feedBytes(
+    state: *Process,
+    content: san.san_handle,
+    position: i64,
+    bytes: []const u8,
+    end_of_input: i32,
+) san.san_status {
+    return feedContent(state, content, .{
+        .position = position,
+        .bytes = bytes.ptr,
+        .length = @intCast(bytes.len),
+        .end_of_input = end_of_input,
+    });
+}
+
+/// Requests the job of `content` for the whole image and returns its
+/// handle.
+fn requestOk(state: *Process, content: san.san_handle) !san.san_handle {
+    var job = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        requestJob(state, content, whole, &job),
+    );
+
+    try testing.expect(job != san.SAN_NO_HANDLE);
+
+    return job;
+}
+
+/// Checks that `engine` counts `jobs` owned jobs and `leases` live
+/// leases.
+fn expectJobs(
+    state: *Process,
+    engine: san.san_handle,
+    jobs: i64,
+    leases: i64,
+) !void {
+    const report = try readCounters(state, engine);
+
+    try testing.expectEqual(jobs, report[san.SAN_ENGINE_COUNTERS_JOB_COUNT]);
+    try testing.expectEqual(leases, report[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+}
+
+test "the feed checks its handle before its arguments" {
     var state = established();
 
     var test_backing: TestBacking = .init(testing.allocator);
@@ -893,20 +1138,634 @@ test "the feed and the job request on an open content fail as EngineFailure" {
 
     const content = try openOk(&state, engine);
 
-    try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
-        unimplementedOn(&state, content),
-    );
+    const malformed: Feed = .{
+        .position = -1,
+        .bytes = null,
+        .length = -1,
+        .end_of_input = 2,
+    };
 
-    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, content));
+    const invalid = [_]san.san_handle{
+        san.SAN_NO_HANDLE,
+        engine,
+        content + next_generation,
+        unwritten,
+    };
 
-    for ([_]san.san_handle{ content, engine, san.SAN_NO_HANDLE }) |handle| {
+    for (invalid) |handle| {
         try testing.expectEqual(
             san.SAN_STATUS_INVALID_HANDLE,
-            unimplementedOn(&state, handle),
+            feedContent(&state, handle, malformed),
         );
     }
 
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feedContent(&state, content, malformed),
+    );
+
+    // A content that its close ended names nothing.
+    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, content));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        feedContent(&state, content, malformed),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        feedBytes(&state, content, 0, "x", 0),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+}
+
+test "each malformed argument of a feed fails as BindingMismatch" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    const bytes: [portion + 1]u8 = @splat(0x5a);
+
+    const valid: Feed = .{
+        .position = 0,
+        .bytes = &bytes,
+        .length = portion,
+        .end_of_input = 0,
+    };
+
+    const max = std.math.maxInt(i32);
+    const min = std.math.minInt(i32);
+
+    for ([_]i32{ 2, -1, max, min }) |end_of_input| {
+        var fed = valid;
+
+        fed.end_of_input = end_of_input;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            feedContent(&state, content, fed),
+        );
+    }
+
+    // A length of 0 needs the end of the input, and the staging bounds
+    // every length.
+    for ([_]i32{ 0, -1, min, portion + 1, max }) |length| {
+        var fed = valid;
+
+        fed.length = length;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            feedContent(&state, content, fed),
+        );
+    }
+
+    // The content received no byte, so only position 0 follows.
+    for ([_]i64{ -1, std.math.minInt(i64), 1, portion }) |position| {
+        var fed = valid;
+
+        fed.position = position;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            feedContent(&state, content, fed),
+        );
+    }
+
+    var without_bytes = valid;
+
+    without_bytes.bytes = null;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feedContent(&state, content, without_bytes),
+    );
+
+    // No refusal changed the content: the valid feed still fits it.
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        feedContent(&state, content, valid),
+    );
+
+    // The staging holds bytes that no step consumed.
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feedBytes(&state, content, portion, "x", 0),
+    );
+
+    try testing.expectEqual(own_blocks + 1, test_backing.blocks);
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+}
+
+test "a feed of no byte ends the input, also with a null pointer" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    const end: Feed = .{
+        .position = 0,
+        .bytes = null,
+        .length = 0,
+        .end_of_input = 1,
+    };
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        feedContent(&state, content, end),
+    );
+
+    // The input ended, so no feed follows.
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feedContent(&state, content, end),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        feedBytes(&state, content, 0, "x", 0),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+}
+
+test "the job request checks its content, then its fields" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    const max = std.math.maxInt(i32);
+    const min = std.math.minInt(i32);
+
+    // Left, top, right, bottom, and the largest output width.
+    const malformed = [_][5]i32{
+        .{ 0, 0, 0, 0, -1 },
+        .{ 0, 0, 0, 0, min },
+        .{ 0, 0, 2, 2, -1 },
+        // An empty or reversed axis, which only four zeros may have.
+        .{ 0, 0, 0, 1, 0 },
+        .{ 0, 0, 1, 0, 0 },
+        .{ 1, 0, 1, 2, 0 },
+        .{ 2, 0, 1, 2, 0 },
+        .{ 0, 1, 2, 1, 0 },
+        .{ 0, 2, 2, 1, 0 },
+        .{ 1, 1, 1, 1, 0 },
+        // A negative edge.
+        .{ -1, 0, 1, 1, 0 },
+        .{ 0, -1, 1, 1, 0 },
+        .{ 0, 0, -1, -1, 0 },
+        .{ min, min, max, max, 0 },
+        .{ min, 0, 0, 0, 0 },
+    };
+
+    const unsupported = [_][5]i32{
+        .{ 1, 0, 2, 2, 0 },
+        .{ 0, 1, 2, 2, 0 },
+        .{ max - 1, max - 1, max, max, 0 },
+    };
+
+    const invalid = [_]san.san_handle{
+        san.SAN_NO_HANDLE,
+        engine,
+        content + next_generation,
+    };
+
+    for (malformed) |fields| {
+        var job = unwritten;
+
+        // The handle decides before the fields do.
+        for (invalid) |handle| {
+            try testing.expectEqual(
+                san.SAN_STATUS_INVALID_HANDLE,
+                requestJob(&state, handle, requestWith(fields), &job),
+            );
+
+            try testing.expectEqual(san.SAN_NO_HANDLE, job);
+        }
+
+        job = unwritten;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            requestJob(&state, content, requestWith(fields), &job),
+        );
+
+        try testing.expectEqual(san.SAN_NO_HANDLE, job);
+    }
+
+    for (unsupported) |fields| {
+        var job = unwritten;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_UNSUPPORTED_OPERATION,
+            requestJob(&state, content, requestWith(fields), &job),
+        );
+
+        try testing.expectEqual(san.SAN_NO_HANDLE, job);
+    }
+
+    // No refusal admitted a job or took the content's one admission.
+    try expectJobs(&state, engine, 0, 0);
+
+    var job = unwritten;
+
+    try testing.expectEqual(san.SAN_STATUS_OK, requestJob(
+        &state,
+        content,
+        requestWith(.{ 0, 0, max, max, max }),
+        &job,
+    ));
+
+    try testing.expect(job != san.SAN_NO_HANDLE);
+    try expectJobs(&state, engine, 1, 1);
+
+    // The content admitted its job, which decides before the region.
+    for ([_][5]i32{ .{ 0, 0, 0, 0, 0 }, unsupported[0] }) |fields| {
+        var second = unwritten;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            requestJob(&state, content, requestWith(fields), &second),
+        );
+
+        try testing.expectEqual(san.SAN_NO_HANDLE, second);
+    }
+
+    try expectJobs(&state, engine, 1, 1);
+    try testing.expectEqual(san.SAN_STATUS_PENDING, shutdown(&state, engine));
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, job));
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+/// Returns the request of `fields`: left, top, right, bottom, and the
+/// largest output width.
+fn requestWith(fields: [5]i32) san.san_output_request {
+    return .{
+        .left = fields[0],
+        .top = fields[1],
+        .right = fields[2],
+        .bottom = fields[3],
+        .max_output_width = fields[4],
+    };
+}
+
+test "a request beyond a count limit fails as BudgetExceeded" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    var opened: [job_slots + 1]san.san_handle = undefined;
+
+    for (&opened) |*content| content.* = try openOk(&state, engine);
+
+    var jobs: [job_slots]san.san_handle = undefined;
+
+    for (&jobs, opened[0..job_slots]) |*job, content| {
+        job.* = try requestOk(&state, content);
+    }
+
+    try testing.expect(jobs[0] != jobs[1]);
+    try expectJobs(&state, engine, job_slots, job_slots);
+
+    var refused = unwritten;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BUDGET_EXCEEDED,
+        requestJob(&state, opened[job_slots], whole, &refused),
+    );
+
+    try testing.expectEqual(san.SAN_NO_HANDLE, refused);
+
+    // A terminal job still holds its slot until its release.
+    var report = unstepped;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        stepJob(&state, jobs[0], &report),
+    );
+
+    try expectJobs(&state, engine, job_slots, job_slots - 1);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BUDGET_EXCEEDED,
+        requestJob(&state, opened[job_slots], whole, &refused),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, jobs[0]));
+
+    const later = try requestOk(&state, opened[job_slots]);
+
+    try testing.expect(later != jobs[0]);
+    try expectJobs(&state, engine, job_slots, job_slots);
+
+    // The first call of the shutdown ends both live jobs.
+    try testing.expectEqual(san.SAN_STATUS_PENDING, shutdown(&state, engine));
+    try expectJobs(&state, engine, job_slots, 0);
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, jobs[1]));
+    try testing.expectEqual(san.SAN_STATUS_PENDING, shutdown(&state, engine));
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, later));
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "a step ends its job and writes a report of zeros" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    const job = try requestOk(&state, content);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        feedBytes(&state, content, 0, "abc", 0),
+    );
+
+    // A release before the terminal outcome changes nothing.
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        releaseJob(&state, job),
+    );
+
+    try expectJobs(&state, engine, 1, 1);
+
+    var report = unstepped;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        stepJob(&state, job, &report),
+    );
+
+    try testing.expectEqual(@as(Report, @splat(0)), report);
+    try expectJobs(&state, engine, 1, 0);
+
+    // After the terminal outcome, a step writes no element, a feed is
+    // refused whatever its arguments, and a cancellation changes nothing.
+    report = unstepped;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_CLOSED,
+        stepJob(&state, job, &report),
+    );
+
+    try testing.expectEqual(unstepped, report);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_CLOSED,
+        feedBytes(&state, content, 3, "d", 0),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_CLOSED, feedContent(&state, content, .{
+        .position = -1,
+        .bytes = null,
+        .length = -1,
+        .end_of_input = 2,
+    }));
+
+    try testing.expectEqual(san.SAN_STATUS_OK, cancelJob(&state, job));
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, job));
+    try expectJobs(&state, engine, 0, 0);
+
+    // The released handle names no job.
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        stepJob(&state, job, &report),
+    );
+
+    try testing.expectEqual(unstepped, report);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        cancelJob(&state, job),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        releaseJob(&state, job),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "a canceled job ends as Canceled in its next step" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const job = try requestOk(&state, try openOk(&state, engine));
+
+    for (0..2) |_| {
+        try testing.expectEqual(san.SAN_STATUS_OK, cancelJob(&state, job));
+    }
+
+    // The request ends nothing: the job holds its lease until the step.
+    try expectJobs(&state, engine, 1, 1);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        releaseJob(&state, job),
+    );
+
+    var report = unstepped;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_CANCELED,
+        stepJob(&state, job, &report),
+    );
+
+    try testing.expectEqual(@as(Report, @splat(0)), report);
+    try expectJobs(&state, engine, 1, 0);
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, job));
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+}
+
+test "the close of a content ends its job, which stays owned" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    const job = try requestOk(&state, content);
+
+    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, content));
+    try expectJobs(&state, engine, 1, 0);
+    try testing.expectEqual(0, try openCount(&state, engine));
+
+    var report = unstepped;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_CLOSED,
+        stepJob(&state, job, &report),
+    );
+
+    try testing.expectEqual(unstepped, report);
+    try testing.expectEqual(san.SAN_STATUS_OK, cancelJob(&state, job));
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, job));
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "a closing engine keeps the counters, the cancel, and the release" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const idle = try openOk(&state, engine);
+
+    const content = try openOk(&state, engine);
+
+    const job = try requestOk(&state, content);
+
+    const own = (try readCounters(&state, engine))[metadata_bytes];
+
+    for (0..2) |_| {
+        try testing.expectEqual(
+            san.SAN_STATUS_PENDING,
+            shutdown(&state, engine),
+        );
+
+        // The first call ended the job and closed both contents.
+        const report = try readCounters(&state, engine);
+
+        try testing.expectEqual(0, report[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT]);
+        try testing.expectEqual(1, report[san.SAN_ENGINE_COUNTERS_JOB_COUNT]);
+        try testing.expectEqual(0, report[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+        try testing.expectEqual(0, report[input_bytes]);
+        try testing.expectEqual(own, report[san.SAN_ENGINE_COUNTERS_LIVE_BYTES]);
+        try testing.expectEqual(own_blocks, test_backing.blocks);
+
+        var opened = unwritten;
+        var requested = unwritten;
+        var stepped = unstepped;
+
+        const closed = [_]san.san_status{
+            openContent(&state, engine, &opened),
+            feedBytes(&state, content, 0, "x", 0),
+            feedBytes(&state, idle, 0, "x", 0),
+            requestJob(&state, idle, whole, &requested),
+            closeContent(&state, content),
+            closeContent(&state, idle),
+            stepJob(&state, job, &stepped),
+        };
+
+        for (closed) |status| {
+            try testing.expectEqual(san.SAN_STATUS_CLOSED, status);
+        }
+
+        try testing.expectEqual(san.SAN_NO_HANDLE, opened);
+        try testing.expectEqual(san.SAN_NO_HANDLE, requested);
+        try testing.expectEqual(unstepped, stepped);
+        try testing.expectEqual(san.SAN_STATUS_OK, cancelJob(&state, job));
+    }
+
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, job));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        releaseJob(&state, job),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
+    try testing.expectEqual(0, test_backing.blocks);
+    try testing.expectEqual(0, test_backing.outstanding);
+
+    // The completed shutdown ended every handle of the engine.
+    var report = unstepped;
+
+    const ended = [_]san.san_status{
+        shutdown(&state, engine),
+        feedBytes(&state, content, 0, "x", 0),
+        closeContent(&state, idle),
+        stepJob(&state, job, &report),
+        cancelJob(&state, job),
+        releaseJob(&state, job),
+    };
+
+    for (ended) |status| {
+        try testing.expectEqual(san.SAN_STATUS_INVALID_HANDLE, status);
+    }
+
+    try testing.expectEqual(unstepped, report);
+}
+
+test "a job handle and another handle are not interchangeable" {
+    var state = established();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine = try createRoomy(&state, &test_backing);
+
+    const content = try openOk(&state, engine);
+
+    const job = try requestOk(&state, content);
+
+    var report = unstepped;
+
+    for ([_]san.san_handle{ engine, content }) |handle| {
+        const statuses = [_]san.san_status{
+            stepJob(&state, handle, &report),
+            cancelJob(&state, handle),
+            releaseJob(&state, handle),
+        };
+
+        for (statuses) |status| {
+            try testing.expectEqual(san.SAN_STATUS_INVALID_HANDLE, status);
+        }
+    }
+
+    var opened = unwritten;
+    var requested = unwritten;
+    var counted = unread;
+
+    const statuses = [_]san.san_status{
+        counters(&state, job, 0, &counted),
+        openContent(&state, job, &opened),
+        feedBytes(&state, job, 0, "x", 0),
+        requestJob(&state, job, whole, &requested),
+        closeContent(&state, job),
+        shutdown(&state, job),
+    };
+
+    for (statuses) |status| {
+        try testing.expectEqual(san.SAN_STATUS_INVALID_HANDLE, status);
+    }
+
+    try testing.expectEqual(unstepped, report);
+    try testing.expectEqual(unread, counted);
+    try testing.expectEqual(san.SAN_NO_HANDLE, opened);
+    try testing.expectEqual(san.SAN_NO_HANDLE, requested);
+
+    // No misuse changed the engine, its content, or its job.
+    try expectJobs(&state, engine, 1, 1);
+    try testing.expectEqual(1, try openCount(&state, engine));
+    try testing.expectEqual(san.SAN_STATUS_OK, closeContent(&state, content));
+    try testing.expectEqual(san.SAN_STATUS_OK, releaseJob(&state, job));
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
 }
 
@@ -979,7 +1838,7 @@ test "a shutdown closes the open contents and ends their handles" {
 
     try testing.expectEqual(
         san.SAN_STATUS_INVALID_HANDLE,
-        unimplementedOn(&state, first),
+        feedBytes(&state, first, 0, "x", 0),
     );
 
     const second_engine = try createRoomy(&state, &test_backing);
@@ -1021,6 +1880,9 @@ test "every content, job, and lease handle is invalid" {
         -1,
         unwritten,
         std.math.minInt(i64),
+        // The kind of a job, at generation 0 and at generation 1.
+        0x3,
+        0x100_0003,
     };
 
     for (handles) |handle| {
@@ -1063,7 +1925,7 @@ test "a second engine fails as BudgetExceeded and leaves the first" {
 
     try testing.expect(engine != san.SAN_NO_HANDLE);
     try expectRefused(&state, roomy, san.SAN_STATUS_BUDGET_EXCEEDED);
-    try testing.expectEqual(2, test_backing.blocks);
+    try testing.expectEqual(own_blocks, test_backing.blocks);
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, engine));
     try testing.expectEqual(0, test_backing.blocks);
 }
@@ -1122,7 +1984,7 @@ test "a shutdown ends the engine and its handle" {
         );
     }
 
-    try testing.expectEqual(2, test_backing.blocks);
+    try testing.expectEqual(own_blocks, test_backing.blocks);
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(&state, first));
     try testing.expectEqual(0, test_backing.blocks);
 
@@ -1150,6 +2012,7 @@ test "a shutdown ends the engine and its handle" {
 
 test "each failure has the status of its category" {
     const expected = [_]struct { Failure, san.san_status }{
+        .{ error.UnsupportedOperation, san.SAN_STATUS_UNSUPPORTED_OPERATION },
         .{ error.BindingMismatch, san.SAN_STATUS_BINDING_MISMATCH },
         .{ error.BudgetExceeded, san.SAN_STATUS_BUDGET_EXCEEDED },
         .{ error.AllocationFailed, san.SAN_STATUS_ALLOCATION_FAILED },
@@ -1254,16 +2117,16 @@ test "the exported functions run the lifecycle of the process" {
     var job = unwritten;
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
+        san.SAN_STATUS_OK,
         san_content_feed(content, 0, &byte, 1, 0),
     );
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
+        san.SAN_STATUS_OK,
         san_job_request(content, &request, &job),
     );
 
-    try testing.expectEqual(san.SAN_NO_HANDLE, job);
+    try testing.expect(job != san.SAN_NO_HANDLE);
 
     try testing.expectEqual(
         san.SAN_STATUS_OK,
@@ -1271,6 +2134,26 @@ test "the exported functions run the lifecycle of the process" {
     );
 
     try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT]);
+    try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_JOB_COUNT]);
+    try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+
+    // No decode exists, so the first step ends the job.
+    var report: Report = @splat(unwritten);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_ENGINE_FAILURE,
+        san_job_step(job, &report),
+    );
+
+    try testing.expectEqual(@as(Report, @splat(0)), report);
+    try testing.expectEqual(san.SAN_STATUS_CLOSED, san_job_step(job, &report));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_CLOSED,
+        san_content_feed(content, 1, &byte, 1, 0),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, san_job_cancel(job));
 
     try testing.expectEqual(
         san.SAN_STATUS_OK,
@@ -1287,19 +2170,34 @@ test "the exported functions run the lifecycle of the process" {
         san_content_feed(content, 0, &byte, 1, 0),
     );
 
+    var refused = unwritten;
+
     try testing.expectEqual(
         san.SAN_STATUS_INVALID_HANDLE,
-        san_job_request(content, &request, &job),
+        san_job_request(content, &request, &refused),
     );
 
-    try testing.expectEqual(san.SAN_NO_HANDLE, job);
+    try testing.expectEqual(san.SAN_NO_HANDLE, refused);
 
-    // A content still open at the shutdown closes with it.
+    // A content still open at the shutdown closes with it, and the
+    // shutdown waits for the release of the job.
     try testing.expectEqual(
         san.SAN_STATUS_OK,
         san_content_open(engine, &content),
     );
 
+    try testing.expectEqual(
+        san.SAN_STATUS_PENDING,
+        san_engine_shutdown(engine),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_CLOSED,
+        san_content_close(content),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, san_job_release(job));
+    try testing.expectEqual(san.SAN_STATUS_INVALID_HANDLE, san_job_release(job));
     try testing.expectEqual(san.SAN_STATUS_OK, san_engine_shutdown(engine));
 
     try testing.expectEqual(

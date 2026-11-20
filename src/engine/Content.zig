@@ -1,7 +1,8 @@
 //! A content context: the slot of one content in the table of its
 //! engine. An open content owns the staging of one input portion, which
 //! its opening admits and allocates as input, so that a feed only
-//! copies.
+//! copies. It admits one job in its lifetime, and it names that job
+//! exactly while the job is live.
 //!
 //! The table is one block of the engine, sized at creation from the
 //! count limit of contents, and its slots never move. A handle names a
@@ -15,6 +16,7 @@ const Engine = @import("Engine.zig");
 const handles = @import("handles.zig");
 
 const Heap = Engine.Heap;
+const Job = Engine.Job;
 
 const Content = @This();
 
@@ -35,6 +37,17 @@ pub const Open = struct {
     generation: handles.Generation,
     /// The staging of one input portion.
     staging: []align(Heap.header_size) u8,
+    /// The bytes of the representation that the feeds supplied.
+    received: u64 = 0,
+    /// The bytes of the staging that the latest feed supplied, and those
+    /// of them that a step consumed: consumed <= staged <= staging.len.
+    staged: usize = 0,
+    consumed: usize = 0,
+    /// Whether a feed reported the end of the input.
+    ended: bool = false,
+    /// The one job of the content's lifetime. Only the request of a job
+    /// makes the link, and only the end of that job removes it.
+    job: union(enum) { none, live: *Job, ended } = .none,
 };
 
 /// A content handle: the opaque 64-bit value that the ABI carries.
@@ -136,15 +149,70 @@ pub fn open(engine: *Engine) OpenError!Handle {
     return .pack(@intCast(index), generation);
 }
 
-/// Closes `live`: releases its staging and frees its slot. Its handle
-/// is invalid from then on.
+/// An open content whose job has not ended, so that it still takes
+/// input. Only `feedable` makes one.
+pub const Feedable = struct {
+    open: *Open,
+};
+
+/// Returns `live` for a feed. A content whose job has its terminal
+/// outcome fails as Closed.
+pub fn feedable(live: Live) error{Closed}!Feedable {
+    const open_state = &live.content.state.open;
+
+    if (open_state.job == .ended) return error.Closed;
+
+    return .{ .open = open_state };
+}
+
+/// One portion of input with its shape checked: the bytes fit the
+/// staging of their content, and no bytes come only with the end.
+pub const Portion = struct {
+    /// The position of the first byte in the representation.
+    position: u64,
+    bytes: []const u8,
+    /// Whether the input ends after the bytes.
+    end: bool,
+};
+
+/// Copies `input` into the staging of `target` and records the end of
+/// the input. A portion after the end, one that follows bytes that no
+/// step consumed, and one at another position than the bytes received
+/// fail as BindingMismatch and change nothing.
+pub fn feed(target: Feedable, input: Portion) error{BindingMismatch}!void {
+    const open_state = target.open;
+
+    if (open_state.ended) return error.BindingMismatch;
+    if (open_state.consumed != open_state.staged) return error.BindingMismatch;
+    if (input.position != open_state.received) return error.BindingMismatch;
+
+    @memcpy(open_state.staging[0..input.bytes.len], input.bytes);
+
+    open_state.staged = input.bytes.len;
+    open_state.consumed = 0;
+    open_state.received += input.bytes.len;
+    open_state.ended = input.end;
+}
+
+/// Closes `live`: ends its live job as canceled, releases its staging,
+/// and frees its slot. Its handle is invalid from then on, and its job
+/// stays owned.
 pub fn close(live: Live) void {
-    live.engine.heap.free(live.content.state.open.staging.ptr);
+    const open_state = &live.content.state.open;
+
+    // The end of the job removes its link to this content.
+    switch (open_state.job) {
+        .none, .ended => {},
+        .live => |job| job.end(),
+    }
+
+    live.engine.heap.free(open_state.staging.ptr);
     live.content.state = .vacant;
 }
 
-/// Shuts every open content of `engine`, whose shutdown has begun: it
-/// releases each staging and keeps each generation.
+/// Shuts every open content of `engine`, whose shutdown has begun and
+/// has ended every job: it releases each staging and keeps each
+/// generation.
 pub fn shutAll(engine: *Engine) void {
     for (engine.contents) |*content| switch (content.state) {
         .vacant, .shut => {},
@@ -209,7 +277,37 @@ const Process = struct {
     fn closeContent(process: *Process, handle: Handle) !void {
         close(try resolve(&process.slot, handle));
     }
+
+    /// Shuts down the engine of `handle`, which owns no job, in one
+    /// call.
+    fn shutDown(process: *Process, handle: Engine.Handle) !void {
+        try testing.expectEqual(
+            .complete,
+            try Engine.shutdown(&process.slot, handle),
+        );
+    }
+
+    /// Feeds `bytes` to the content of `handle` as its bytes from
+    /// `position` on.
+    fn feedContent(
+        process: *Process,
+        handle: Handle,
+        position: u64,
+        bytes: []const u8,
+        end: bool,
+    ) !void {
+        const target = try feedable(try resolve(&process.slot, handle));
+
+        try feed(target, .{ .position = position, .bytes = bytes, .end = end });
+    }
 };
+
+/// The job slots of each engine of the tests below.
+const job_slots = 2;
+
+/// The blocks of an engine's own state: the engine, the slots of its
+/// contents, and the slots of its jobs.
+const own_blocks = 3;
 
 /// Returns limits of `count` contents of one portion each, with every
 /// other limit roomy.
@@ -219,16 +317,19 @@ fn limitsFor(count: i64) Engine.Limits {
     inline for (Engine.Limits.names) |name| @field(limits, name) = 1 << 20;
 
     limits.content_count = count;
+    limits.job_count = job_slots;
+    limits.output_lease_count = job_slots;
     limits.input_portion_bytes = portion;
 
     return limits;
 }
 
-/// Returns the bytes that an engine of `count` slots takes for itself:
-/// the engine and the array of slots, a block each.
+/// Returns the bytes that an engine of `count` content slots takes for
+/// itself: the engine and each array of slots, a block each.
 fn ownBytes(count: usize) u64 {
     return Heap.accounted(@sizeOf(Engine)).? +
-        Heap.accounted(count * @sizeOf(Content)).?;
+        Heap.accounted(count * @sizeOf(Content)).? +
+        Heap.accounted(job_slots * @sizeOf(Job)).?;
 }
 
 fn unpack(handle: Handle) handles.Slotted {
@@ -284,7 +385,7 @@ fn expectHolds(
     try testing.expectEqual(count * staged, usage.input);
     try testing.expectEqual(0, usage.reserved);
     try testing.expectEqual(test_backing.outstanding, usage.live);
-    try testing.expectEqual(2 + count, test_backing.blocks);
+    try testing.expectEqual(own_blocks + count, test_backing.blocks);
 }
 
 test "an invalid handle fails as InvalidHandle and changes nothing" {
@@ -335,7 +436,7 @@ test "an invalid handle fails as InvalidHandle and changes nothing" {
         (try resolve(&process.slot, content)).engine,
     );
 
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
 }
 
 test "a handle is stale after its content closes" {
@@ -364,7 +465,7 @@ test "a handle is stale after its content closes" {
     );
 
     try expectHolds(engine, &test_backing, 0);
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
 }
 
 test "a handle is stale after its engine shuts down" {
@@ -376,7 +477,7 @@ test "a handle is stale after its engine shuts down" {
 
     const content = try open(try process.engineOf(engine_handle));
 
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
     try testing.expectEqual(0, test_backing.blocks);
 
     try testing.expectError(
@@ -394,7 +495,7 @@ test "a handle of a finished engine fails under a later engine" {
 
     const first = try open(try process.engineOf(first_engine));
 
-    try Engine.shutdown(&process.slot, first_engine);
+    try process.shutDown(first_engine);
 
     const second_engine = try process.create(&test_backing, limitsFor(2));
 
@@ -418,7 +519,7 @@ test "a handle of a finished engine fails under a later engine" {
     );
 
     try expectHolds(engine, &test_backing, 1);
-    try Engine.shutdown(&process.slot, second_engine);
+    try process.shutDown(second_engine);
     try testing.expectEqual(0, test_backing.blocks);
 }
 
@@ -446,7 +547,7 @@ test "a retired serial fails every opening as EngineFailure" {
     try testing.expectEqual(before, snapshot(engine, &test_backing));
     try testing.expectEqual(1, countOpen(engine));
     try testing.expect(engine.serial.retired());
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
     try testing.expect(process.slot.serial.retired());
 
     const later_handle = try process.create(&test_backing, limitsFor(2));
@@ -456,7 +557,7 @@ test "a retired serial fails every opening as EngineFailure" {
     try testing.expectError(error.EngineFailure, open(later));
     try expectHolds(later, &test_backing, 0);
     try testing.expectEqual(0, countOpen(later));
-    try Engine.shutdown(&process.slot, later_handle);
+    try process.shutDown(later_handle);
     try testing.expectEqual(0, test_backing.blocks);
 }
 
@@ -502,7 +603,7 @@ test "the table admits its slots and refuses the next opening" {
     );
 
     try expectHolds(engine, &test_backing, 3);
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
     try testing.expectEqual(0, test_backing.blocks);
 }
 
@@ -529,15 +630,16 @@ test "a budget that admits n stagings refuses the next" {
     try testing.expectError(error.BudgetExceeded, open(engine));
     try testing.expectEqual(before, snapshot(engine, &test_backing));
     try expectHolds(engine, &test_backing, 2);
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
     try testing.expectEqual(0, test_backing.blocks);
 }
 
 test "an opening that fails on the backing keeps nothing" {
     var process: Process = .init();
 
+    // The staging is the first allocation after the engine's own blocks.
     var failing: testing.FailingAllocator = .init(testing.allocator, .{
-        .fail_index = 2,
+        .fail_index = own_blocks,
     });
 
     var test_backing: TestBacking = .init(failing.allocator());
@@ -551,7 +653,7 @@ test "an opening that fails on the backing keeps nothing" {
     try testing.expectError(error.AllocationFailed, open(engine));
     try testing.expectEqual(before, snapshot(engine, &test_backing));
     try testing.expectEqual(0, countOpen(engine));
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
     try testing.expectEqual(0, test_backing.blocks);
 }
 
@@ -582,7 +684,7 @@ fn expectReleased(process: *Process, test_backing: *const TestBacking) !void {
 
     const later = try process.create(&later_backing, limitsFor(2));
 
-    try Engine.shutdown(&process.slot, later);
+    try process.shutDown(later);
     try testing.expectEqual(0, later_backing.blocks);
 }
 
@@ -609,7 +711,7 @@ fn openAndShutDown(gpa: std.mem.Allocator) !void {
 
     openTwo(&process, engine) catch |err| switch (err) {
         error.AllocationFailed => {
-            try Engine.shutdown(&process.slot, engine_handle);
+            try process.shutDown(engine_handle);
             try expectReleased(&process, &test_backing);
 
             return error.OutOfMemory;
@@ -618,7 +720,7 @@ fn openAndShutDown(gpa: std.mem.Allocator) !void {
     };
 
     try expectHolds(engine, &test_backing, 1);
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
     try expectReleased(&process, &test_backing);
 }
 
@@ -667,7 +769,7 @@ test "the handles of a churn over three tables are distinct and nonzero" {
     }
 
     try expectHolds(engine, &test_backing, 0);
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
 }
 
 test "a shutdown returns the serial to the slot and closes every content" {
@@ -686,8 +788,171 @@ test "a shutdown returns the serial to the slot and closes every content" {
     try testing.expectEqual(1, process.slot.serial.next);
     try testing.expectEqual(3, engine.serial.next);
     try expectHolds(engine, &test_backing, 2);
-    try Engine.shutdown(&process.slot, engine_handle);
+    try process.shutDown(engine_handle);
     try testing.expectEqual(3, process.slot.serial.next);
     try testing.expectEqual(0, test_backing.blocks);
     try testing.expectEqual(0, test_backing.outstanding);
+}
+
+/// Returns the state of the open content of `handle`.
+fn openOf(process: *Process, handle: Handle) !*Open {
+    const live = try resolve(&process.slot, handle);
+
+    return &live.content.state.open;
+}
+
+test "a feed copies its portion and counts the bytes received" {
+    var process: Process = .init();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine_handle = try process.create(&test_backing, limitsFor(2));
+
+    const engine = try process.engineOf(engine_handle);
+
+    const content = try open(engine);
+
+    const open_state = try openOf(&process, content);
+
+    const first = "ten bytes!";
+
+    try testing.expectEqual(portion, open_state.staging.len);
+    try process.feedContent(content, 0, first, false);
+    try testing.expectEqualSlices(u8, first, open_state.staging[0..first.len]);
+    try testing.expectEqual(first.len, open_state.staged);
+    try testing.expectEqual(0, open_state.consumed);
+    try testing.expectEqual(first.len, open_state.received);
+    try testing.expect(!open_state.ended);
+
+    // No step consumes input yet, so the test consumes each portion.
+    open_state.consumed = open_state.staged;
+
+    var full: [portion]u8 = undefined;
+
+    for (&full, 0..) |*byte, at| byte.* = @intCast(at);
+
+    // A portion of the whole staging, then the end without a byte.
+    try process.feedContent(content, first.len, &full, false);
+    try testing.expectEqualSlices(u8, &full, open_state.staging);
+    try testing.expectEqual(portion, open_state.staged);
+    try testing.expectEqual(0, open_state.consumed);
+    try testing.expectEqual(first.len + portion, open_state.received);
+    try testing.expect(!open_state.ended);
+
+    open_state.consumed = open_state.staged;
+
+    try process.feedContent(content, first.len + portion, "", true);
+    try testing.expectEqual(0, open_state.staged);
+    try testing.expectEqual(0, open_state.consumed);
+    try testing.expectEqual(first.len + portion, open_state.received);
+    try testing.expect(open_state.ended);
+
+    // A feed only copies: it allocates and reserves nothing.
+    try expectHolds(engine, &test_backing, 1);
+    try process.shutDown(engine_handle);
+}
+
+test "a feed out of order fails as BindingMismatch and changes nothing" {
+    var process: Process = .init();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine_handle = try process.create(&test_backing, limitsFor(2));
+
+    const content = try open(try process.engineOf(engine_handle));
+
+    const open_state = try openOf(&process, content);
+
+    // At another position than the bytes received.
+    for ([_]u64{ 1, portion, std.math.maxInt(u64) }) |position| {
+        try testing.expectError(
+            error.BindingMismatch,
+            process.feedContent(content, position, "x", false),
+        );
+    }
+
+    try testing.expectEqual(0, open_state.received);
+    try testing.expectEqual(0, open_state.staged);
+    try process.feedContent(content, 0, "abc", false);
+
+    // After bytes that no step consumed, whole or in part, at the
+    // position that follows them.
+    for ([_]usize{ 0, 2 }) |consumed| {
+        open_state.consumed = consumed;
+
+        const before = open_state.*;
+
+        try testing.expectError(
+            error.BindingMismatch,
+            process.feedContent(content, 3, "d", false),
+        );
+
+        try testing.expectError(
+            error.BindingMismatch,
+            process.feedContent(content, 3, "", true),
+        );
+
+        try testing.expectEqual(before, open_state.*);
+        try testing.expectEqualSlices(u8, "abc", open_state.staging[0..3]);
+    }
+
+    open_state.consumed = open_state.staged;
+
+    try process.feedContent(content, 3, "", true);
+
+    // After the end of the input.
+    const ended = open_state.*;
+
+    try testing.expectError(
+        error.BindingMismatch,
+        process.feedContent(content, 3, "e", false),
+    );
+
+    try testing.expectError(
+        error.BindingMismatch,
+        process.feedContent(content, 3, "", true),
+    );
+
+    try testing.expectEqual(ended, open_state.*);
+    try process.shutDown(engine_handle);
+}
+
+test "a feed after the terminal outcome of the job fails as Closed" {
+    var process: Process = .init();
+
+    var test_backing: TestBacking = .init(testing.allocator);
+
+    const engine_handle = try process.create(&test_backing, limitsFor(2));
+
+    const content = try open(try process.engineOf(engine_handle));
+
+    const job = try Job.request(try resolve(&process.slot, content), .{});
+
+    // A live job leaves its content open to input.
+    try process.feedContent(content, 0, "abc", false);
+
+    const outcome = Job.step(try Job.resolve(&process.slot, job));
+
+    try testing.expectEqual(.engine_failure, outcome);
+
+    const before = (try openOf(&process, content)).*;
+
+    // The ended job decides before the order of the feed does.
+    for ([_]u64{ 3, 0 }) |position| {
+        try testing.expectError(
+            error.Closed,
+            process.feedContent(content, position, "d", false),
+        );
+    }
+
+    try Job.release(try Job.resolveOwned(&process.slot, job));
+
+    // The release of the job reopens nothing.
+    try testing.expectError(
+        error.Closed,
+        process.feedContent(content, 3, "d", false),
+    );
+
+    try testing.expectEqual(before, (try openOf(&process, content)).*);
+    try process.shutDown(engine_handle);
 }

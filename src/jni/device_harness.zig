@@ -148,8 +148,9 @@ const Copy = *const fn (
 const limit_count = 16;
 
 /// Calls `create` with roomy limits, except that the limit `index` is
-/// `value`. Roomy means 1 << 20 for each limit but the four content slots
-/// and the staging of 4096 bytes of each content.
+/// `value`. Roomy means 1 << 20 for each limit but the four content
+/// slots, the two job slots, the two leases, and the staging of 4096
+/// bytes of each content.
 fn createWith(
     create: Create,
     env: [*c]jni.JNIEnv,
@@ -160,7 +161,9 @@ fn createWith(
     var limits: [limit_count]jni.jlong = @splat(1 << 20);
 
     limits[1] = 4;
+    limits[2] = 2;
     limits[4] = 4096;
+    limits[15] = 2;
     limits[index] = value;
 
     return create(

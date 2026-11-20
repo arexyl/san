@@ -2,7 +2,7 @@
 //! its caller, and its lowest byte holds the kind, so one comparison on
 //! the bits alone rejects a handle of another kind.
 //!
-//! A handle of a slot, such as a content's, holds the index of the slot
+//! A handle of a slot, a content's or a job's, holds the index of the slot
 //! and the generation of its issuance. The generations of a process come
 //! from one serial that only rises, so a generation is issued once in a
 //! process, and a handle that an earlier engine issued matches no slot
@@ -14,6 +14,7 @@ const std = @import("std");
 pub const Tag = enum(u8) {
     engine = 1,
     content = 2,
+    job = 3,
     _,
 };
 

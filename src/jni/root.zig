@@ -559,13 +559,26 @@ const unwritten: jni.jlong = 0x5a5a_5a5a_5a5a_5a5a;
 /// `san_engine_limits`.
 const limit_count = @typeInfo(san.san_engine_limits).@"struct".field_names.len;
 
-/// Returns roomy limits with an aggregate budget of `budget`.
+/// Returns the position of the limit `name` among the parameters of
+/// engineCreate.
+fn limitAt(comptime name: []const u8) usize {
+    return std.meta.fieldIndex(san.san_engine_limits, name).?;
+}
+
+/// The staging of a content under the roomy limits, in bytes.
+const portion_bytes = 4096;
+
+/// Returns roomy limits with an aggregate budget of `budget`: four
+/// contents of one staging each, two jobs, two leases, and 1 << 20 for
+/// every other limit.
 fn limitsUnder(budget: jni.jlong) [limit_count]jni.jlong {
     var limits: [limit_count]jni.jlong = @splat(1 << 20);
 
-    limits[0] = budget;
-    limits[1] = 4;
-    limits[4] = 4096;
+    limits[limitAt("aggregate_budget_bytes")] = budget;
+    limits[limitAt("content_count")] = 4;
+    limits[limitAt("job_count")] = 2;
+    limits[limitAt("output_lease_count")] = 2;
+    limits[limitAt("input_portion_bytes")] = portion_bytes;
 
     return limits;
 }
@@ -825,7 +838,7 @@ test "the methods convert their arguments and run the lifecycle" {
 
         for (counted) |element| try testing.expect(element != unwritten);
 
-        // The engine's own state is its two blocks, of the metadata kind.
+        // The engine's own state is its three blocks, of the metadata kind.
         const live = counted[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
 
         try testing.expect(live > 0);
@@ -903,6 +916,234 @@ test "the methods convert their arguments and run the lifecycle" {
         shutdown(jenv, null, elements[0]),
     );
 
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+// The sixteen limits share one descriptor letter, so only what the
+// engine does with each value tells two parameters apart. The test
+// covers the limits that the engine enforces: the budget, the three
+// count limits, the input portion, and the metadata limit.
+test "each enforced limit reaches the engine from its own parameter" {
+    var env: fake.Env = .{};
+
+    try expectLoaded(&env);
+
+    const establish = try methodOf(&env, "bindingEstablish", bindingEstablish);
+    const shutdown = try methodOf(&env, "engineShutdown", engineShutdown);
+    const counters = try methodOf(&env, "engineCounters", engineCounters);
+    const open = try methodOf(&env, "contentOpen", contentOpen);
+    const request = try methodOf(&env, "jobRequest", jobRequest);
+    const step = try methodOf(&env, "jobStep", jobStep);
+    const release = try methodOf(&env, "jobRelease", jobRelease);
+
+    const jenv = env.pointer();
+
+    const budget_at = limitAt("aggregate_budget_bytes");
+    const contents_at = limitAt("content_count");
+    const jobs_at = limitAt("job_count");
+    const metadata_at = limitAt("metadata_bytes");
+    const leases_at = limitAt("output_lease_count");
+
+    var handle = [_]jni.jlong{unwritten};
+    var out: fake.Array = .{ .longs = &handle };
+
+    var counted: [san.SAN_ENGINE_COUNTERS_LENGTH]jni.jlong = @splat(unwritten);
+    var counted_array: fake.Array = .{ .longs = &counted };
+
+    var report: [san.SAN_JOB_REPORT_LENGTH]jni.jlong = @splat(unwritten);
+    var report_array: fake.Array = .{ .longs = &report };
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        establish(jenv, null, san.SAN_ABI_VERSION),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        try createWith(&env, limitsUnder(1 << 20), out.object()),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        counters(jenv, null, handle[0], jni.JNI_FALSE, counted_array.object()),
+    );
+
+    // The engine's own state under the roomy limits, in bytes.
+    const own = counted[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(jenv, null, handle[0]));
+
+    // A count beyond the slot index refuses only a count limit, and a
+    // byte count below the engine's own state refuses only the budget
+    // and the metadata limit.
+    const beyond_index = std.math.maxInt(u16) + 1;
+
+    for (0..limit_count) |index| {
+        const counts = index == contents_at or index == jobs_at or
+            index == leases_at;
+
+        const holds_state = index == budget_at or index == metadata_at;
+
+        const probes = [_]struct { jni.jlong, bool }{
+            .{ beyond_index, counts },
+            .{ own - 1, holds_state },
+        };
+
+        for (probes) |probe| {
+            const value, const refused = probe;
+
+            var limits = limitsUnder(1 << 20);
+
+            limits[index] = value;
+
+            const status = try createWith(&env, limits, out.object());
+
+            if (refused) {
+                try testing.expectEqual(san.SAN_STATUS_BUDGET_EXCEEDED, status);
+
+                continue;
+            }
+
+            try testing.expectEqual(san.SAN_STATUS_OK, status);
+
+            try testing.expectEqual(
+                san.SAN_STATUS_OK,
+                shutdown(jenv, null, handle[0]),
+            );
+        }
+    }
+
+    // A staging and its block header, in bytes.
+    const staged = portion_bytes + 16;
+
+    // The budget admits the engine and one staging, and the metadata
+    // limit admits exactly the engine. With the two values exchanged,
+    // the first opening would fail.
+    var tight = limitsUnder(own + staged);
+
+    tight[metadata_at] = own;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        try createWith(&env, tight, out.object()),
+    );
+
+    const tight_engine = handle[0];
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        open(jenv, null, tight_engine, out.object()),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_OK, counters(
+        jenv,
+        null,
+        tight_engine,
+        jni.JNI_FALSE,
+        counted_array.object(),
+    ));
+
+    try testing.expectEqual(staged, counted[san.SAN_ENGINE_COUNTERS_INPUT_BYTES]);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BUDGET_EXCEEDED,
+        open(jenv, null, tight_engine, out.object()),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        shutdown(jenv, null, tight_engine),
+    );
+
+    // Three contents, two jobs, and one lease: each refusal below has
+    // one of the three limits as its only cause.
+    var counted_limits = limitsUnder(1 << 20);
+
+    counted_limits[contents_at] = 3;
+    counted_limits[jobs_at] = 2;
+    counted_limits[leases_at] = 1;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        try createWith(&env, counted_limits, out.object()),
+    );
+
+    const engine = handle[0];
+
+    var contents: [3]jni.jlong = undefined;
+
+    for (&contents) |*content| {
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            open(jenv, null, engine, out.object()),
+        );
+
+        content.* = handle[0];
+    }
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BUDGET_EXCEEDED,
+        open(jenv, null, engine, out.object()),
+    );
+
+    var jobs: [3]jni.jlong = undefined;
+
+    // Each job gets its request after the refusal that only one limit
+    // causes: none for the first, the one live lease for the second, and
+    // the two owned jobs for the third. The step of a job reclaims its
+    // lease and keeps its slot, and the release frees the slot.
+    for (&jobs, contents, 0..) |*job, content, at| {
+        if (at != 0) {
+            try testing.expectEqual(
+                san.SAN_STATUS_BUDGET_EXCEEDED,
+                request(jenv, null, content, 0, 0, 0, 0, 0, out.object()),
+            );
+        }
+
+        switch (at) {
+            0 => {},
+            1 => try testing.expectEqual(
+                san.SAN_STATUS_ENGINE_FAILURE,
+                step(jenv, null, jobs[0], report_array.object()),
+            ),
+            else => {
+                try testing.expectEqual(
+                    san.SAN_STATUS_ENGINE_FAILURE,
+                    step(jenv, null, jobs[1], report_array.object()),
+                );
+
+                // Both jobs are terminal, and both still hold a slot.
+                try testing.expectEqual(
+                    san.SAN_STATUS_BUDGET_EXCEEDED,
+                    request(jenv, null, content, 0, 0, 0, 0, 0, out.object()),
+                );
+
+                try testing.expectEqual(
+                    san.SAN_STATUS_OK,
+                    release(jenv, null, jobs[0]),
+                );
+            },
+        }
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            request(jenv, null, content, 0, 0, 0, 0, 0, out.object()),
+        );
+
+        job.* = handle[0];
+    }
+
+    try testing.expectEqual(
+        san.SAN_STATUS_PENDING,
+        shutdown(jenv, null, engine),
+    );
+
+    for (jobs[1..]) |job| {
+        try testing.expectEqual(san.SAN_STATUS_OK, release(jenv, null, job));
+    }
+
+    try testing.expectEqual(san.SAN_STATUS_OK, shutdown(jenv, null, engine));
     try testing.expect(!env.pending);
     try testing.expectEqual(0, env.forbidden_calls);
 }

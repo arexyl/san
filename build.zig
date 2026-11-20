@@ -182,6 +182,11 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
 
     const test_step = b.step("test", "Run the host tests that need no package");
 
+    const test_tsan = b.step(
+        "test-tsan",
+        "Run the host tests of the engine under ThreadSanitizer",
+    );
+
     const test_header = b.step(
         "test-header",
         "Check the host translation of the Bindings header against abi.tsv",
@@ -258,6 +263,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         failSteps(b, &.{
             b.getInstallStep(),
             test_step,
+            test_tsan,
             test_header,
             test_abi,
             test_jni,
@@ -280,6 +286,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     }
 
     addHostTests(b, test_step);
+    addSanitizedTests(b, test_tsan);
     addClean(b, clean_step, layout);
     addVerifyStore(b, verify_store, layout);
     addHeaderTest(b, test_header, layout);
@@ -428,6 +435,29 @@ fn addHostTests(b: *std.Build, step: *std.Build.Step) void {
         run.setCwd(scratch);
         step.dependOn(&run.step);
     }
+}
+
+/// Adds the host tests of the engine under ThreadSanitizer. A plain run
+/// of the tests that cross threads observes neither a race on a plain
+/// field nor a missing memory ordering, and the sanitizer reports both.
+fn addSanitizedTests(b: *std.Build, step: *std.Build.Step) void {
+    const tests = b.addTest(.{
+        .name = "engine-tsan",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(engine_root),
+            .target = b.graph.host,
+            .optimize = .debug,
+            // The tests run the system backing on the host libc.
+            .link_libc = true,
+            .sanitize_thread = true,
+        }),
+    });
+
+    // On macOS the sanitizer's runtime is a dynamic library in the
+    // global cache, and the test finds it through a run path relative to
+    // the build root. So the test runs there, where it writes no file:
+    // the tests of the engine use no temporary directory.
+    step.dependOn(&b.addRunArtifact(tests).step);
 }
 
 fn addClean(b: *std.Build, step: *std.Build.Step, layout: Layout) void {

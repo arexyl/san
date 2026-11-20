@@ -7,8 +7,10 @@
 //! cases run in one fixed order: the calls before the binding is
 //! established, the binding, the limits, one engine and the handles that
 //! do not name it, the functions that reject every handle, the contents
-//! of an engine, a run of engines one after another, and creations that
-//! race from several threads.
+//! of an engine, a job from its request to its release with a pending
+//! shutdown, cancellations that race the step of their job, a run of
+//! engines one after another, and creations that race from several
+//! threads.
 //!
 //! The harness prints one line per case, ending in `ok` or `FAIL`, then
 //! a summary. It exits 0 only when every case passes, 1 when a case
@@ -33,18 +35,38 @@ const content_slots = 4;
 const portion_bytes = 4096;
 const block_header = 16;
 
+/// The job slots of an engine of the harness, and its count limit of
+/// leases.
+const job_slots = 2;
+
 /// Limits that admit every engine of the harness: each one is 1 << 20,
-/// except the content slots and the staging of a content.
+/// except the slots of the contents and of the jobs, the count limit of
+/// leases, and the staging of a content.
 const roomy: san.san_engine_limits = uniform: {
     var admitting: san.san_engine_limits = undefined;
 
     for (limit_names) |name| @field(admitting, name) = 1 << 20;
 
     admitting.content_count = content_slots;
+    admitting.job_count = job_slots;
+    admitting.output_lease_count = job_slots;
     admitting.input_portion_bytes = portion_bytes;
 
     break :uniform admitting;
 };
+
+/// The request of the whole image at a scale of 1:1.
+const whole: san.san_output_request = .{
+    .left = 0,
+    .top = 0,
+    .right = 0,
+    .bottom = 0,
+    .max_output_width = 0,
+};
+
+/// A job report, and one that no step has written.
+const Report = [san.SAN_JOB_REPORT_LENGTH]i64;
+const unstepped: Report = @splat(unwritten);
 
 /// A value that no creation writes, so that a case sees whether a call
 /// wrote its output.
@@ -60,6 +82,9 @@ const run_engines = 1000;
 /// The threads of the creation race, and its rounds.
 const race_threads = 8;
 const race_rounds = 200;
+
+/// The rounds of the race of a cancellation against a step.
+const cancel_rounds = 2000;
 
 const usage = "usage: san-abi-harness\n";
 
@@ -86,6 +111,8 @@ pub fn main(init: std.process.Init) !u8 {
     try harness.case("one engine", oneEngine());
     try harness.case("no content, job, or lease", noOtherHandle());
     try harness.case("contents", contents());
+    try harness.case("one job", oneJob());
+    try harness.case("racing cancellations", try racingCancellations());
     try harness.case("engines in turn", enginesInTurn());
     try harness.case("racing creations", try racingCreations());
 
@@ -198,7 +225,7 @@ fn limits() bool {
 }
 
 /// Reports whether `counters` shows an engine that holds only its own
-/// state: two live blocks of metadata, which are also both peaks, and no
+/// state: three live blocks of metadata, which are also both peaks, and no
 /// reservation, input, output, content, job, or lease.
 fn ownStateAlone(counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64) bool {
     const live = counters[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
@@ -410,6 +437,163 @@ fn contents() bool {
 
     return holds(later, 1) and
         san.san_engine_shutdown(later) == san.SAN_STATUS_OK;
+}
+
+/// Requests the job of `content` for the whole image and returns its
+/// handle, or null when the request fails or writes no handle.
+fn requestJob(content: san.san_handle) ?san.san_handle {
+    var job = unwritten;
+
+    if (san.san_job_request(content, &whole, &job) != san.SAN_STATUS_OK) {
+        return null;
+    }
+
+    if (job == san.SAN_NO_HANDLE or job == unwritten) return null;
+
+    return job;
+}
+
+/// Reports whether `engine` counts `owned` jobs and `leased` live
+/// leases. The read works while the engine shuts down.
+fn counts(engine: san.san_handle, owned: i64, leased: i64) bool {
+    var counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(unwritten);
+
+    if (san.san_engine_counters(engine, 0, &counters) !=
+        san.SAN_STATUS_OK) return false;
+
+    return counters[san.SAN_ENGINE_COUNTERS_JOB_COUNT] == owned and
+        counters[san.SAN_ENGINE_COUNTERS_LEASE_COUNT] == leased;
+}
+
+/// Reports whether a step of `job` returns `status` and writes every
+/// element of its report as `element`.
+fn steps(job: san.san_handle, status: san.san_status, element: i64) bool {
+    var report = unstepped;
+
+    return san.san_job_step(job, &report) == status and
+        std.mem.allEqual(i64, &report, element);
+}
+
+/// Reports whether a job takes input, ends in its first step, refuses a
+/// release before that step and a step after it, and holds the shutdown
+/// of its engine pending until its release.
+fn oneJob() bool {
+    const engine = createEngine() orelse return false;
+
+    const content = openContent(engine) orelse return false;
+
+    const byte: u8 = 0x5a;
+
+    if (san.san_content_feed(content, 0, &byte, 1, 0) !=
+        san.SAN_STATUS_OK) return false;
+
+    // The staging holds a byte that no step consumed.
+    if (san.san_content_feed(content, 1, &byte, 1, 0) !=
+        san.SAN_STATUS_BINDING_MISMATCH) return false;
+
+    const job = requestJob(content) orelse return false;
+
+    var second = unwritten;
+
+    if (san.san_job_request(content, &whole, &second) !=
+        san.SAN_STATUS_BINDING_MISMATCH) return false;
+
+    if (second != san.SAN_NO_HANDLE or !counts(engine, 1, 1)) return false;
+
+    if (san.san_job_release(job) !=
+        san.SAN_STATUS_BINDING_MISMATCH) return false;
+
+    // No decode exists, so the first step ends the job, and a rejected
+    // step writes no element.
+    if (!steps(job, san.SAN_STATUS_ENGINE_FAILURE, 0)) return false;
+    if (!steps(job, san.SAN_STATUS_CLOSED, unwritten)) return false;
+    if (!counts(engine, 1, 0)) return false;
+
+    if (san.san_content_feed(content, 1, &byte, 1, 0) !=
+        san.SAN_STATUS_CLOSED) return false;
+
+    if (san.san_job_cancel(job) != san.SAN_STATUS_OK) return false;
+
+    // The shutdown waits for the release, and the closing engine keeps
+    // the counters, the cancellation, and the release.
+    for (0..2) |_| {
+        if (san.san_engine_shutdown(engine) !=
+            san.SAN_STATUS_PENDING) return false;
+
+        if (!counts(engine, 1, 0) or !holds(engine, 0)) return false;
+        if (!steps(job, san.SAN_STATUS_CLOSED, unwritten)) return false;
+
+        if (san.san_content_close(content) !=
+            san.SAN_STATUS_CLOSED) return false;
+
+        if (san.san_job_cancel(job) != san.SAN_STATUS_OK) return false;
+    }
+
+    if (san.san_job_release(job) != san.SAN_STATUS_OK) return false;
+
+    if (san.san_job_release(job) !=
+        san.SAN_STATUS_INVALID_HANDLE) return false;
+
+    return san.san_engine_shutdown(engine) == san.SAN_STATUS_OK and
+        rejects(job) and rejects(content);
+}
+
+/// One cancellation from another thread, and what it returned.
+const Cancellation = struct {
+    job: san.san_handle,
+    waiting: std.atomic.Value(bool) = .init(false),
+    go: std.atomic.Value(bool) = .init(false),
+    status: san.san_status = san.SAN_STATUS_ENGINE_FAILURE,
+};
+
+fn cancelAtOnce(cancellation: *Cancellation) void {
+    cancellation.waiting.store(true, .release);
+
+    while (!cancellation.go.load(.acquire)) std.atomic.spinLoopHint();
+
+    cancellation.status = san.san_job_cancel(cancellation.job);
+}
+
+/// Reports whether, in every round, a cancellation that races the step
+/// of its job finds the job, and the step ends the job with one terminal
+/// outcome, as canceled or as an engine failure.
+fn racingCancellations() !bool {
+    const engine = createEngine() orelse return false;
+
+    for (0..cancel_rounds) |_| {
+        const content = openContent(engine) orelse return false;
+
+        const job = requestJob(content) orelse return false;
+
+        var cancellation: Cancellation = .{ .job = job };
+        var report = unstepped;
+
+        const thread = try std.Thread.spawn(.{}, cancelAtOnce, .{
+            &cancellation,
+        });
+
+        while (!cancellation.waiting.load(.acquire)) std.atomic.spinLoopHint();
+
+        cancellation.go.store(true, .release);
+
+        const status = san.san_job_step(job, &report);
+
+        // Every cancellation returns before the release of its job.
+        thread.join();
+
+        if (cancellation.status != san.SAN_STATUS_OK) return false;
+
+        if (status != san.SAN_STATUS_CANCELED and
+            status != san.SAN_STATUS_ENGINE_FAILURE) return false;
+
+        if (!std.mem.allEqual(i64, &report, 0)) return false;
+        if (!steps(job, san.SAN_STATUS_CLOSED, unwritten)) return false;
+        if (san.san_job_release(job) != san.SAN_STATUS_OK) return false;
+        if (san.san_content_close(content) != san.SAN_STATUS_OK) return false;
+    }
+
+    return counts(engine, 0, 0) and
+        san.san_engine_shutdown(engine) == san.SAN_STATUS_OK;
 }
 
 fn oneEngine() bool {
