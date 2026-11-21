@@ -16,6 +16,7 @@ const Decoder = @import("Decoder.zig");
 const cases = @import("cases.zig");
 const device_case = @import("device_case.zig");
 
+const Codec = engine.Codec;
 const Heap = engine.Heap;
 const Request = device_case.Request;
 const Result = device_case.Result;
@@ -192,7 +193,7 @@ const Sink = struct {
         ctx: *anyopaque,
         index: u32,
         bytes: []const u8,
-    ) Decoder.Stop!void {
+    ) Decoder.Stop!Codec.Demand {
         const receiver: *Sink = @ptrCast(@alignCast(ctx));
 
         if (index != receiver.rows) receiver.mismatches += 1;
@@ -204,5 +205,7 @@ const Sink = struct {
         if (index == receiver.cancel_row) {
             receiver.cancel.store(cancel_bit, .release);
         }
+
+        return .more;
     }
 };

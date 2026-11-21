@@ -38,12 +38,21 @@ pub const plans = [_]Plan{
 };
 
 /// Feeds `bytes` to `decoder` in the portions of `plan`, then finishes
-/// the decode. Returns the first failure.
+/// the decode. A portion that satisfies the sink ends the decode there,
+/// without the portions after it and without the finish. Returns the
+/// first failure.
 pub fn feed(decoder: *Decoder, bytes: []const u8, plan: Plan) Error!void {
+    if (try portions(decoder, bytes, plan)) return;
+
+    try decoder.finish();
+}
+
+/// Feeds the portions and returns whether one of them satisfied the sink.
+fn portions(decoder: *Decoder, bytes: []const u8, plan: Plan) Error!bool {
     switch (plan) {
-        .whole => _ = try decoder.feed(bytes),
+        .whole => return satisfies(decoder, bytes),
         .bytewise => for (0..bytes.len) |at| {
-            _ = try decoder.feed(bytes[at..][0..1]);
+            if (try satisfies(decoder, bytes[at..][0..1])) return true;
         },
         .seeded => |seed| {
             var prng: std.Random.DefaultPrng = .init(seed);
@@ -55,18 +64,28 @@ pub fn feed(decoder: *Decoder, bytes: []const u8, plan: Plan) Error!void {
             while (rest.len != 0) {
                 const len = @min(rest.len, random.intRangeAtMost(usize, 1, 97));
 
-                _ = try decoder.feed(rest[0..len]);
+                if (try satisfies(decoder, rest[0..len])) return true;
+
                 rest = rest[len..];
             }
         },
         .split => |at| {
-            _ = try decoder.feed(bytes[0..at]);
-            _ = try decoder.feed(bytes[at..]);
+            if (try satisfies(decoder, bytes[0..at])) return true;
+
+            return satisfies(decoder, bytes[at..]);
         },
-        .prefix => |len| _ = try decoder.feed(bytes[0..len]),
+        .prefix => |len| return satisfies(decoder, bytes[0..len]),
     }
 
-    try decoder.finish();
+    return false;
+}
+
+/// Feeds one portion and returns whether it satisfied the sink.
+fn satisfies(decoder: *Decoder, portion: []const u8) Error!bool {
+    return switch (try decoder.feed(portion)) {
+        .need_input, .ended => false,
+        .satisfied => true,
+    };
 }
 
 /// A short tEXt chunk.

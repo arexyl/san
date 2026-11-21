@@ -43,6 +43,9 @@ codec: ?*c.san_png_decoder = null,
 /// The cause of the stop verdict that a callback returned during the
 /// current call.
 stop: ?Stop = null,
+/// The sink was satisfied at a row of the current call, which stopped
+/// the decode there without a cause.
+satisfied: bool = false,
 /// The image header, once libpng has read IHDR.
 image: ?Header = null,
 /// The adapter's records after the latest call.
@@ -69,6 +72,9 @@ pub const Progress = enum {
     need_input,
     /// Only the end of the input: IEND passed every check.
     ended,
+    /// Nothing: the sink has every row that it wants. The decode is
+    /// complete, and the bytes after that row stay unread and unchecked.
+    satisfied,
 };
 
 /// The receiver of the decoded image. Each callback runs inside a call of
@@ -79,8 +85,13 @@ pub const Sink = struct {
     /// Runs once, before the first row.
     header: *const fn (ctx: *anyopaque, header: Header) Stop!void,
     /// Runs for each row in order. `bytes` holds the row's samples without
-    /// its filter byte, and stays valid only during the call.
-    row: *const fn (ctx: *anyopaque, index: u32, bytes: []const u8) Stop!void,
+    /// its filter byte, and stays valid only during the call. A sink
+    /// that returns `satisfied` gets no row after this one.
+    row: *const fn (
+        ctx: *anyopaque,
+        index: u32,
+        bytes: []const u8,
+    ) Stop!Codec.Demand,
 };
 
 /// The image header as IHDR declares it.
@@ -119,8 +130,9 @@ pub const Header = struct {
     }
 };
 
-/// Why the adapter ended a decode without success, for diagnostics and
-/// tests. The category never follows from it.
+/// Why the adapter ended a decode before the end of its image, for
+/// diagnostics and tests. The category never follows from it: a
+/// satisfied sink stops a decode as a cancellation does.
 pub const Reason = enum(i32) {
     none = c.SAN_PNG_REASON_NONE,
     libpng = c.SAN_PNG_REASON_LIBPNG,
@@ -194,7 +206,7 @@ pub fn deinit(decoder: *Decoder) void {
 
 /// Feeds the next portion of the encoded image, which the call only
 /// reads. A byte after IEND fails the decode, in this portion or a later
-/// one. A failure is terminal.
+/// one. A failure is terminal, and so is a satisfied sink.
 pub fn feed(decoder: *Decoder, bytes: []const u8) Error!Progress {
     const codec = decoder.live();
 
@@ -205,6 +217,7 @@ pub fn feed(decoder: *Decoder, bytes: []const u8) Error!Progress {
     return switch (try decoder.settle(status)) {
         .need_input => .need_input,
         .ended => .ended,
+        .satisfied => .satisfied,
         .done => decoder.fail(error.EngineFailure),
     };
 }
@@ -220,7 +233,8 @@ pub fn finish(decoder: *Decoder) Error!void {
 
     switch (try decoder.settle(c.san_png_finish(codec))) {
         .done => {},
-        .need_input, .ended => return error.EngineFailure,
+        // The end of the input delivers no row.
+        .need_input, .ended, .satisfied => return error.EngineFailure,
     }
 }
 
@@ -253,19 +267,27 @@ fn live(decoder: *const Decoder) *c.san_png_decoder {
 fn prepare(decoder: *Decoder) void {
     _ = decoder.heap.takeRefusal();
     decoder.stop = null;
+    decoder.satisfied = false;
 }
 
 /// The statuses that end a call without a failure.
-const Settled = enum { need_input, ended, done };
+const Settled = enum { need_input, ended, done, satisfied };
 
 /// Maps the status of a call into the adapter, after it reads the
-/// adapter's records. A failure destroys the codec context.
+/// adapter's records. A failure destroys the codec context, and so does
+/// a satisfied sink, whose stop left libpng through its error path.
 fn settle(decoder: *Decoder, status: c.san_png_status) Error!Settled {
     decoder.snapshot();
     errdefer decoder.close();
 
     if (decoder.heap.takeRefusal()) |refusal| return refusal;
     if (decoder.stop) |cause| return cause;
+
+    if (decoder.satisfied) {
+        decoder.close();
+
+        return .satisfied;
+    }
 
     return switch (status) {
         c.SAN_PNG_STATUS_NEED_INPUT => .need_input,
@@ -355,7 +377,8 @@ fn hookHeader(
 
 /// The row callback. It reads the cancellation flag after the sink
 /// returns, so a cancellation stops the decode within one row, through
-/// libpng's error path.
+/// libpng's error path. A satisfied sink stops the decode the same way,
+/// without a cause, unless a cancellation comes first.
 fn hookRow(
     ctx: ?*anyopaque,
     index: u32,
@@ -366,12 +389,20 @@ fn hookRow(
 
     if (decoder.heap.refusal != null) return c.SAN_PNG_STOP;
 
-    decoder.sink.row(decoder.sink.ctx, index, bytes[0..len]) catch |cause|
-        return decoder.stopWith(cause);
+    const demand =
+        decoder.sink.row(decoder.sink.ctx, index, bytes[0..len]) catch |cause|
+            return decoder.stopWith(cause);
 
     if (decoder.cancel.requested()) return decoder.stopWith(error.Canceled);
 
-    return c.SAN_PNG_CONTINUE;
+    switch (demand) {
+        .more => return c.SAN_PNG_CONTINUE,
+        .satisfied => {
+            decoder.satisfied = true;
+
+            return c.SAN_PNG_STOP;
+        },
+    }
 }
 
 /// The opener of PNG decoders for the jobs of an engine.
@@ -393,8 +424,11 @@ const Opened = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn feedCodec(ptr: *anyopaque, bytes: []const u8) Error!void {
-        _ = try of(ptr).decoder.feed(bytes);
+    fn feedCodec(ptr: *anyopaque, bytes: []const u8) Error!Codec.Demand {
+        return switch (try of(ptr).decoder.feed(bytes)) {
+            .need_input, .ended => .more,
+            .satisfied => .satisfied,
+        };
     }
 
     fn finishCodec(ptr: *anyopaque) Error!void {
@@ -431,10 +465,14 @@ const Opened = struct {
         try opened.target.admit(opened.target.ctx, image);
     }
 
-    fn deliver(ctx: *anyopaque, index: u32, bytes: []const u8) Stop!void {
+    fn deliver(
+        ctx: *anyopaque,
+        index: u32,
+        bytes: []const u8,
+    ) Stop!Codec.Demand {
         const opened = of(ctx);
 
-        opened.target.row(opened.target.ctx, index, bytes);
+        return opened.target.row(opened.target.ctx, index, bytes);
     }
 };
 
@@ -512,6 +550,8 @@ const Collector = struct {
     /// The row after whose delivery the row callback stops the decode as
     /// BudgetExceeded.
     row_stop: ?u32 = null,
+    /// The row with which the sink is satisfied.
+    enough_at: ?u32 = null,
     /// The rows' samples, kept outside the heap under test.
     samples: std.ArrayList(u8) = .empty,
     headers: u32 = 0,
@@ -543,7 +583,11 @@ const Collector = struct {
         if (collector.header_stop) |cause| return cause;
     }
 
-    fn onRow(ctx: *anyopaque, index: u32, bytes: []const u8) Stop!void {
+    fn onRow(
+        ctx: *anyopaque,
+        index: u32,
+        bytes: []const u8,
+    ) Stop!Codec.Demand {
         const collector: *Collector = @ptrCast(@alignCast(ctx));
 
         if (index != collector.rows) collector.mismatches += 1;
@@ -557,6 +601,8 @@ const Collector = struct {
         if (collector.cancel_at == index) collector.cancel.request();
 
         if (collector.row_stop == index) return error.BudgetExceeded;
+
+        return if (collector.enough_at == index) .satisfied else .more;
     }
 };
 
@@ -567,6 +613,7 @@ const Options = struct {
     cancel_at: ?u32 = null,
     header_stop: ?Stop = null,
     row_stop: ?u32 = null,
+    enough_at: ?u32 = null,
     /// The heap holds a refusal of other work when the decode starts.
     stale_refusal: bool = false,
 };
@@ -611,6 +658,7 @@ fn decodeWith(
         .cancel_at = options.cancel_at,
         .header_stop = options.header_stop,
         .row_stop = options.row_stop,
+        .enough_at = options.enough_at,
     };
     defer collector.samples.deinit(testing.allocator);
 
@@ -1221,6 +1269,75 @@ test "a stop verdict of the sink ends the decode with its cause" {
     try testing.expectEqual(2, at_row.rows);
 }
 
+test "a satisfied sink completes the decode at its row in every split" {
+    const spec: fixtures.Spec = .{ .width = 3, .height = 7, .filters = .cycle };
+
+    const bytes = try encode(spec);
+    defer testing.allocator.free(bytes);
+
+    const expected = try fixtures.samples(testing.allocator, spec);
+    defer testing.allocator.free(expected);
+
+    const row_bytes = expected.len / spec.height;
+
+    for (cases.plans) |plan| {
+        // The last row satisfies the sink like any other: the decode ends
+        // there, before the checks of the image end.
+        for ([_]u32{ 0, 3, 6 }) |row| {
+            const outcome = try decode(bytes, .{
+                .plan = plan,
+                .enough_at = row,
+            });
+            defer outcome.deinit();
+
+            try outcome.result;
+            try testing.expectEqual(row + 1, outcome.rows);
+            try testing.expectEqual(1, outcome.headers);
+
+            try testing.expectEqualSlices(
+                u8,
+                expected[0 .. (row + 1) * row_bytes],
+                outcome.samples,
+            );
+        }
+    }
+}
+
+test "a satisfied sink leaves the bytes after its row unread" {
+    const image = try encode(.{ .width = 3, .height = 7 });
+    defer testing.allocator.free(image);
+
+    // A byte after IEND fails the feed that reads it, also in the one
+    // portion that holds the whole input.
+    const bytes = try std.mem.concat(testing.allocator, u8, &.{ image, "x" });
+    defer testing.allocator.free(bytes);
+
+    for (cases.plans) |plan| {
+        const whole = try decode(bytes, .{ .plan = plan });
+        defer whole.deinit();
+
+        try testing.expectError(error.InvalidContent, whole.result);
+        try testing.expectEqual(Reason.trailing, whole.report.reason);
+
+        const band = try decode(bytes, .{ .plan = plan, .enough_at = 4 });
+        defer band.deinit();
+
+        try band.result;
+        try testing.expectEqual(5, band.rows);
+    }
+}
+
+test "a cancellation at the row that satisfies the sink comes first" {
+    const bytes = try encode(.{ .width = 3, .height = 7 });
+    defer testing.allocator.free(bytes);
+
+    const outcome = try decode(bytes, .{ .cancel_at = 2, .enough_at = 2 });
+    defer outcome.deinit();
+
+    try testing.expectError(error.Canceled, outcome.result);
+    try testing.expectEqual(3, outcome.rows);
+}
+
 test "the settle check catches a block that a decode leaves behind" {
     const bytes = try encode(cases.small);
     defer testing.allocator.free(bytes);
@@ -1288,6 +1405,8 @@ const Receiver = struct {
     /// The cause with which the receiver refuses the image.
     refusal: ?Codec.Refusal = null,
     rows: u32 = 0,
+    /// The count of rows after which the receiver is satisfied.
+    enough: ?u32 = null,
     /// The rows' samples, kept outside the heap under test.
     samples: std.ArrayList(u8) = .empty,
 
@@ -1304,7 +1423,7 @@ const Receiver = struct {
         if (receiver.refusal) |refusal| return refusal;
     }
 
-    fn row(ctx: *anyopaque, index: u32, bytes: []const u8) void {
+    fn row(ctx: *anyopaque, index: u32, bytes: []const u8) Codec.Demand {
         const receiver: *Receiver = @ptrCast(@alignCast(ctx));
 
         if (index != receiver.rows) @panic("a row arrived out of order");
@@ -1313,6 +1432,8 @@ const Receiver = struct {
 
         receiver.samples.appendSlice(testing.allocator, bytes) catch
             @panic("the test ran out of memory");
+
+        return if (receiver.rows == receiver.enough) .satisfied else .more;
     }
 };
 
@@ -1339,9 +1460,14 @@ fn decodeOpened(
         ) catch |err| break :run err;
         defer codec.vtable.destroy(codec.ptr);
 
-        codec.vtable.feed(codec.ptr, bytes) catch |err| break :run err;
+        const demand =
+            codec.vtable.feed(codec.ptr, bytes) catch |err| break :run err;
 
-        break :run codec.vtable.finish(codec.ptr);
+        // Only `destroy` may follow a satisfied demand.
+        break :run switch (demand) {
+            .more => codec.vtable.finish(codec.ptr),
+            .satisfied => {},
+        };
     };
 
     try testing.expectEqual(0, backing.blocks);
@@ -1373,6 +1499,35 @@ test "an opened decoder describes an RGB8 image and delivers its rows" {
 
     try testing.expectEqual(cases.small.height, receiver.rows);
     try testing.expectEqualSlices(u8, expected, receiver.samples.items);
+}
+
+test "an opened decoder ends at the row that satisfies its target" {
+    const spec: fixtures.Spec = .{ .width = 3, .height = 7 };
+
+    const image = try encode(spec);
+    defer testing.allocator.free(image);
+
+    // The byte after IEND would fail a decode that read on.
+    const bytes = try std.mem.concat(testing.allocator, u8, &.{ image, "x" });
+    defer testing.allocator.free(bytes);
+
+    const expected = try fixtures.samples(testing.allocator, spec);
+    defer testing.allocator.free(expected);
+
+    const row_bytes = expected.len / spec.height;
+
+    var receiver: Receiver = .{ .enough = 3 };
+    defer receiver.samples.deinit(testing.allocator);
+
+    try (try decodeOpened(testing.allocator, bytes, &receiver));
+
+    try testing.expectEqual(3, receiver.rows);
+
+    try testing.expectEqualSlices(
+        u8,
+        expected[0 .. 3 * row_bytes],
+        receiver.samples.items,
+    );
 }
 
 test "a tRNS chunk before the image data marks the header" {

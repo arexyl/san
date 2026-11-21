@@ -26,8 +26,9 @@ vtable: *const VTable,
 
 pub const VTable = struct {
     /// Decodes the next portion of the encoded image, which the call
-    /// only reads. A failure is the terminal outcome of the decode.
-    feed: *const fn (ptr: *anyopaque, bytes: []const u8) Error!void,
+    /// only reads. A failure is the terminal outcome of the decode, and
+    /// so is a satisfied demand.
+    feed: *const fn (ptr: *anyopaque, bytes: []const u8) Error!Demand,
     /// Ends the input. Succeeds only when the image is complete and
     /// every check of the codec passed.
     finish: *const fn (ptr: *anyopaque) Error!void,
@@ -81,8 +82,19 @@ pub const Target = struct {
     admit: *const fn (ctx: *anyopaque, image: Image) Refusal!void,
     /// Runs for each row of an admitted image, in order. `samples` holds
     /// the row in the layout of the image and stays valid only during
-    /// the call.
-    row: *const fn (ctx: *anyopaque, index: u32, samples: []const u8) void,
+    /// the call. It returns whether the target wants the rows after it.
+    row: *const fn (ctx: *anyopaque, index: u32, samples: []const u8) Demand,
+};
+
+/// Whether a decode goes on: a target answers it for the rows after the
+/// one that it took, and a codec for the bytes after a portion.
+pub const Demand = enum {
+    more,
+    /// The target has every row of its output. The codec delivers no
+    /// row after that one and reads no byte after it, so the rest of the
+    /// input stays unchecked, and only `destroy` may follow. A
+    /// cancellation that the codec observes at that row comes first.
+    satisfied,
 };
 
 /// An image as its codec describes it, with both axes at least 1. An
@@ -145,6 +157,8 @@ pub const Scripted = struct {
     workspace: ?[]u8 = null,
     rows: u32 = 0,
     ended: bool = false,
+    /// The target was satisfied, so the decode is over.
+    satisfied: bool = false,
 
     pub const Command = enum(u8) {
         /// Describes the image: the width and the height follow, each
@@ -236,14 +250,24 @@ pub const Scripted = struct {
         .destroy = destroy,
     };
 
-    fn feed(ptr: *anyopaque, bytes: []const u8) Error!void {
+    fn feed(ptr: *anyopaque, bytes: []const u8) Error!Demand {
         const scripted: *Scripted = @ptrCast(@alignCast(ptr));
 
-        for (bytes) |byte| try scripted.take(byte);
+        scripted.expectLive();
+
+        // A satisfied target ends the decode at its row, so the commands
+        // after it stay unread.
+        for (bytes) |byte| {
+            if (try scripted.take(byte) == .satisfied) return .satisfied;
+        }
+
+        return .more;
     }
 
     fn finish(ptr: *anyopaque) Error!void {
         const scripted: *Scripted = @ptrCast(@alignCast(ptr));
+
+        scripted.expectLive();
 
         if (!scripted.ended) return error.TruncatedContent;
     }
@@ -257,7 +281,7 @@ pub const Scripted = struct {
         heap.free(scripted);
     }
 
-    fn take(scripted: *Scripted, byte: u8) Error!void {
+    fn take(scripted: *Scripted, byte: u8) Error!Demand {
         if (scripted.ended) return error.InvalidContent;
 
         const command: Command = @fromBackingInt(byte);
@@ -266,16 +290,17 @@ pub const Scripted = struct {
             scripted.pending[scripted.pending_len] = byte;
             scripted.pending_len += 1;
 
-            if (scripted.pending_len < image_command_bytes) return;
+            if (scripted.pending_len < image_command_bytes) return .more;
 
             scripted.pending_len = 0;
+            try scripted.describe();
 
-            return scripted.describe();
+            return .more;
         }
 
         switch (command) {
             .image => unreachable,
-            .row => try scripted.deliver(),
+            .row => return scripted.deliver(),
             .end => {
                 const image = scripted.image orelse
                     return error.InvalidContent;
@@ -294,6 +319,8 @@ pub const Scripted = struct {
             .cut => scripted.ended = true,
             _ => return error.InvalidContent,
         }
+
+        return .more;
     }
 
     /// Delivers the image of the pending command and takes the
@@ -328,7 +355,7 @@ pub const Scripted = struct {
         scripted.workspace = workspace[0..row_bytes];
     }
 
-    fn deliver(scripted: *Scripted) Error!void {
+    fn deliver(scripted: *Scripted) Error!Demand {
         const image = scripted.image orelse return error.InvalidContent;
         const workspace = scripted.workspace orelse return error.InvalidContent;
 
@@ -338,7 +365,9 @@ pub const Scripted = struct {
 
         for (workspace, 0..) |*byte, offset| byte.* = sample(index, offset);
 
-        scripted.target.row(scripted.target.ctx, index, workspace);
+        const demand =
+            scripted.target.row(scripted.target.ctx, index, workspace);
+
         scripted.rows += 1;
 
         if (scripted.hooks.after_row) |after_row| {
@@ -346,6 +375,18 @@ pub const Scripted = struct {
         }
 
         if (scripted.cancel.requested()) return error.Canceled;
+
+        scripted.satisfied = demand == .satisfied;
+
+        return demand;
+    }
+
+    /// A call other than `destroy` after a satisfied demand is a bug in
+    /// San, which a real codec answers the same way.
+    fn expectLive(scripted: *const Scripted) void {
+        if (scripted.satisfied) {
+            @panic("the scripted codec is called after a satisfied demand");
+        }
     }
 };
 
@@ -358,6 +399,8 @@ const Recorder = struct {
     refusal: ?Refusal = null,
     /// Whether every row arrived in order with the samples of its index.
     intact: bool = true,
+    /// The count of rows after which the recorder is satisfied.
+    enough: ?u32 = null,
 
     fn target(recorder: *Recorder) Target {
         return .{ .ctx = recorder, .admit = admit, .row = row };
@@ -372,7 +415,7 @@ const Recorder = struct {
         if (recorder.refusal) |refusal| return refusal;
     }
 
-    fn row(ctx: *anyopaque, index: u32, samples: []const u8) void {
+    fn row(ctx: *anyopaque, index: u32, samples: []const u8) Demand {
         const recorder: *Recorder = @ptrCast(@alignCast(ctx));
         const image = recorder.image.?;
 
@@ -387,6 +430,8 @@ const Recorder = struct {
         }
 
         recorder.rows += 1;
+
+        return if (recorder.rows == recorder.enough) .satisfied else .more;
     }
 };
 
@@ -420,7 +465,12 @@ const Bench = struct {
         );
     }
 
-    fn feed(bench: *Bench, bytes: []const u8) Error!void {
+    /// Feeds a portion that leaves the target wanting more.
+    fn feed(bench: *Bench, bytes: []const u8) !void {
+        try testing.expectEqual(.more, try bench.demand(bytes));
+    }
+
+    fn demand(bench: *Bench, bytes: []const u8) Error!Demand {
         return bench.codec.vtable.feed(bench.codec.ptr, bytes);
     }
 
@@ -577,6 +627,37 @@ test "a codec observes only the flag of its mask, after each row" {
     // runs until the hook sets the flag.
     try testing.expectError(error.Canceled, bench.feed(&script));
     try testing.expectEqual(2, bench.recorder.rows);
+    try bench.stop();
+}
+
+test "a satisfied target ends the decode at its row" {
+    var bench: Bench = undefined;
+
+    try bench.start(Scripted.opener);
+    bench.recorder.enough = 2;
+
+    // The commands after the second row stay unread: a third row, and
+    // one that would fail the decode.
+    const script = comptime Scripted.imageCommand(3, 4) ++ row_command ++
+        row_command ++ row_command ++ invalid_command;
+
+    try testing.expectEqual(.satisfied, try bench.demand(&script));
+    try testing.expectEqual(2, bench.recorder.rows);
+    try testing.expect(bench.recorder.intact);
+    try bench.stop();
+}
+
+test "a cancellation at the row that satisfies the target comes first" {
+    var bench: Bench = undefined;
+
+    try bench.start(Scripted.opener);
+    bench.recorder.enough = 1;
+    _ = bench.word.fetchOr(Bench.flag_bit, .release);
+
+    const script = comptime Scripted.imageCommand(1, 2) ++ row_command;
+
+    try testing.expectError(error.Canceled, bench.demand(&script));
+    try testing.expectEqual(1, bench.recorder.rows);
     try bench.stop();
 }
 

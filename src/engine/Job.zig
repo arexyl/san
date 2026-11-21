@@ -348,7 +348,12 @@ fn advance(job: *Job, engine: *Engine) Codec.Error!bool {
     if (within != 0) {
         input.consumed += within;
 
-        try decode.feed(staged[0..within]);
+        // No decode of this build ends before its image, so a codec that
+        // reports a satisfied target broke its promise.
+        switch (try decode.feed(staged[0..within])) {
+            .more => {},
+            .satisfied => return error.EngineFailure,
+        }
     }
 
     if (within != staged.len) return error.BudgetExceeded;

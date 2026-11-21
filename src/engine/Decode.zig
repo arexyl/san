@@ -104,7 +104,7 @@ pub fn close(decode: *Decode) void {
     decode.codec.vtable.destroy(decode.codec.ptr);
 }
 
-pub fn feed(decode: *Decode, bytes: []const u8) Codec.Error!void {
+pub fn feed(decode: *Decode, bytes: []const u8) Codec.Error!Codec.Demand {
     return decode.codec.vtable.feed(decode.codec.ptr, bytes);
 }
 
@@ -157,8 +157,8 @@ fn admit(ctx: *anyopaque, image: Codec.Image) Codec.Refusal!void {
 }
 
 /// Writes one row of the image into the lease, as pixels of R, G, B,
-/// and an alpha of 255.
-fn write(ctx: *anyopaque, index: u32, samples: []const u8) void {
+/// and an alpha of 255. This build wants every row of the image.
+fn write(ctx: *anyopaque, index: u32, samples: []const u8) Codec.Demand {
     const decode: *Decode = @ptrCast(@alignCast(ctx));
 
     // The codec delivers each row of an admitted image once, in order.
@@ -182,6 +182,8 @@ fn write(ctx: *anyopaque, index: u32, samples: []const u8) void {
     }
 
     decode.rows = index + 1;
+
+    return .more;
 }
 
 const testing = std.testing;
