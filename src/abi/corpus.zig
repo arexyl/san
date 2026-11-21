@@ -841,6 +841,94 @@ pub fn scalesLongBand(
     try decode.finish();
 }
 
+/// Decodes the first viewport of the long segment, scaled to the width
+/// of the reference viewport, with its payload withheld at the hold
+/// point. The bytes before the hold publish every grid row that the
+/// image rows of the hold complete, which copy while the rest of the
+/// payload is withheld. The released payload completes the band in the
+/// same lease, before the end of the input, and leaves the rows that
+/// copied early as they were.
+pub fn publishesTopBand(
+    io: std.Io,
+    arena: Allocator,
+    directory: []const u8,
+) Error!void {
+    const fixture: Fixture = try .read(io, arena, directory, long_path);
+
+    if (fixture.height <= band_rows or fixture.held_rows >= band_rows) {
+        return error.ManifestUnusable;
+    }
+
+    var decode: Decode = try .start(
+        page_limits,
+        rowsOf(fixture, 0, band_rows, viewport_width),
+    );
+    errdefer decode.abandon();
+
+    try expectStatus(
+        san.SAN_STATUS_INPUT_NEEDED,
+        try decode.advance(fixture.bytes, fixture.held_from, false),
+    );
+
+    var shape: Shape = .of(fixture, viewport_width, 0, 0);
+
+    // The band is one viewport of the grid.
+    shape.rows = @divExact(
+        @as(i64, band_rows) * shape.grid_height,
+        fixture.height,
+    );
+
+    // A grid row is complete when the image rows of the hold reach its
+    // lower edge.
+    const held: i32 = @intCast(@divFloor(
+        @as(i64, fixture.held_rows) * shape.grid_height,
+        fixture.height,
+    ));
+
+    const early = decode.report;
+
+    if (early[san.SAN_JOB_REPORT_COVERED_ROWS] != held or
+        early[san.SAN_JOB_REPORT_DECODED_ROWS] != fixture.held_rows)
+    {
+        return error.UnexpectedReport;
+    }
+
+    try expectShape(early, fixture, shape);
+
+    const first: Canvas = try .init(arena, viewport_width, held);
+
+    try expectStatus(san.SAN_STATUS_OK, decode.copy(first, held));
+    try first.expectRest(held);
+    try expectStatus(san.SAN_STATUS_OK, try decode.run(fixture.bytes));
+
+    if (decode.fed == fixture.bytes.len) return error.UnexpectedReport;
+
+    const final = decode.report;
+
+    if (final[san.SAN_JOB_REPORT_COVERED_ROWS] != shape.rows or
+        final[san.SAN_JOB_REPORT_DECODED_ROWS] != band_rows)
+    {
+        return error.UnexpectedReport;
+    }
+
+    const band: Canvas =
+        try .init(arena, viewport_width, @intCast(shape.rows));
+
+    try expectStatus(
+        san.SAN_STATUS_OK,
+        decode.copy(band, @intCast(shape.rows)),
+    );
+
+    // A later revision never changes a covered row.
+    for (0..@intCast(held)) |index| {
+        if (!std.mem.eql(u8, first.row(index), band.row(index))) {
+            return error.UnexpectedPixels;
+        }
+    }
+
+    try decode.finish();
+}
+
 /// The limits of a reader with room for the large page at the image
 /// size in one lease.
 const large_limits: san.san_engine_limits = roomy: {
@@ -1156,6 +1244,19 @@ test "a scaled band of the long segment is the average of its rows" {
 
     try expectBound();
     try scalesLongBand(testing.io, arena_state.allocator(), corpus_directory);
+}
+
+test "the first band of the long segment publishes its held rows" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    try expectBound();
+
+    try publishesTopBand(
+        testing.io,
+        arena_state.allocator(),
+        corpus_directory,
+    );
 }
 
 test "the scaled large page is the average of the page" {
