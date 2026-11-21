@@ -14,9 +14,8 @@
 //! codec of its jobs.
 //!
 //! San implements the engine lifecycle, the counters read, the contents
-//! with their feed, the jobs with their steps and reports, and the
-//! release of an output lease. The copy is not implemented yet:
-//! san_output_copy rejects every handle.
+//! with their feed, the jobs with their steps and reports, and the copy
+//! and the release of an output lease.
 
 const std = @import("std");
 const san = @import("san");
@@ -116,17 +115,26 @@ pub export fn san_job_release(job: san.san_handle) san.san_status {
 }
 
 pub export fn san_output_copy(
-    _: san.san_handle,
-    _: i32,
-    _: i32,
-    _: [*c]u8,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
-    _: i32,
+    lease: san.san_handle,
+    first_row: i32,
+    row_count: i32,
+    dst: [*c]u8,
+    dst_width: i32,
+    dst_height: i32,
+    dst_stride: i32,
+    dst_first_row: i32,
+    dst_alpha: i32,
 ) san.san_status {
-    return san.SAN_STATUS_INVALID_HANDLE;
+    return copyOutput(&process, lease, .{
+        .first_row = first_row,
+        .row_count = row_count,
+        .dst = dst,
+        .dst_width = dst_width,
+        .dst_height = dst_height,
+        .dst_stride = dst_stride,
+        .dst_first_row = dst_first_row,
+        .dst_alpha = dst_alpha,
+    });
 }
 
 pub export fn san_output_release(lease: san.san_handle) san.san_status {
@@ -549,6 +557,95 @@ fn releaseJob(state: *Process, job: san.san_handle) san.san_status {
     Job.release(owned) catch |err| return statusOf(err);
 
     return san.SAN_STATUS_OK;
+}
+
+/// The arguments of san_output_copy after its handle, as the caller
+/// passed them.
+const CopyArguments = struct {
+    first_row: i32,
+    row_count: i32,
+    dst: [*c]u8,
+    dst_width: i32,
+    dst_height: i32,
+    dst_stride: i32,
+    dst_first_row: i32,
+    dst_alpha: i32,
+};
+
+/// Copies covered rows of a lease of `state` into the destination of
+/// `wanted`, also while its engine shuts down and after its content
+/// closed. The lease decides first, then the checks of the header in
+/// their order, and a failed call writes no pixel and changes nothing.
+fn copyOutput(
+    state: *Process,
+    lease: san.san_handle,
+    wanted: CopyArguments,
+) san.san_status {
+    const held = Lease.resolve(
+        &state.slot,
+        leaseHandle(lease),
+    ) catch |err| return statusOf(err);
+
+    const rows = copyOf(held, wanted) catch |err| return statusOf(err);
+
+    Lease.copy(held, rows);
+
+    return san.SAN_STATUS_OK;
+}
+
+/// Returns the copy that `wanted` names for `held`. In the order of the
+/// header and in 64-bit arithmetic, these fail as BindingMismatch: a
+/// width other than the width of the lease; an alpha value that the
+/// header does not define; fewer than one row, or rows outside the
+/// coverage; a stride below the width times the bytes of a pixel; and
+/// destination rows outside the destination, which a null destination
+/// has none of.
+fn copyOf(
+    held: Lease.Held,
+    wanted: CopyArguments,
+) error{BindingMismatch}!Lease.Copy {
+    const lease = held.lease;
+
+    if (wanted.dst_width != lease.width) return error.BindingMismatch;
+
+    // An opaque destination admits only a lease without alpha, and no
+    // lease of this build has alpha, so both values admit every lease.
+    switch (wanted.dst_alpha) {
+        san.SAN_ALPHA_PREMULTIPLIED, san.SAN_ALPHA_OPAQUE => {},
+        else => return error.BindingMismatch,
+    }
+
+    const row_count: i64 = wanted.row_count;
+
+    if (row_count < 1) return error.BindingMismatch;
+    if (wanted.first_row < 0) return error.BindingMismatch;
+
+    if (wanted.first_row + row_count > lease.covered) {
+        return error.BindingMismatch;
+    }
+
+    const row_bytes = @as(i64, wanted.dst_width) * Lease.pixel_bytes;
+
+    if (wanted.dst_stride < row_bytes) return error.BindingMismatch;
+    if (wanted.dst_first_row < 0) return error.BindingMismatch;
+
+    if (wanted.dst_first_row + row_count > wanted.dst_height) {
+        return error.BindingMismatch;
+    }
+
+    if (wanted.dst == null) return error.BindingMismatch;
+
+    // No factor is negative, and each is below 2^31, so the offset fits
+    // the 64 bits of an address on both ABIs.
+    const stride: usize = @intCast(wanted.dst_stride);
+    const first: usize = @intCast(wanted.dst_first_row);
+
+    return .{
+        .first_row = @intCast(wanted.first_row),
+        .row_count = @intCast(wanted.row_count),
+        .destination = @as([*]u8, wanted.dst) + first * stride,
+        .stride = stride,
+    };
 }
 
 /// Releases the caller's claim on a lease of `state`, also while its
@@ -2350,6 +2447,111 @@ const CancelingBacking = struct {
     }
 };
 
+/// A plain destination of a copy: rows of `width` pixels in a stride
+/// that holds padding after them. Every byte starts as `untouched`, so
+/// a test sees each byte that a copy wrote.
+const Canvas = struct {
+    bytes: []u8,
+    width: i32,
+    height: i32,
+    stride: i32,
+
+    const untouched: u8 = 0xa5;
+    const padding = 5;
+
+    fn init(width: i32, height: i32) !Canvas {
+        const stride = width * Lease.pixel_bytes + padding;
+
+        const bytes = try testing.allocator.alloc(
+            u8,
+            @intCast(height * stride),
+        );
+
+        @memset(bytes, untouched);
+
+        return .{
+            .bytes = bytes,
+            .width = width,
+            .height = height,
+            .stride = stride,
+        };
+    }
+
+    fn deinit(canvas: Canvas) void {
+        testing.allocator.free(canvas.bytes);
+    }
+
+    /// Returns the arguments of a copy of `row_count` rows of a lease,
+    /// from its row `first_row` on, to the first rows of the canvas, as
+    /// an opaque destination.
+    fn taking(canvas: Canvas, first_row: i32, row_count: i32) CopyArguments {
+        return .{
+            .first_row = first_row,
+            .row_count = row_count,
+            .dst = canvas.bytes.ptr,
+            .dst_width = canvas.width,
+            .dst_height = canvas.height,
+            .dst_stride = canvas.stride,
+            .dst_first_row = 0,
+            .dst_alpha = san.SAN_ALPHA_OPAQUE,
+        };
+    }
+
+    /// Returns the row `index` with its padding.
+    fn row(canvas: Canvas, index: usize) []const u8 {
+        const stride: usize = @intCast(canvas.stride);
+
+        return canvas.bytes[index * stride ..][0..stride];
+    }
+
+    /// Checks that no copy wrote the `count` rows from the row `first`
+    /// on, their padding included.
+    fn expectUntouched(canvas: Canvas, first: usize, count: usize) !void {
+        for (first..first + count) |index| {
+            try testing.expect(
+                std.mem.allEqual(u8, canvas.row(index), untouched),
+            );
+        }
+    }
+
+    /// Checks that the `count` rows from the row `first` on hold the
+    /// rows of the image of `samples` from its row `image_first` on, as
+    /// pixels of R, G, B, and an alpha of 255, and that their padding
+    /// stays untouched.
+    fn expectImage(
+        canvas: Canvas,
+        first: usize,
+        samples: []const u8,
+        image_first: usize,
+        count: usize,
+    ) !void {
+        const width: usize = @intCast(canvas.width);
+
+        for (0..count) |offset| {
+            const pixels = canvas.row(first + offset);
+            const expected = samples[(image_first + offset) * width * 3 ..];
+
+            for (0..width) |column| {
+                const pixel = pixels[column * Lease.pixel_bytes ..];
+
+                try testing.expectEqualSlices(
+                    u8,
+                    expected[column * 3 ..][0..3],
+                    pixel[0..3],
+                );
+
+                try testing.expectEqual(0xff, pixel[3]);
+            }
+
+            try testing.expect(std.mem.allEqual(
+                u8,
+                pixels[width * Lease.pixel_bytes ..],
+                untouched,
+            ));
+        }
+    }
+};
+
 /// One job over an encoded test image, with the engine and the content
 /// that it needs. It starts in place, because the engine names its
 /// backing by address.
@@ -2447,42 +2649,48 @@ const Decoding = struct {
         return .{ .status = status, .report = report };
     }
 
-    /// Returns the lease that `report` names, which the caller holds.
-    fn leaseOf(decoding: *Decoding, report: Report) !*Lease {
-        const held = try Lease.resolve(
-            &decoding.state.slot,
-            leaseHandle(report[san.SAN_JOB_REPORT_LEASE]),
+    fn copy(
+        decoding: *Decoding,
+        report: Report,
+        wanted: CopyArguments,
+    ) san.san_status {
+        return copyOutput(
+            &decoding.state,
+            report[san.SAN_JOB_REPORT_LEASE],
+            wanted,
         );
-
-        return held.lease;
     }
 
-    /// Checks that the lease of `report` covers `rows` rows and that each
-    /// holds the samples of the image with an alpha of 255. The tests
-    /// read the lease itself, because the copy is not implemented yet.
+    /// Checks that `report` covers `rows` rows, and copies them out of
+    /// its lease into a destination with a padded stride and one row
+    /// more: each copied row holds the samples of the image with an
+    /// alpha of 255, and every other byte stays as it was. A copy of one
+    /// row beyond the coverage is refused and writes nothing.
     fn expectRows(decoding: *Decoding, report: Report, rows: u32) !void {
-        const lease = try decoding.leaseOf(report);
-        const width: usize = lease.width;
-
-        try testing.expectEqual(rows, lease.covered);
         try testing.expectEqual(rows, report[san.SAN_JOB_REPORT_COVERED_ROWS]);
 
-        for (0..rows) |index| {
-            const pixels = lease.row(@intCast(index));
-            const expected = decoding.samples[index * width * 3 ..];
+        const count: i32 = @intCast(rows);
 
-            for (0..width) |column| {
-                const pixel = pixels[column * Lease.pixel_bytes ..];
+        var canvas: Canvas = try .init(
+            @intCast(report[san.SAN_JOB_REPORT_LEASE_WIDTH]),
+            count + 1,
+        );
+        defer canvas.deinit();
 
-                try testing.expectEqualSlices(
-                    u8,
-                    expected[column * 3 ..][0..3],
-                    pixel[0..3],
-                );
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            decoding.copy(report, canvas.taking(0, count + 1)),
+        );
 
-                try testing.expectEqual(0xff, pixel[3]);
-            }
-        }
+        try canvas.expectUntouched(0, rows + 1);
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            decoding.copy(report, canvas.taking(0, count)),
+        );
+
+        try canvas.expectImage(0, decoding.samples, 0, rows);
+        try canvas.expectUntouched(rows, 1);
     }
 
     fn release(decoding: *Decoding, report: Report) san.san_status {
@@ -2857,6 +3065,197 @@ test "a held lease outlives its content, its job, and the first shutdown" {
     );
 }
 
+test "a copy writes its rows at their place and nothing else" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    const stepped = try decoding.advance(decoding.rest(), 1);
+    const report = stepped.report;
+
+    try testing.expectEqual(san.SAN_STATUS_OK, stepped.status);
+
+    var canvas: Canvas = try .init(8, 6);
+    defer canvas.deinit();
+
+    // Rows 3 and 4 of the image go to rows 2 and 3 of the destination.
+    // A lease without alpha fills a destination of either kind alike.
+    const alphas = [_]i32{ san.SAN_ALPHA_PREMULTIPLIED, san.SAN_ALPHA_OPAQUE };
+
+    for (alphas) |alpha| {
+        var wanted = canvas.taking(3, 2);
+
+        wanted.dst_first_row = 2;
+        wanted.dst_alpha = alpha;
+
+        @memset(canvas.bytes, Canvas.untouched);
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            decoding.copy(report, wanted),
+        );
+
+        try canvas.expectUntouched(0, 2);
+        try canvas.expectImage(2, decoding.samples, 3, 2);
+        try canvas.expectUntouched(4, 2);
+    }
+
+    // The last row of the image fills a destination of exactly one row
+    // without padding, to its last byte.
+    var tight: [8 * Lease.pixel_bytes]u8 = @splat(Canvas.untouched);
+
+    try testing.expectEqual(san.SAN_STATUS_OK, decoding.copy(report, .{
+        .first_row = 15,
+        .row_count = 1,
+        .dst = &tight,
+        .dst_width = 8,
+        .dst_height = 1,
+        .dst_stride = tight.len,
+        .dst_first_row = 0,
+        .dst_alpha = san.SAN_ALPHA_OPAQUE,
+    }));
+
+    for (0..8) |column| {
+        const pixel = tight[column * Lease.pixel_bytes ..];
+        const expected = decoding.samples[(15 * 8 + column) * 3 ..];
+
+        try testing.expectEqualSlices(u8, expected[0..3], pixel[0..3]);
+        try testing.expectEqual(0xff, pixel[3]);
+    }
+
+    // A copy keeps the claims: the lease still copies and still counts.
+    try decoding.expectRows(report, 16);
+
+    const counted = try decoding.counters();
+
+    try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+    try decoding.drop(report);
+    try decoding.stop();
+}
+
+test "a copy refuses what its lease or its destination does not admit" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    // The lease covers some rows of the image and not all.
+    const early = try decoding.advance(decoding.bytes.len * 2 / 3, 0);
+    const report = early.report;
+    const covered: i32 = @intCast(report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+
+    try testing.expect(covered > 1 and covered < 16);
+
+    var canvas: Canvas = try .init(8, 16);
+    defer canvas.deinit();
+
+    const largest = std.math.maxInt(i32);
+    const lowest = std.math.minInt(i32);
+    const good = canvas.taking(0, covered);
+
+    var refused: [31]CopyArguments = @splat(good);
+
+    // A width other than the width of the lease.
+    refused[0].dst_width = 7;
+    refused[1].dst_width = 9;
+    refused[2].dst_width = 0;
+    refused[3].dst_width = -8;
+
+    // An alpha value that the header does not define.
+    refused[4].dst_alpha = 2;
+    refused[5].dst_alpha = -1;
+
+    // Fewer than one row, and rows outside the coverage, also where the
+    // lease holds their pixels and where 32 bits would wrap.
+    refused[6].row_count = 0;
+    refused[7].row_count = -1;
+    refused[8].row_count = covered + 1;
+    refused[9].first_row = -1;
+    refused[10].first_row = 1;
+    refused[11] = canvas.taking(covered, 1);
+    refused[12] = canvas.taking(largest, 1);
+    refused[13] = canvas.taking(largest, largest);
+    refused[14] = canvas.taking(1, largest);
+
+    // A stride below the width times the bytes of a pixel.
+    refused[15].dst_stride = 8 * Lease.pixel_bytes - 1;
+    refused[16].dst_stride = 0;
+    refused[17].dst_stride = -canvas.stride;
+
+    // Destination rows outside the destination, and no destination.
+    refused[18].dst_first_row = -1;
+    refused[19].dst_first_row = 16 - covered + 1;
+    refused[20].dst_first_row = largest;
+    refused[21].dst_height = covered - 1;
+    refused[22].dst_height = -16;
+    refused[23].dst = null;
+
+    // The lowest value of each argument, which no narrowing may meet.
+    refused[24].first_row = lowest;
+    refused[25].row_count = lowest;
+    refused[26].dst_width = lowest;
+    refused[27].dst_height = lowest;
+    refused[28].dst_stride = lowest;
+    refused[29].dst_first_row = lowest;
+    refused[30].dst_alpha = lowest;
+
+    // A handle of another generation names no lease, whatever the
+    // arguments, also while the caller holds the lease of the slot.
+    var stale = report;
+
+    stale[san.SAN_JOB_REPORT_LEASE] += next_generation;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        decoding.copy(stale, good),
+    );
+
+    for (refused) |wanted| {
+        try testing.expectEqual(
+            san.SAN_STATUS_BINDING_MISMATCH,
+            decoding.copy(report, wanted),
+        );
+
+        try canvas.expectUntouched(0, 16);
+    }
+
+    // The bounds themselves pass: the last covered row alone, into the
+    // last row of the destination.
+    var last = canvas.taking(covered - 1, 1);
+
+    last.dst_first_row = 15;
+
+    try testing.expectEqual(san.SAN_STATUS_OK, decoding.copy(report, last));
+    try canvas.expectUntouched(0, 15);
+    try canvas.expectImage(15, decoding.samples, @intCast(covered - 1), 1);
+
+    @memset(canvas.bytes, Canvas.untouched);
+
+    // A lease that its caller released decides before every argument,
+    // and so does a handle that names no lease.
+    try decoding.drop(report);
+
+    for ([_]Report{ report, stale }) |named| {
+        for (refused ++ [_]CopyArguments{good}) |wanted| {
+            try testing.expectEqual(
+                san.SAN_STATUS_INVALID_HANDLE,
+                decoding.copy(named, wanted),
+            );
+        }
+    }
+
+    try canvas.expectUntouched(0, 16);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        cancelJob(&decoding.state, decoding.job),
+    );
+
+    try testing.expectEqual(san.SAN_STATUS_CANCELED, decoding.step().status);
+    try decoding.stop();
+}
+
 test "bytes after the image end the job as InvalidContent" {
     var decoding: Decoding = undefined;
 
@@ -3191,4 +3590,61 @@ test "every failed allocation of a decode ends the job and settles" {
     // The decoder object, libpng's structs, its row buffers, zlib's state
     // and window, and the lease, each failed once.
     try testing.expect(failures > 6);
+}
+
+// This test runs on the state of the process, after the lifecycle test,
+// which needs that state before its binding.
+test "the exported copy takes each argument from its own parameter" {
+    const bytes = try fixtures.encode(testing.allocator, striped);
+    defer testing.allocator.free(bytes);
+
+    const samples = try fixtures.samples(testing.allocator, striped);
+    defer testing.allocator.free(samples);
+
+    var engine = unwritten;
+    var content = unwritten;
+    var job = unwritten;
+    var report = unstepped;
+
+    const calls = [_]san.san_status{
+        san_binding_establish(san.SAN_ABI_VERSION),
+        san_engine_create(&roomy, &engine),
+        san_content_open(engine, &content),
+        san_job_request(content, &whole, &job),
+        san_content_feed(content, 0, bytes.ptr, @intCast(bytes.len), 1),
+        san_job_step(job, &report),
+    };
+
+    for (calls) |status| try testing.expectEqual(san.SAN_STATUS_OK, status);
+
+    var canvas: Canvas = try .init(8, 6);
+    defer canvas.deinit();
+
+    // Rows 4 and 5 of the image go to rows 3 and 4 of the destination.
+    // The seven values after the destination all differ, so an exchange
+    // of two of them copies other rows or fails a check.
+    try testing.expectEqual(san.SAN_STATUS_OK, san_output_copy(
+        report[san.SAN_JOB_REPORT_LEASE],
+        4,
+        2,
+        canvas.bytes.ptr,
+        8,
+        6,
+        canvas.stride,
+        3,
+        san.SAN_ALPHA_OPAQUE,
+    ));
+
+    try canvas.expectUntouched(0, 3);
+    try canvas.expectImage(3, samples, 4, 2);
+    try canvas.expectUntouched(5, 1);
+
+    const ended = [_]san.san_status{
+        san_output_release(report[san.SAN_JOB_REPORT_LEASE]),
+        san_job_release(job),
+        san_content_close(content),
+        san_engine_shutdown(engine),
+    };
+
+    for (ended) |status| try testing.expectEqual(san.SAN_STATUS_OK, status);
 }

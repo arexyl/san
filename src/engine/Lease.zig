@@ -165,6 +165,33 @@ pub fn row(lease: *Lease, index: u32) []u8 {
     return lease.pixels.?[@as(usize, index) * row_bytes ..][0..row_bytes];
 }
 
+/// A copy of covered rows of a lease with its shape checked: the rows
+/// lie inside the coverage, and the destination holds each of them.
+pub const Copy = struct {
+    /// The first row of the lease to copy, and the count of rows.
+    first_row: u32,
+    row_count: u32,
+    /// Where the first row goes. Each further row starts `stride` bytes
+    /// after the row before it.
+    destination: [*]u8,
+    stride: usize,
+};
+
+/// Copies the rows of `wanted` out of `held`. Each row writes the width
+/// of the lease times the bytes of a pixel at its start and leaves the
+/// rest of its stride as it is. The copy keeps every claim on the lease.
+pub fn copy(held: Held, wanted: Copy) void {
+    const lease = held.lease;
+    const row_bytes = @as(usize, lease.width) * pixel_bytes;
+
+    for (0..wanted.row_count) |offset| {
+        const source = lease.row(wanted.first_row + @as(u32, @intCast(offset)));
+        const target = wanted.destination + offset * wanted.stride;
+
+        @memcpy(target[0..row_bytes], source);
+    }
+}
+
 /// Ends the claim of the job of `lease` at the job's terminal outcome.
 pub fn endJobClaim(lease: *Lease, engine: *Engine) void {
     lease.claims.job = false;

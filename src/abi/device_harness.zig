@@ -13,9 +13,9 @@
 //! their job, a run of engines one after another, and creations that
 //! race from several threads.
 //!
-//! The decodes read an image that is built at compile time, and they
-//! check the reports and the counters. The copy that reads a lease is
-//! not implemented yet, so no case reads a pixel.
+//! The decodes read an image that is built at compile time. They check
+//! the reports and the counters, and they copy each lease into a plain
+//! destination with a padded stride and compare its pixels.
 //!
 //! The harness prints one line per case, ending in `ok` or `FAIL`, then
 //! a summary. It exits 0 only when every case passes, 1 when a case
@@ -631,9 +631,67 @@ fn leases(engine: san.san_handle, leased: i64, bytes: i64) bool {
         counters[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] == bytes;
 }
 
+/// Reports whether the first `rows` rows of `lease` copy out as the rows
+/// of the tiny image with an alpha of 255, into a destination whose
+/// stride holds padding: the padding and the row after the copied ones
+/// stay as they were, and a copy of one row more than the coverage
+/// holds is refused and writes nothing.
+fn copies(lease: san.san_handle, rows: usize) bool {
+    const untouched = 0xa5;
+    const row_bytes = tiny.width * 4;
+    const stride = row_bytes + 3;
+
+    var destination: [(tiny.height + 1) * stride]u8 = @splat(untouched);
+
+    const count: i32 = @intCast(rows);
+
+    if (san.san_output_copy(
+        lease,
+        0,
+        count + 1,
+        &destination,
+        tiny.width,
+        tiny.height + 1,
+        stride,
+        0,
+        san.SAN_ALPHA_OPAQUE,
+    ) != san.SAN_STATUS_BINDING_MISMATCH) return false;
+
+    if (!std.mem.allEqual(u8, &destination, untouched)) return false;
+
+    if (san.san_output_copy(
+        lease,
+        0,
+        count,
+        &destination,
+        tiny.width,
+        tiny.height + 1,
+        stride,
+        0,
+        san.SAN_ALPHA_OPAQUE,
+    ) != san.SAN_STATUS_OK) return false;
+
+    for (0..rows) |row| {
+        const pixels = destination[row * stride ..][0..stride];
+
+        for (0..tiny.width) |column| {
+            const pixel = pixels[column * 4 ..][0..4];
+            const expected = tiny.samples[(row * tiny.width + column) * 3 ..];
+
+            if (!std.mem.eql(u8, pixel[0..3], expected[0..3])) return false;
+            if (pixel[3] != 0xff) return false;
+        }
+
+        if (!std.mem.allEqual(u8, pixels[row_bytes..], untouched)) return false;
+    }
+
+    return std.mem.allEqual(u8, destination[rows * stride ..], untouched);
+}
+
 /// Reports whether an image decodes in one step into a lease that its
-/// report names, and whether that lease outlives its job and its content
-/// and holds the shutdown of its engine pending until its release.
+/// report names, and whether that lease copies and outlives its job and
+/// its content and holds the shutdown of its engine pending until its
+/// release.
 fn oneDecode() bool {
     const engine = createEngine() orelse return false;
 
@@ -648,18 +706,27 @@ fn oneDecode() bool {
 
     const lease = report[san.SAN_JOB_REPORT_LEASE];
 
+    if (!copies(lease, tiny.height)) return false;
     if (!decode.finish() or !leases(engine, 1, tiny_lease_bytes)) return false;
 
-    // The lease alone keeps the engine closing, and its release works
-    // there.
+    // The lease alone keeps the engine closing, and its copy and its
+    // release work there, after its content closed.
     for (0..2) |_| {
         if (san.san_engine_shutdown(engine) !=
             san.SAN_STATUS_PENDING) return false;
+
+        if (!copies(lease, tiny.height)) return false;
     }
 
     if (san.san_output_release(lease) != san.SAN_STATUS_OK) return false;
 
     if (san.san_output_release(lease) !=
+        san.SAN_STATUS_INVALID_HANDLE) return false;
+
+    // A released lease copies nothing, whatever the arguments.
+    var pixel: [4]u8 = undefined;
+
+    if (san.san_output_copy(lease, 0, 1, &pixel, 1, 1, 4, 0, 0) !=
         san.SAN_STATUS_INVALID_HANDLE) return false;
 
     return leases(engine, 0, 0) and
@@ -699,6 +766,9 @@ fn earlyOutput() bool {
     if (!std.mem.eql(i64, &early, &ended)) return false;
     if (!cut.finish()) return false;
 
+    // The two published rows copy, and the third does not.
+    if (!copies(early[san.SAN_JOB_REPORT_LEASE], 2)) return false;
+
     if (san.san_output_release(early[san.SAN_JOB_REPORT_LEASE]) !=
         san.SAN_STATUS_OK) return false;
 
@@ -716,6 +786,7 @@ fn earlyOutput() bool {
         san.SAN_STATUS_INVALID_CONTENT) return false;
 
     if (!publishes(invalid, 1, tiny.height) or !failed.finish()) return false;
+    if (!copies(invalid[san.SAN_JOB_REPORT_LEASE], tiny.height)) return false;
 
     if (san.san_output_release(invalid[san.SAN_JOB_REPORT_LEASE]) !=
         san.SAN_STATUS_OK) return false;
@@ -783,6 +854,7 @@ fn racingCancellations() !bool {
         switch (status) {
             san.SAN_STATUS_OK => {
                 if (!publishes(report, 1, tiny.height)) return false;
+                if (!copies(lease, tiny.height)) return false;
 
                 if (san.san_output_release(lease) !=
                     san.SAN_STATUS_OK) return false;
