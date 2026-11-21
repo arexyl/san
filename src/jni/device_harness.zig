@@ -14,7 +14,9 @@
 //!   names nothing.
 //!
 //! Registration in a Java VM, and every conversion that needs one, runs
-//! only inside an Android app.
+//! only inside an Android app. So does the copy into a Bitmap: the
+//! harness needs libjnigraphics.so through the library, and it passes
+//! the copy only a null Bitmap, which no bitmap function sees.
 //!
 //! The harness prints one line per case, ending in `ok` or `FAIL`, then
 //! a summary. It exits 0 only when every case passes, 1 when a case
@@ -516,11 +518,9 @@ fn withoutHandle(env: *fake.Env) bool {
 
     if (elements[0] != san.SAN_NO_HANDLE) return false;
 
-    // Any non-null reference stands for the Bitmap.
-    var bitmap: u8 = 0;
-
+    // Only the null reference reaches the copy here: the library binds
+    // the platform's bitmap functions, which need a Bitmap of a Java VM.
     if (copy(jenv, null, unwritten, 0, 1, null, 0) != mismatch) return false;
-    if (copy(jenv, null, unwritten, 0, 1, &bitmap, 0) != invalid) return false;
 
     for ([_]OfHandle{ close, cancel, release, drop }) |method| {
         if (method(jenv, null, unwritten) != invalid) return false;

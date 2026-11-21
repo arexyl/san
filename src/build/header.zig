@@ -26,6 +26,17 @@ pub const Translation = struct {
     system: *std.Build.Module,
 };
 
+/// A C source with the NDK headers of the JNI layer: the JNI header and
+/// the headers of the Android bitmap functions. One translation holds
+/// them, so that the bitmap functions take the JNI types of the layer's
+/// methods.
+const jni_stub =
+    \\#include <jni.h>
+    \\#include <android/bitmap.h>
+    \\#include <android/data_space.h>
+    \\
+;
+
 /// The system headers that a translation sees besides aro's own.
 pub const System = union(enum) {
     /// None. The host query is explicit, so translate-c reads no native
@@ -36,7 +47,34 @@ pub const System = union(enum) {
         api_level: u32,
         include_dirs: [2][]const u8,
     },
+    /// The NDK's include directory that every ABI shares, on a host
+    /// target: the host tests of the JNI layer read Android declarations
+    /// that hold no layout of a target.
+    android_on_host: struct {
+        api_level: u32,
+        include_dir: []const u8,
+    },
 };
+
+/// Translates the NDK headers of the JNI layer for `target` and returns
+/// the module of the translation, named `jni`.
+pub fn translateJni(
+    b: *std.Build,
+    comptime Translator: type,
+    translate_c: *std.Build.Dependency,
+    target: std.Build.ResolvedTarget,
+    system: System,
+) *std.Build.Module {
+    return translateFile(
+        b,
+        Translator,
+        translate_c,
+        target,
+        system,
+        "jni",
+        b.addWriteFiles().add("jni_layer.h", jni_stub),
+    );
+}
 
 /// Translates the Bindings header and the stub of its system includes for
 /// `target`. `Translator` is the Translator type of the translate_c
@@ -84,15 +122,20 @@ pub fn translateFile(
     name: []const u8,
     source: std.Build.LazyPath,
 ) *std.Build.Module {
-    const extra_args: []const []const u8 = switch (system) {
-        .host => &.{},
-        // The pinned aro predefines only __ANDROID__, and NDK r30
-        // sys/cdefs.h rejects a translation without the level.
-        .android => |android| b.graph.dupeStrings(&.{
-            b.fmt("-D__ANDROID_API__={d}", .{android.api_level}),
-            b.fmt("-D__ANDROID_MIN_SDK_VERSION__={d}", .{android.api_level}),
-        }),
+    const api_level: ?u32 = switch (system) {
+        .host => null,
+        inline .android, .android_on_host => |android| android.api_level,
     };
+
+    // The pinned aro predefines only __ANDROID__, and NDK r30 sys/cdefs.h
+    // rejects a translation without the level.
+    const extra_args: []const []const u8 = if (api_level) |level|
+        b.graph.dupeStrings(&.{
+            b.fmt("-D__ANDROID_API__={d}", .{level}),
+            b.fmt("-D__ANDROID_MIN_SDK_VERSION__={d}", .{level}),
+        })
+    else
+        &.{};
 
     const translator = Translator.init(translate_c, .{
         .name = name,
@@ -114,6 +157,9 @@ pub fn translateFile(
         .android => |android| for (android.include_dirs) |dir| {
             translator.addSystemIncludePath(b.graph.cwdRelativePath(dir));
         },
+        .android_on_host => |android| translator.addSystemIncludePath(
+            b.graph.cwdRelativePath(android.include_dir),
+        ),
     }
 
     return translator.mod;

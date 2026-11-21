@@ -2,9 +2,10 @@
 //! test library that stands in for it, so that each test library shows
 //! the imports, the libraries, and the layout that the San library gets.
 //!
-//! - No module of the library's graph links libc. Bionic comes in only as
-//!   the API-level stub of libc.so, by its path, so the library takes no
-//!   NDK runtime object such as crtbegin_so.o and needs only libc.so.
+//! - No module of the library's graph links libc. The system comes in
+//!   only as the API-level stubs of the libraries that allowlist.zig
+//!   names for the artifact, by their paths, so the library takes no NDK
+//!   runtime object such as crtbegin_so.o and needs only those libraries.
 //! - Every C source of the library's graph takes the hardening header.
 //! - `-z defs`, so that an unresolved symbol fails the link instead of
 //!   becoming an unversioned import.
@@ -58,9 +59,13 @@ pub fn add(b: *std.Build, options: Options) *std.Build.Step.Compile {
         codecs.requireHardening(module, name);
     }
 
-    options.root_module.addObjectFile(
-        b.graph.cwdRelativePath(options.ndk.libc_stub),
-    );
+    for (allowlist.libraries) |needed| {
+        if (!needed.serves(options.artifact)) continue;
+
+        const stub = b.pathJoin(&.{ options.ndk.crt_dir, needed.name });
+
+        options.root_module.addObjectFile(b.graph.cwdRelativePath(stub));
+    }
 
     const library = b.addLibrary(.{
         .linkage = .dynamic,

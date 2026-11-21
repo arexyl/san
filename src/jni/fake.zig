@@ -10,8 +10,15 @@
 //! call while an exception is pending, for every function here except
 //! the two that inspect and clear the exception, and it forbids every
 //! call inside a critical region except the one that leaves the region.
+//!
+//! A test binary also holds stand-ins for the four Android bitmap
+//! functions, under their C names, because the host has no
+//! libjnigraphics.so. An executable for Android holds none: the San
+//! library that it loads binds the platform's functions, which need a
+//! Bitmap of a Java VM.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const jni = @import("jni");
 
 /// A Java primitive array. A `jarray` of the tests is a pointer to one.
@@ -33,6 +40,158 @@ pub const Array = union(enum) {
         };
     }
 };
+
+/// An android.graphics.Bitmap. A `jobject` of the tests that stands for
+/// a Bitmap is a pointer to one. The defaults are an sRGB data space and
+/// successful calls; a test sets `info` and `pixels`.
+pub const Bitmap = struct {
+    info: jni.AndroidBitmapInfo,
+    /// The pixels as a reader outside a lock sees them, at most
+    /// `staging_bytes`.
+    pixels: []u8,
+    /// What AndroidBitmap_getDataSpace returns. A recycled Bitmap has
+    /// ADATASPACE_UNKNOWN.
+    data_space: i32 = jni.ADATASPACE_SRGB,
+    /// The result of each function. A failed lock does nothing else.
+    info_result: c_int = jni.ANDROID_BITMAP_RESULT_SUCCESS,
+    lock_result: c_int = jni.ANDROID_BITMAP_RESULT_SUCCESS,
+    unlock_result: c_int = jni.ANDROID_BITMAP_RESULT_SUCCESS,
+
+    /// What a lock hands out: a copy of `pixels`, which the unlock
+    /// copies back, so that a write after the unlock is lost.
+    staging: [staging_bytes]u8 = undefined,
+    /// Whether the pixels are locked.
+    locked: bool = false,
+    /// The successful locks, and the unlocks of locked pixels, failed
+    /// ones included.
+    locks: u32 = 0,
+    unlocks: u32 = 0,
+    /// The calls that a copy must not make: a lock of locked pixels, an
+    /// unlock of pixels that are not locked, and a read of the
+    /// description while the pixels are locked.
+    misuses: u32 = 0,
+
+    pub const staging_bytes = 256;
+
+    pub fn object(bitmap: *Bitmap) jni.jobject {
+        return bitmap;
+    }
+
+    fn of(reference: jni.jobject) *Bitmap {
+        return @ptrCast(@alignCast(reference.?));
+    }
+};
+
+comptime {
+    if (builtin.is_test) {
+        const getInfo = jni.AndroidBitmap_getInfo;
+        const getDataSpace = jni.AndroidBitmap_getDataSpace;
+        const lockPixels = jni.AndroidBitmap_lockPixels;
+        const unlockPixels = jni.AndroidBitmap_unlockPixels;
+
+        standIn(bitmapInfo, getInfo, "AndroidBitmap_getInfo");
+        standIn(bitmapDataSpace, getDataSpace, "AndroidBitmap_getDataSpace");
+        standIn(bitmapLock, lockPixels, "AndroidBitmap_lockPixels");
+        standIn(bitmapUnlock, unlockPixels, "AndroidBitmap_unlockPixels");
+    }
+}
+
+/// Exports `function` as `name`, the name of `declared`. The link binds
+/// by name alone, so the types are compared here.
+fn standIn(
+    comptime function: anytype,
+    comptime declared: anytype,
+    comptime name: []const u8,
+) void {
+    if (@TypeOf(function) != @TypeOf(declared)) {
+        @compileError("the stand-in of " ++ name ++ " is " ++
+            @typeName(@TypeOf(function)) ++ ", and the header declares " ++
+            @typeName(@TypeOf(declared)));
+    }
+
+    @export(&function, .{ .name = name });
+}
+
+fn bitmapInfo(
+    pointer_to_functions: [*c]jni.JNIEnv,
+    reference: jni.jobject,
+    info: [*c]jni.AndroidBitmapInfo,
+) callconv(.c) c_int {
+    _ = Env.entered(pointer_to_functions);
+
+    const bitmap = Bitmap.of(reference);
+
+    if (bitmap.locked) bitmap.misuses += 1;
+
+    // Also on a failure, so that only the result tells the caller.
+    info.* = bitmap.info;
+
+    return bitmap.info_result;
+}
+
+fn bitmapDataSpace(
+    pointer_to_functions: [*c]jni.JNIEnv,
+    reference: jni.jobject,
+) callconv(.c) i32 {
+    _ = Env.entered(pointer_to_functions);
+
+    const bitmap = Bitmap.of(reference);
+
+    if (bitmap.locked) bitmap.misuses += 1;
+
+    return bitmap.data_space;
+}
+
+fn bitmapLock(
+    pointer_to_functions: [*c]jni.JNIEnv,
+    reference: jni.jobject,
+    address: [*c]?*anyopaque,
+) callconv(.c) c_int {
+    _ = Env.entered(pointer_to_functions);
+
+    const bitmap = Bitmap.of(reference);
+
+    if (bitmap.locked) bitmap.misuses += 1;
+
+    if (bitmap.lock_result == jni.ANDROID_BITMAP_RESULT_SUCCESS) {
+        const staged = bitmap.staging[0..bitmap.pixels.len];
+
+        @memcpy(staged, bitmap.pixels);
+
+        bitmap.locked = true;
+        bitmap.locks += 1;
+        address.* = staged.ptr;
+    }
+
+    return bitmap.lock_result;
+}
+
+/// Unlocks the pixels. A failure stands for a Bitmap that was recycled
+/// while its pixels were locked, so it still ends the lock of the test
+/// and shows what the lock's holder wrote.
+fn bitmapUnlock(
+    pointer_to_functions: [*c]jni.JNIEnv,
+    reference: jni.jobject,
+) callconv(.c) c_int {
+    _ = Env.entered(pointer_to_functions);
+
+    const bitmap = Bitmap.of(reference);
+
+    if (bitmap.locked) {
+        const staged = bitmap.staging[0..bitmap.pixels.len];
+
+        @memcpy(bitmap.pixels, staged);
+        @memset(staged, undefined);
+
+        bitmap.unlocks += 1;
+    } else {
+        bitmap.misuses += 1;
+    }
+
+    bitmap.locked = false;
+
+    return bitmap.unlock_result;
+}
 
 /// A JNI environment of one thread.
 pub const Env = struct {

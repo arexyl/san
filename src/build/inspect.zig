@@ -57,12 +57,14 @@ pub const Rule = enum {
     /// Hiding the rest lets LTO and section collection drop what the
     /// exports do not reach, and no San symbol can interpose a system one.
     exports,
-    /// Every undefined dynamic symbol is on the import allowlist, so each
-    /// dependency on the system has a named consumer and reason.
+    /// Every undefined dynamic symbol is on the import allowlist, in a
+    /// library that the artifact needs, so each dependency on the system
+    /// has a named consumer and reason.
     imports,
-    /// The DT_NEEDED entries are exactly the allowed libraries. An extra
-    /// library brings code that the device may lack or that the allowlist
-    /// forbids, and a missing one leaves the imports without a provider.
+    /// The DT_NEEDED entries are exactly the allowed libraries of the
+    /// artifact. An extra library brings code that the device may lack
+    /// or that the allowlist forbids, and a missing one leaves the
+    /// imports without a provider.
     needed,
     /// Every LOAD segment is aligned to at least `min_load_align`.
     load_align,
@@ -140,8 +142,8 @@ pub fn inspect(
 
     try checkMachine(&failures, image, abi);
     try checkExports(&failures, image, artifact);
-    try checkImports(&failures, image);
-    try checkNeeded(&failures, image);
+    try checkImports(&failures, image, artifact);
+    try checkNeeded(&failures, image, artifact);
     try checkLoadAlign(&failures, image);
     try checkGnuStack(&failures, image);
     try checkTextrel(&failures, image);
@@ -703,38 +705,51 @@ fn exportsName(symbols: []const Symbol, name: []const u8) bool {
     return false;
 }
 
-fn checkImports(failures: *Failures, image: Image) Allocator.Error!void {
+fn checkImports(
+    failures: *Failures,
+    image: Image,
+    artifact: allowlist.Artifact,
+) Allocator.Error!void {
     for (image.symbols) |symbol| {
-        if (symbol.defined or allowlist.importEntry(symbol.name) != null) {
-            continue;
-        }
+        if (symbol.defined) continue;
+
+        if (allowlist.importEntry(artifact, symbol.name) != null) continue;
 
         try failures.add(
             .imports,
-            "{s} is imported, but the allowlist does not name it",
-            .{symbol.name},
+            "{s} is imported, but the allowlist does not name it for the " ++
+                "{t} artifact",
+            .{ symbol.name, artifact },
         );
     }
 }
 
-fn checkNeeded(failures: *Failures, image: Image) Allocator.Error!void {
+fn checkNeeded(
+    failures: *Failures,
+    image: Image,
+    artifact: allowlist.Artifact,
+) Allocator.Error!void {
     for (image.needed) |name| {
-        if (allowlist.allowsLibrary(name)) continue;
+        if (allowlist.needs(artifact, name)) continue;
 
         try failures.add(
             .needed,
-            "{s} is needed, but it is not an allowed library",
-            .{name},
+            "{s} is needed, but it is not an allowed library of the {t} " ++
+                "artifact",
+            .{ name, artifact },
         );
     }
 
     for (allowlist.libraries) |library| {
+        if (!library.serves(artifact)) continue;
+
         if (contains(image.needed, library.name)) continue;
 
         try failures.add(
             .needed,
-            "{s} is an allowed library, but no DT_NEEDED entry names it",
-            .{library.name},
+            "{s} is an allowed library of the {t} artifact, but no " ++
+                "DT_NEEDED entry names it",
+            .{ library.name, artifact },
         );
     }
 }
@@ -1321,6 +1336,14 @@ test "a library with every property right passes" {
 
     const san = try Synthetic.build(.{
         .exports = &.{.{ .name = "JNI_OnLoad" }},
+        .imports = &.{
+            .{ .name = "malloc" },
+            .{ .name = "AndroidBitmap_getInfo" },
+            .{ .name = "AndroidBitmap_getDataSpace" },
+            .{ .name = "AndroidBitmap_lockPixels" },
+            .{ .name = "AndroidBitmap_unlockPixels" },
+        },
+        .needed = &.{ "libc.so", "libjnigraphics.so" },
     }, arena);
 
     try expectRules(&.{}, try inspect(arena, san, .@"arm64-v8a", .san));
@@ -1478,11 +1501,78 @@ test "a missing declared export or a missing libc.so fails" {
         .png_device_test,
     ));
 
+    // The San library declares another export and needs a second library.
     const png = try Synthetic.build(.{}, arena);
 
-    try expectRules(&.{ .exports, .exports }, try inspect(
+    try expectRules(&.{ .exports, .exports, .needed }, try inspect(
         arena,
         png,
+        .@"arm64-v8a",
+        .san,
+    ));
+}
+
+test "only the San library may need the Android bitmap library" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    const arena = arena_state.allocator();
+
+    const copy: Synthetic.Global = .{ .name = "AndroidBitmap_lockPixels" };
+    const both = [_][]const u8{ "libc.so", "libjnigraphics.so" };
+
+    // A test library with the San library's DT_NEEDED entries.
+    const needing = try Synthetic.build(.{ .needed = &both }, arena);
+
+    const needed = try inspect(
+        arena,
+        needing,
+        .@"arm64-v8a",
+        .png_device_test,
+    );
+
+    try expectRules(&.{.needed}, needed);
+    try testing.expect(mentions(needed[0].detail, "libjnigraphics.so"));
+
+    // A test library with an import of the copy operation. A real link
+    // of it also needs the library; the rules are judged apart here.
+    const importing = try Synthetic.build(.{
+        .imports = &.{ .{ .name = "malloc" }, copy },
+    }, arena);
+
+    const imported = try inspect(
+        arena,
+        importing,
+        .@"arm64-v8a",
+        .png_device_test,
+    );
+
+    try expectRules(&.{.imports}, imported);
+    try testing.expect(mentions(imported[0].detail, copy.name));
+
+    // The San library without the Android bitmap library, whose import
+    // then has no provider.
+    const unprovided = try Synthetic.build(.{
+        .exports = &.{.{ .name = "JNI_OnLoad" }},
+        .imports = &.{ .{ .name = "malloc" }, copy },
+    }, arena);
+
+    const missing = try inspect(arena, unprovided, .@"arm64-v8a", .san);
+
+    try expectRules(&.{.needed}, missing);
+    try testing.expect(mentions(missing[0].detail, "libjnigraphics.so"));
+
+    // No artifact may take another function of the Android bitmap
+    // library.
+    const compressing = try Synthetic.build(.{
+        .exports = &.{.{ .name = "JNI_OnLoad" }},
+        .imports = &.{.{ .name = "AndroidBitmap_compress" }},
+        .needed = &both,
+    }, arena);
+
+    try expectRules(&.{.imports}, try inspect(
+        arena,
+        compressing,
         .@"arm64-v8a",
         .san,
     ));

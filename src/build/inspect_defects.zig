@@ -10,9 +10,10 @@
 //! libraries.
 //!
 //! Some defects live in the link rather than in this code: an extra name
-//! in the version script, a 4 KiB page size, and the libm.so stub as a
-//! link input. This root then exports the extra name and calls into
-//! libm, so that the link keeps what the defect needs.
+//! in the version script, a 4 KiB page size, and the stub of libm.so or
+//! of libjnigraphics.so as a link input. This root then exports the
+//! extra name and calls into the library, so that the link keeps what
+//! the defect needs.
 //!
 //! The link drops a shared library that no symbol binds to, so every
 //! library of this root takes Bionic's heap, as every San library does,
@@ -34,6 +35,10 @@ extern fn free(ptr: ?*anyopaque) void;
 extern fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern fn pow(x: f64, y: f64) f64;
 
+/// A function of libjnigraphics.so that the San library imports for its
+/// copy operation, and that no test library may take.
+extern fn AndroidBitmap_getDataSpace(env: ?*anyopaque, bitmap: ?*anyopaque) i32;
+
 /// The declared export of the PNG device test library. Its result
 /// depends on the heap and on the selected defect's code, so the link
 /// keeps both.
@@ -54,6 +59,10 @@ fn defective(input: u64) u64 {
             @floatFromInt(input),
             @floatFromInt(input >> 1),
         )),
+        .bitmap_import => @bitCast(@as(i64, AndroidBitmap_getDataSpace(
+            null,
+            @ptrFromInt(input),
+        ))),
         .svc => supervisorCall(input),
     };
 }

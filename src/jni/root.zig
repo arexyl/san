@@ -12,6 +12,11 @@
 //! violates its declared shape returns SAN_STATUS_BINDING_MISMATCH before
 //! that function runs, and an output value is written only after it
 //! returns. No method raises a Java exception or leaves one pending.
+//!
+//! The copy takes its destination as a Bitmap. It rejects a Bitmap that
+//! the pixel profile does not admit, locks the pixels around its one
+//! function, and unlocks them on every path after the lock. No other
+//! code of San touches a Bitmap.
 
 const std = @import("std");
 const jni = @import("jni");
@@ -349,7 +354,7 @@ fn jobRelease(
 }
 
 fn outputCopy(
-    _: [*c]jni.JNIEnv,
+    env: [*c]jni.JNIEnv,
     _: jni.jclass,
     lease: jni.jlong,
     first_row: jni.jint,
@@ -357,22 +362,98 @@ fn outputCopy(
     destination: jni.jobject,
     destination_first_row: jni.jint,
 ) callconv(.c) jni.jint {
-    if (destination == null) return san.SAN_STATUS_BINDING_MISMATCH;
+    const bitmap = destination orelse return san.SAN_STATUS_BINDING_MISMATCH;
 
-    // San issues no lease, so the C ABI rejects every handle before it
-    // reads a destination, and nothing locks the Bitmap.
-    return abi.san_output_copy(
+    const backing = Backing.of(env, bitmap) orelse
+        return san.SAN_STATUS_BINDING_MISMATCH;
+
+    var pixels: ?*anyopaque = null;
+
+    if (jni.AndroidBitmap_lockPixels(env, bitmap, &pixels) != bitmap_ok) {
+        return san.SAN_STATUS_BINDING_MISMATCH;
+    }
+
+    const status = abi.san_output_copy(
         lease,
         first_row,
         row_count,
-        null,
-        0,
-        0,
-        0,
+        @ptrCast(pixels),
+        backing.width,
+        backing.height,
+        backing.stride,
         destination_first_row,
-        san.SAN_ALPHA_PREMULTIPLIED,
+        backing.alpha,
     );
+
+    // The unlock fails only for a Bitmap that was recycled during the
+    // call. A rejection keeps its status, because the first failed check
+    // decides.
+    const unlocked = jni.AndroidBitmap_unlockPixels(env, bitmap) == bitmap_ok;
+
+    if (status == san.SAN_STATUS_OK and !unlocked) {
+        return san.SAN_STATUS_BINDING_MISMATCH;
+    }
+
+    return status;
 }
+
+const bitmap_ok = jni.ANDROID_BITMAP_RESULT_SUCCESS;
+
+/// The pixels of a Bitmap that the pixel profile admits, as the C ABI
+/// takes the destination of a copy.
+const Backing = struct {
+    width: i32,
+    height: i32,
+    stride: i32,
+    /// SAN_ALPHA_PREMULTIPLIED or SAN_ALPHA_OPAQUE.
+    alpha: i32,
+
+    /// The header declares the hardware flag as `1 << 31`, which is no
+    /// value of the `int` of its enumeration, so the mask takes its bits.
+    const hardware: u32 = @bitCast(@as(
+        i32,
+        jni.ANDROID_BITMAP_FLAGS_IS_HARDWARE,
+    ));
+
+    const alpha_mask: u32 = jni.ANDROID_BITMAP_FLAGS_ALPHA_MASK;
+    const alpha_shift: u5 = jni.ANDROID_BITMAP_FLAGS_ALPHA_SHIFT;
+    const premultiplied: u32 = jni.ANDROID_BITMAP_FLAGS_ALPHA_PREMUL;
+    const @"opaque": u32 = jni.ANDROID_BITMAP_FLAGS_ALPHA_OPAQUE;
+
+    /// Returns the backing of `bitmap`, or null for a Bitmap that the
+    /// copy must not lock: one without a readable description, a
+    /// hardware Bitmap, one in another format, alpha encoding, or data
+    /// space, and one whose geometry exceeds a coordinate of the C ABI.
+    fn of(env: [*c]jni.JNIEnv, bitmap: jni.jobject) ?Backing {
+        var info: jni.AndroidBitmapInfo = undefined;
+
+        if (jni.AndroidBitmap_getInfo(env, bitmap, &info) != bitmap_ok) {
+            return null;
+        }
+
+        if (info.flags & hardware != 0) return null;
+        if (info.format != jni.ANDROID_BITMAP_FORMAT_RGBA_8888) return null;
+
+        const alpha: i32 = switch ((info.flags & alpha_mask) >> alpha_shift) {
+            premultiplied => san.SAN_ALPHA_PREMULTIPLIED,
+            @"opaque" => san.SAN_ALPHA_OPAQUE,
+            else => return null,
+        };
+
+        // A recycled Bitmap keeps its description and loses its data
+        // space.
+        const data_space = jni.AndroidBitmap_getDataSpace(env, bitmap);
+
+        if (data_space != jni.ADATASPACE_SRGB) return null;
+
+        return .{
+            .width = std.math.cast(i32, info.width) orelse return null,
+            .height = std.math.cast(i32, info.height) orelse return null,
+            .stride = std.math.cast(i32, info.stride) orelse return null,
+            .alpha = alpha,
+        };
+    }
+};
 
 fn outputRelease(
     _: [*c]jni.JNIEnv,
@@ -1491,8 +1572,8 @@ test "the methods of a content, a job, and a lease reject every handle" {
 
     const jenv = env.pointer();
 
-    // Any non-null reference stands for the Bitmap.
-    var bitmap: u8 = 0;
+    var pixels: [bitmap_bytes]u8 = @splat(untouched);
+    var bitmap = bitmapOver(&pixels);
 
     const handles = [_]jni.jlong{
         san.SAN_NO_HANDLE,
@@ -1507,7 +1588,7 @@ test "the methods of a content, a job, and a lease reject every handle" {
             close(jenv, null, handle),
             cancel(jenv, null, handle),
             release(jenv, null, handle),
-            copy(jenv, null, handle, 0, 1, &bitmap, 0),
+            copy(jenv, null, handle, 0, 1, bitmap.object(), 0),
             drop(jenv, null, handle),
         };
 
@@ -1522,7 +1603,348 @@ test "the methods of a content, a job, and a lease reject every handle" {
         );
     }
 
-    try testing.expectEqual(0, bitmap);
+    // The handle decides inside the lock of an admitted Bitmap.
+    try testing.expectEqual(handles.len, bitmap.locks);
+    try testing.expectEqual(handles.len, bitmap.unlocks);
+    try testing.expectEqual(0, bitmap.misuses);
+    try expectRows(&pixels, 0, 0, 0);
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+/// The destination of the copy tests: a Bitmap of the width of
+/// `tiny_png` with more rows than its lease and a padded stride, so
+/// that each number of a copy differs from the others.
+const bitmap_height = 7;
+const bitmap_stride = tiny.width * 4 + 4;
+const bitmap_bytes = bitmap_height * bitmap_stride;
+
+/// The value of every byte of a destination that no copy wrote.
+const untouched: u8 = 0xa5;
+
+/// Returns a mutable ARGB_8888 Bitmap in sRGB with alpha over `pixels`.
+fn bitmapOver(pixels: *[bitmap_bytes]u8) fake.Bitmap {
+    return .{
+        .info = .{
+            .width = tiny.width,
+            .height = bitmap_height,
+            .stride = bitmap_stride,
+            .format = jni.ANDROID_BITMAP_FORMAT_RGBA_8888,
+            .flags = jni.ANDROID_BITMAP_FLAGS_ALPHA_PREMUL,
+        },
+        .pixels = pixels,
+    };
+}
+
+/// Checks that `pixels` holds the rows [first, first + count) of
+/// `tiny_png` from the row `at` on, in the pixel profile, and
+/// `untouched` in every other byte, the padding of each row included.
+fn expectRows(
+    pixels: *const [bitmap_bytes]u8,
+    first: usize,
+    count: usize,
+    at: usize,
+) !void {
+    var expected: [bitmap_bytes]u8 = @splat(untouched);
+
+    for (0..count) |row| {
+        const samples = tiny.samples[(first + row) * tiny.width * 3 ..];
+        const written = expected[(at + row) * bitmap_stride ..];
+
+        for (0..tiny.width) |column| {
+            written[column * 4 ..][0..3].* = samples[column * 3 ..][0..3].*;
+            written[column * 4 + 3] = 0xff;
+        }
+    }
+
+    try testing.expectEqualSlices(u8, &expected, pixels);
+}
+
+/// An engine with one held lease of the decoded `tiny_png`.
+const Held = struct {
+    engine: jni.jlong,
+    lease: jni.jlong,
+
+    fn decode(env: *fake.Env) !Held {
+        var handle = [_]jni.jlong{unwritten};
+        var out: fake.Array = .{ .longs = &handle };
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            try createWith(env, limitsUnder(1 << 20), out.object()),
+        );
+
+        const engine = handle[0];
+
+        const status, const lease = try decodeTiny(env, engine);
+
+        try testing.expectEqual(san.SAN_STATUS_OK, status);
+
+        return .{ .engine = engine, .lease = lease };
+    }
+
+    /// Releases the lease, which a test may have released, and shuts the
+    /// engine down.
+    fn end(held: Held, env: *fake.Env) !void {
+        const drop = try methodOf(env, "outputRelease", outputRelease);
+        const shutdown = try methodOf(env, "engineShutdown", engineShutdown);
+
+        _ = drop(env.pointer(), null, held.lease);
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            shutdown(env.pointer(), null, held.engine),
+        );
+    }
+};
+
+test "the copy writes covered rows into the locked pixels of a Bitmap" {
+    var env: fake.Env = .{};
+
+    try expectLoaded(&env);
+
+    const copy = try methodOf(&env, "outputCopy", outputCopy);
+    const jenv = env.pointer();
+
+    const held: Held = try .decode(&env);
+
+    // Each copy names its rows, its destination row, and the flags of
+    // its Bitmap. No lease of this build has alpha, so an opaque Bitmap
+    // admits it as a premultiplied one does. The last Bitmap sets a bit
+    // that the header does not define, outside the alpha mask.
+    const Case = struct { jni.jint, jni.jint, jni.jint, u32 };
+
+    const cases = [_]Case{
+        .{ 0, 3, 4, jni.ANDROID_BITMAP_FLAGS_ALPHA_PREMUL },
+        .{ 1, 2, 0, jni.ANDROID_BITMAP_FLAGS_ALPHA_OPAQUE },
+        .{ 2, 1, 6, 1 << 4 },
+    };
+
+    for (cases) |case| {
+        const first, const count, const at, const flags = case;
+
+        var pixels: [bitmap_bytes]u8 = @splat(untouched);
+        var bitmap = bitmapOver(&pixels);
+
+        bitmap.info.flags = flags;
+
+        try testing.expectEqual(san.SAN_STATUS_OK, copy(
+            jenv,
+            null,
+            held.lease,
+            first,
+            count,
+            bitmap.object(),
+            at,
+        ));
+
+        try expectRows(&pixels, @intCast(first), @intCast(count), @intCast(at));
+        try testing.expectEqual(1, bitmap.locks);
+        try testing.expectEqual(1, bitmap.unlocks);
+        try testing.expectEqual(0, bitmap.misuses);
+    }
+
+    try held.end(&env);
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+test "a Bitmap outside the pixel profile fails before the lock" {
+    var env: fake.Env = .{};
+
+    try expectLoaded(&env);
+
+    const copy = try methodOf(&env, "outputCopy", outputCopy);
+    const jenv = env.pointer();
+
+    const held: Held = try .decode(&env);
+
+    const hardware: u32 = 1 << 31;
+    const @"opaque": u32 = jni.ANDROID_BITMAP_FLAGS_ALPHA_OPAQUE;
+    const beyond: u32 = std.math.maxInt(i32) + 1;
+
+    var scratch: [bitmap_bytes]u8 = undefined;
+
+    const admitted = bitmapOver(&scratch);
+
+    var rejected: [17]fake.Bitmap = @splat(admitted);
+
+    // The description is unreadable, or the lock fails.
+    rejected[0].info_result = jni.ANDROID_BITMAP_RESULT_BAD_PARAMETER;
+    rejected[1].info_result = jni.ANDROID_BITMAP_RESULT_JNI_EXCEPTION;
+    rejected[2].lock_result = jni.ANDROID_BITMAP_RESULT_JNI_EXCEPTION;
+    rejected[3].lock_result = jni.ANDROID_BITMAP_RESULT_ALLOCATION_FAILED;
+
+    // A hardware Bitmap, whatever else it states.
+    rejected[4].info.flags |= hardware;
+    rejected[5].info.flags = hardware | @"opaque";
+
+    rejected[6].info.format = jni.ANDROID_BITMAP_FORMAT_NONE;
+    rejected[7].info.format = jni.ANDROID_BITMAP_FORMAT_RGB_565;
+    rejected[8].info.format = jni.ANDROID_BITMAP_FORMAT_RGBA_F16;
+
+    rejected[9].info.flags = jni.ANDROID_BITMAP_FLAGS_ALPHA_UNPREMUL;
+    rejected[10].info.flags = jni.ANDROID_BITMAP_FLAGS_ALPHA_MASK;
+
+    // A recycled Bitmap, and one in another color space.
+    rejected[11].data_space = jni.ADATASPACE_UNKNOWN;
+    rejected[12].data_space = jni.ADATASPACE_DISPLAY_P3;
+
+    // A geometry that no coordinate of the C ABI holds.
+    rejected[13].info.width = beyond;
+    rejected[14].info.height = beyond;
+    rejected[15].info.stride = beyond;
+    rejected[16].info.stride = std.math.maxInt(u32);
+
+    // An invalid handle would fail the same copy inside the lock.
+    const leases = [_]jni.jlong{ held.lease, san.SAN_NO_HANDLE, unwritten };
+
+    for (&rejected) |*bitmap| {
+        for (leases) |lease| {
+            var pixels: [bitmap_bytes]u8 = @splat(untouched);
+
+            bitmap.pixels = &pixels;
+
+            try testing.expectEqual(san.SAN_STATUS_BINDING_MISMATCH, copy(
+                jenv,
+                null,
+                lease,
+                0,
+                1,
+                bitmap.object(),
+                0,
+            ));
+
+            try expectRows(&pixels, 0, 0, 0);
+        }
+
+        try testing.expectEqual(0, bitmap.locks);
+        try testing.expectEqual(0, bitmap.unlocks);
+        try testing.expectEqual(0, bitmap.misuses);
+    }
+
+    // The control: the same copy into the admitted Bitmap succeeds.
+    var pixels: [bitmap_bytes]u8 = @splat(untouched);
+    var control = bitmapOver(&pixels);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        copy(jenv, null, held.lease, 0, 1, control.object(), 0),
+    );
+
+    try expectRows(&pixels, 0, 1, 0);
+    try held.end(&env);
+    try testing.expect(!env.pending);
+    try testing.expectEqual(0, env.forbidden_calls);
+}
+
+test "the copy passes the geometry of the Bitmap and unlocks on every path" {
+    var env: fake.Env = .{};
+
+    try expectLoaded(&env);
+
+    const copy = try methodOf(&env, "outputCopy", outputCopy);
+    const drop = try methodOf(&env, "outputRelease", outputRelease);
+    const jenv = env.pointer();
+
+    const held: Held = try .decode(&env);
+
+    // What the platform's unlock returns for a recycled Bitmap.
+    const unlock_failure: c_int = jni.ANDROID_BITMAP_RESULT_JNI_EXCEPTION;
+
+    var pixels: [bitmap_bytes]u8 = @splat(untouched);
+
+    // The C ABI rejects each of these inside the lock: a width other
+    // than the lease's, a stride below the row, and rows past the end.
+    const Rejection = struct { width: u32, height: u32, stride: u32 };
+
+    const rejections = [_]Rejection{
+        .{ .width = 3, .height = bitmap_height, .stride = bitmap_stride },
+        .{ .width = 2, .height = bitmap_height, .stride = 7 },
+        .{ .width = 2, .height = 6, .stride = bitmap_stride },
+    };
+
+    for (rejections) |rejection| {
+        var bitmap = bitmapOver(&pixels);
+
+        bitmap.info.width = rejection.width;
+        bitmap.info.height = rejection.height;
+        bitmap.info.stride = rejection.stride;
+
+        // A failed unlock keeps the status of the rejection.
+        for ([_]c_int{ bitmap_ok, unlock_failure }) |unlock_result| {
+            bitmap.unlock_result = unlock_result;
+
+            try testing.expectEqual(
+                san.SAN_STATUS_BINDING_MISMATCH,
+                copy(jenv, null, held.lease, 0, 3, bitmap.object(), 4),
+            );
+        }
+
+        try testing.expectEqual(2, bitmap.locks);
+        try testing.expectEqual(2, bitmap.unlocks);
+        try testing.expectEqual(0, bitmap.misuses);
+        try expectRows(&pixels, 0, 0, 0);
+    }
+
+    // A failed unlock after a copy that wrote: the Bitmap was recycled
+    // during the call.
+    var recycled = bitmapOver(&pixels);
+
+    recycled.unlock_result = unlock_failure;
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        copy(jenv, null, held.lease, 0, 3, recycled.object(), 4),
+    );
+
+    try testing.expectEqual(1, recycled.unlocks);
+    try expectRows(&pixels, 0, 3, 4);
+
+    // The largest height and stride that a coordinate of the C ABI
+    // holds. The copy stays inside the first row of the pixels.
+    @memset(&pixels, untouched);
+
+    var largest = bitmapOver(&pixels);
+
+    largest.info.height = std.math.maxInt(i32);
+    largest.info.stride = std.math.maxInt(i32);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        copy(jenv, null, held.lease, 2, 1, largest.object(), 0),
+    );
+
+    try testing.expectEqual(1, largest.unlocks);
+    try expectRows(&pixels, 2, 1, 0);
+
+    // The largest width reaches the C ABI, which the lease then fails.
+    largest.info.width = std.math.maxInt(i32);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_BINDING_MISMATCH,
+        copy(jenv, null, held.lease, 2, 1, largest.object(), 0),
+    );
+
+    try testing.expectEqual(2, largest.locks);
+    try testing.expectEqual(2, largest.unlocks);
+
+    // A released lease fails as InvalidHandle, also with a failed unlock.
+    try testing.expectEqual(san.SAN_STATUS_OK, drop(jenv, null, held.lease));
+
+    @memset(&pixels, untouched);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        copy(jenv, null, held.lease, 0, 3, recycled.object(), 4),
+    );
+
+    try testing.expectEqual(2, recycled.locks);
+    try testing.expectEqual(2, recycled.unlocks);
+    try testing.expectEqual(0, recycled.misuses);
+    try expectRows(&pixels, 0, 0, 0);
+
+    try held.end(&env);
     try testing.expect(!env.pending);
     try testing.expectEqual(0, env.forbidden_calls);
 }

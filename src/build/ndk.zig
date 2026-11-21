@@ -6,6 +6,7 @@
 //! tool runs.
 
 const std = @import("std");
+const allowlist = @import("allowlist.zig");
 const profile = @import("profile.zig");
 
 /// An NDK revision as `Pkg.Revision` in `source.properties` records it.
@@ -35,10 +36,11 @@ pub const Root = struct {
     /// the order of a Zig libc description.
     include_dirs: [2][]const u8,
     /// `<sysroot>/usr/lib/<triple>/<level>`: the stubs of the profile's
-    /// API level and the crt objects of executables.
+    /// API level and the crt objects of executables. It holds the stub
+    /// of every library of the allowlist.
     crt_dir: []const u8,
-    /// The API-level stub of Bionic's libc.so in `crt_dir`, the one
-    /// shared library that a San library links against.
+    /// The API-level stub of Bionic's libc.so in `crt_dir`, which every
+    /// San library links against.
     libc_stub: []const u8,
 };
 
@@ -217,16 +219,18 @@ pub fn open(
         profile.api_level,
     ) catch @panic("OOM");
 
-    const libc_stub = b.pathJoin(&.{ crt_dir, "libc.so" });
+    for (allowlist.libraries) |library| {
+        const stub = b.pathJoin(&.{ crt_dir, library.name });
 
-    trackPresence(b, libc_stub);
+        trackPresence(b, stub);
 
-    std.Io.Dir.cwd().access(b.graph.io, libc_stub, .{}) catch |err| {
-        return .{ .rejected = b.fmt(
-            "-Dndk={s}: missing libc.so stub of API level {d}: {s}: {t}",
-            .{ root, profile.api_level, libc_stub, err },
-        ) };
-    };
+        std.Io.Dir.cwd().access(b.graph.io, stub, .{}) catch |err| {
+            return .{ .rejected = b.fmt(
+                "-Dndk={s}: missing {s} stub of API level {d}: {s}: {t}",
+                .{ root, library.name, profile.api_level, stub, err },
+            ) };
+        };
+    }
 
     return .{ .ok = .{
         .path = root,
@@ -234,7 +238,7 @@ pub fn open(
         .sysroot = sysroot,
         .include_dirs = include_dirs,
         .crt_dir = crt_dir,
-        .libc_stub = libc_stub,
+        .libc_stub = b.pathJoin(&.{ crt_dir, allowlist.libc }),
     } };
 }
 

@@ -732,10 +732,11 @@ fn addAbiTest(
 }
 
 /// Adds the host tests of the JNI layer, in the mode of -Doptimize. The
-/// JNI header comes from the NDK, and it includes only <stdarg.h> and
-/// <stdint.h>, so the host translates it alone, without another NDK
-/// header. The layer runs the C ABI, which composes the engine with the
-/// PNG decoder, so the tests link the host codec archives.
+/// headers of the layer come from the NDK, so the host translates them
+/// against the NDK's include directory that every ABI shares; the types
+/// of fixed width keep their size on every target. The layer runs the C
+/// ABI, which composes the engine with the PNG decoder, so the tests
+/// link the host codec archives.
 fn addJniTest(
     b: *std.Build,
     step: *std.Build.Step,
@@ -760,14 +761,15 @@ fn addJniTest(
 
     const translator = b.dependency("translate_c", .{});
 
-    const jni = header.translateFile(
+    const jni = header.translateJni(
         b,
         translate_c.Translator,
         translator,
         target,
-        .host,
-        "jni",
-        jniHeader(b, found),
+        .{ .android_on_host = .{
+            .api_level = profile.api_level,
+            .include_dir = found.include_dirs[0],
+        } },
     );
 
     const translation = header.translate(
@@ -825,13 +827,6 @@ fn addJniTest(
     });
 
     step.dependOn(&b.addRunArtifact(tests).step);
-}
-
-/// Returns the JNI header of the NDK.
-fn jniHeader(b: *std.Build, found: ndk.Root) std.Build.LazyPath {
-    return b.graph.cwdRelativePath(
-        b.pathJoin(&.{ found.include_dirs[0], "jni.h" }),
-    );
 }
 
 /// An Android ABI and an optimization mode that the profile permits.
@@ -1585,15 +1580,7 @@ fn addSanLibrary(
         system,
     );
 
-    const jni = header.translateFile(
-        b,
-        Translator,
-        translator,
-        target,
-        system,
-        "jni",
-        jniHeader(b, found),
-    );
+    const jni = header.translateJni(b, Translator, translator, target, system);
 
     const engine = androidEngine(b);
 
@@ -1950,24 +1937,38 @@ fn addReport(
 }
 
 /// A deliberate defect of a library that check-inspect links, with the
-/// rule of the inspection that must reject it. `none` is the control:
+/// rules of the inspection that must reject it. `none` is the control:
 /// the same library without a defect, which passes every rule.
 const Defect = enum {
     none,
     extra_export,
     getenv_import,
     libm_needed,
+    bitmap_import,
     small_pages,
     svc,
 
-    fn rule(defect: Defect) ?inspect.Rule {
+    fn rules(defect: Defect) []const inspect.Rule {
         return switch (defect) {
-            .none => null,
-            .extra_export => .exports,
-            .getenv_import => .imports,
-            .libm_needed => .needed,
-            .small_pages => .load_align,
-            .svc => .svc,
+            .none => &.{},
+            .extra_export => &.{.exports},
+            .getenv_import => &.{.imports},
+            .libm_needed => &.{.needed},
+            // A test library that takes what only the San library may:
+            // the import and the library that holds it.
+            .bitmap_import => &.{ .imports, .needed },
+            .small_pages => &.{.load_align},
+            .svc => &.{.svc},
+        };
+    }
+
+    /// The stub that the link of the defect takes beside the allowed
+    /// ones, or null.
+    fn stub(defect: Defect) ?[]const u8 {
+        return switch (defect) {
+            .libm_needed => "libm.so",
+            .bitmap_import => "libjnigraphics.so",
+            .none, .extra_export, .getenv_import, .small_pages, .svc => null,
         };
     }
 };
@@ -1978,7 +1979,7 @@ const extra_export = "san_png_device_test_extra";
 
 /// Adds check-inspect: a library in the link shape of San's libraries
 /// for each defect, each inspected with the expectation that the tool
-/// exits 1 and names the defect's rule, and the control without a
+/// exits 1 and names the defect's rules, and the control without a
 /// defect, which must pass. The svc rule scans arm64 code only, so its
 /// defect is linked for arm64-v8a only.
 fn addInspectCheck(
@@ -2025,15 +2026,16 @@ fn addInspectCheck(
         });
 
         switch (defect) {
-            .none, .getenv_import, .svc => {},
+            .none, .getenv_import, .libm_needed, .bitmap_import, .svc => {},
             .extra_export => defective.setVersionScript(
                 extraExportScript(b),
             ),
-            .libm_needed => root.addObjectFile(b.graph.cwdRelativePath(
-                b.pathJoin(&.{ found.crt_dir, "libm.so" }),
-            )),
             .small_pages => defective.link_z_max_page_size = 4096,
         }
+
+        if (defect.stub()) |name| root.addObjectFile(b.graph.cwdRelativePath(
+            b.pathJoin(&.{ found.crt_dir, name }),
+        ));
 
         const run = addInspection(
             b,
@@ -2043,11 +2045,12 @@ fn addInspectCheck(
             defective,
         );
 
-        if (defect.rule()) |rule| {
-            run.expectExitCode(1);
+        const rules = defect.rules();
+
+        run.expectExitCode(@intFromBool(rules.len != 0));
+
+        for (rules) |rule| {
             run.expectStdErrMatch(b.fmt("inspect: {t}: ", .{rule}));
-        } else {
-            run.expectExitCode(0);
         }
 
         step.dependOn(&run.step);
