@@ -20,12 +20,16 @@ ceilings: Ceilings = .{},
 usage: Usage = .{},
 /// The part of `usage.reserved` in reservations of the metadata kind.
 reserved_metadata: u64 = 0,
+/// The part of `usage.reserved` in reservations of the output kind.
+reserved_output: u64 = 0,
 
 /// The bounds of single kinds within the budget. A ledger without an
 /// engine, such as a codec test's, has none.
 pub const Ceilings = struct {
     /// The bound of the live and the reserved metadata bytes together.
     metadata: u64 = std.math.maxInt(u64),
+    /// The bound of the live and the reserved output bytes together.
+    output: u64 = std.math.maxInt(u64),
 };
 
 /// An aggregate budget in bytes that admits at least one byte.
@@ -105,15 +109,13 @@ pub fn reserve(
 ) error{BudgetExceeded}!Reservation {
     if (bytes > ledger.available()) return error.BudgetExceeded;
 
-    if (kind == .metadata) {
-        const held = ledger.usage.metadata + ledger.reserved_metadata;
+    if (ledger.boundOf(kind)) |bound| {
+        const held = bound.live + bound.reserved.*;
 
         // The sum stays within the ceiling, so the difference holds.
-        if (bytes > ledger.ceilings.metadata - held) {
-            return error.BudgetExceeded;
-        }
+        if (bytes > bound.ceiling - held) return error.BudgetExceeded;
 
-        ledger.reserved_metadata += bytes;
+        bound.reserved.* += bytes;
     }
 
     const usage = &ledger.usage;
@@ -137,7 +139,7 @@ pub fn convert(ledger: *Ledger, reservation: *Reservation, bytes: u64) void {
     ledger.usage.peak = @max(ledger.usage.peak, ledger.usage.live);
 
     if (ledger.countOf(reservation.kind)) |count| count.* += bytes;
-    if (reservation.kind == .metadata) ledger.reserved_metadata -= bytes;
+    if (ledger.boundOf(reservation.kind)) |bound| bound.reserved.* -= bytes;
 }
 
 /// Returns what remains of `reservation` to the budget. Cancelling a
@@ -145,8 +147,8 @@ pub fn convert(ledger: *Ledger, reservation: *Reservation, bytes: u64) void {
 pub fn cancel(ledger: *Ledger, reservation: *Reservation) void {
     ledger.usage.reserved -= reservation.bytes;
 
-    if (reservation.kind == .metadata) {
-        ledger.reserved_metadata -= reservation.bytes;
+    if (ledger.boundOf(reservation.kind)) |bound| {
+        bound.reserved.* -= reservation.bytes;
     }
 
     reservation.bytes = 0;
@@ -173,6 +175,32 @@ fn countOf(ledger: *Ledger, kind: Kind) ?*u64 {
         .metadata => &ledger.usage.metadata,
         .output => &ledger.usage.output,
         .codec => null,
+    };
+}
+
+/// A kind that has a ceiling: the ceiling, the live bytes of the kind,
+/// and the count of its reserved bytes.
+const Bound = struct {
+    ceiling: u64,
+    live: u64,
+    reserved: *u64,
+};
+
+/// Returns the bound of `kind`, or null for a kind that only the budget
+/// bounds.
+fn boundOf(ledger: *Ledger, kind: Kind) ?Bound {
+    return switch (kind) {
+        .metadata => .{
+            .ceiling = ledger.ceilings.metadata,
+            .live = ledger.usage.metadata,
+            .reserved = &ledger.reserved_metadata,
+        },
+        .output => .{
+            .ceiling = ledger.ceilings.output,
+            .live = ledger.usage.output,
+            .reserved = &ledger.reserved_output,
+        },
+        .input, .codec => null,
     };
 }
 
@@ -408,16 +436,59 @@ test "the metadata ceiling bounds live and reserved metadata together" {
     try testing.expect(ledger.settled());
 }
 
-test "a ledger without ceilings admits metadata up to its budget" {
+test "the output ceiling bounds live and reserved output together" {
     var ledger: Ledger = .init(try .init(1000));
 
-    var whole = try ledger.reserve(.metadata, 1000);
+    ledger.ceilings = .{ .output = 100 };
 
-    try testing.expectError(error.BudgetExceeded, ledger.reserve(.metadata, 1));
-    ledger.convert(&whole, 1000);
-    try testing.expectEqual(0, ledger.reserved_metadata);
-    ledger.release(.metadata, 1000);
+    var first = try ledger.reserve(.output, 60);
+
+    ledger.convert(&first, 40);
+
+    // 40 live and 20 reserved leave 40 under the ceiling.
+    const before = ledger.usage;
+
+    try testing.expectError(error.BudgetExceeded, ledger.reserve(.output, 41));
+    try testing.expectEqual(before, ledger.usage);
+    try testing.expectEqual(20, ledger.reserved_output);
+
+    var second = try ledger.reserve(.output, 40);
+
+    try testing.expectError(error.BudgetExceeded, ledger.reserve(.output, 1));
+
+    // The ceiling of one kind leaves the other kinds to the budget.
+    var metadata = try ledger.reserve(.metadata, 400);
+
+    try testing.expectEqual(60, ledger.reserved_output);
+    try testing.expectEqual(400, ledger.reserved_metadata);
+    ledger.cancel(&metadata);
+
+    // A cancellation and a release each return their room.
+    ledger.cancel(&second);
+    ledger.cancel(&first);
+    ledger.release(.output, 40);
+
+    var whole = try ledger.reserve(.output, 100);
+
+    try testing.expectError(error.BudgetExceeded, ledger.reserve(.output, 1));
+    ledger.cancel(&whole);
+    try testing.expectEqual(0, ledger.reserved_output);
     try testing.expect(ledger.settled());
+}
+
+test "a ledger without ceilings admits each kind up to its budget" {
+    inline for (.{ Kind.metadata, Kind.output }) |kind| {
+        var ledger: Ledger = .init(try .init(1000));
+
+        var whole = try ledger.reserve(kind, 1000);
+
+        try testing.expectError(error.BudgetExceeded, ledger.reserve(kind, 1));
+        ledger.convert(&whole, 1000);
+        try testing.expectEqual(0, ledger.reserved_metadata);
+        try testing.expectEqual(0, ledger.reserved_output);
+        ledger.release(kind, 1000);
+        try testing.expect(ledger.settled());
+    }
 }
 
 test "each kind counts its own live bytes, and codec bytes are the rest" {

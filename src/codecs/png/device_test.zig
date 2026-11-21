@@ -36,7 +36,7 @@ fn run(request: Request) Result {
 
     var heap: Heap = .init(backing.backing(), .{ .bytes = request.budget });
 
-    var cancel: std.atomic.Value(bool) = .init(false);
+    var cancel: std.atomic.Value(u64) = .init(0);
 
     var sink: Sink = .{
         .heap = &heap,
@@ -48,7 +48,9 @@ fn run(request: Request) Result {
     var decoder: Decoder = undefined;
 
     const outcome = decode: {
-        decoder.init(&heap, sink.sink(), &cancel) catch |err| break :decode err;
+        const flag: Decoder.Cancel = .{ .word = &cancel, .mask = cancel_bit };
+
+        decoder.init(&heap, sink.sink(), flag) catch |err| break :decode err;
 
         break :decode cases.feed(&decoder, request.bytes[0..request.len], plan);
     };
@@ -147,13 +149,16 @@ const Counting = struct {
     }
 };
 
+/// The bit of the word of a run that cancels its decode.
+const cancel_bit: u64 = 1;
+
 /// The receiver of the decoded image. It hashes the samples, checks at
 /// every callback that the ledger counts exactly what the backing holds,
 /// and sets the cancellation flag after the row `cancel_row`.
 const Sink = struct {
     heap: *const Heap,
     backing: *const Counting,
-    cancel: *std.atomic.Value(bool),
+    cancel: *std.atomic.Value(u64),
     cancel_row: u32,
     checksum: std.hash.Crc32 = .init(),
     headers: u32 = 0,
@@ -196,6 +201,8 @@ const Sink = struct {
         receiver.check();
         receiver.checksum.update(bytes);
 
-        if (index == receiver.cancel_row) receiver.cancel.store(true, .release);
+        if (index == receiver.cancel_row) {
+            receiver.cancel.store(cancel_bit, .release);
+        }
     }
 };

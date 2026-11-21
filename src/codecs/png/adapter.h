@@ -46,8 +46,14 @@ typedef struct san_png_header {
   uint8_t  bit_depth;
   uint8_t  color_type;
   /* Zero for a noninterlaced image, one for Adam7. */
-  uint8_t  interlace;
-  uint8_t  channels;
+  uint8_t interlace;
+  uint8_t channels;
+  /*
+   * One when a tRNS chunk gives the image transparency that its rows do
+   * not carry. The chunk precedes the image data, so the value is final
+   * at the header hook, and a query before that may still read zero.
+   */
+  uint8_t  transparency;
   uint64_t row_bytes;
 } san_png_header;
 

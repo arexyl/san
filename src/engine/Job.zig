@@ -22,10 +22,19 @@
 //! other exchange that expects the live word, so exactly one of the two
 //! takes a live job, and a job has one terminal outcome. The other
 //! fields of a slot are plain data of the serializing thread.
+//!
+//! A step hands the staged bytes of the job's content to the job's
+//! codec, which writes the rows that they yield into the job's lease. A
+//! step that does not end as canceled then publishes those rows: it
+//! extends the coverage of the lease, so a canceled step publishes
+//! nothing new, also when it wrote rows.
 
 const std = @import("std");
+const Codec = @import("Codec.zig");
 const Content = @import("Content.zig");
+const Decode = @import("Decode.zig");
 const Engine = @import("Engine.zig");
+const Lease = @import("Lease.zig");
 const handles = @import("handles.zig");
 
 const Job = @This();
@@ -35,6 +44,14 @@ word: std.atomic.Value(u64) = .init(0),
 content: ?*Content = null,
 /// The output request of the job of a taken slot.
 requested: Request = .{},
+/// The lease of a live job, which the request takes. The end of the job
+/// ends the job's claim on it and removes the link.
+lease: ?*Lease = null,
+/// The decode of a live job, from its first step until its end. It
+/// stays in place, because its codec holds its address.
+decode: ?Decode = null,
+/// The count of the steps that extended the coverage of the lease.
+revision: u64 = 0,
 
 const Word = packed struct(u64) {
     /// The generation of the issuance, which the handle repeats. Zero is
@@ -65,9 +82,71 @@ pub const Request = struct {
     };
 };
 
-/// The terminal outcome of a job. No decode exists, so a job ends as
-/// canceled or as an engine failure.
-pub const Outcome = enum { canceled, engine_failure };
+/// The terminal outcome of a job.
+pub const Outcome = enum {
+    completed,
+    canceled,
+    unsupported_format,
+    unsupported_operation,
+    invalid_content,
+    truncated_content,
+    budget_exceeded,
+    allocation_failed,
+    engine_failure,
+
+    fn of(failure: Codec.Error) Outcome {
+        return switch (failure) {
+            error.Canceled => .canceled,
+            error.UnsupportedFormat => .unsupported_format,
+            error.UnsupportedOperation => .unsupported_operation,
+            error.InvalidContent => .invalid_content,
+            error.TruncatedContent => .truncated_content,
+            error.BudgetExceeded => .budget_exceeded,
+            error.AllocationFailed => .allocation_failed,
+            error.EngineFailure => .engine_failure,
+        };
+    }
+};
+
+/// What a step reports of its job.
+pub const Report = struct {
+    /// The lease, from the job's first publication on, also after the
+    /// caller released it.
+    lease: ?Lease.Handle = null,
+    /// The count of the publications so far.
+    revision: u64 = 0,
+    /// The rows [0, covered_rows) of the lease that the publications
+    /// cover.
+    covered_rows: u32 = 0,
+    /// The image and its output grid, once the admission step passed
+    /// the image limits.
+    admission: ?Decode.Admission = null,
+    /// The lease as the admission step admitted it.
+    admitted: ?Admitted = null,
+    /// The image rows that the codec delivered so far.
+    decoded_rows: u32 = 0,
+
+    /// The geometry and the kind of an admitted lease. This build
+    /// decodes the whole image without alpha, row by row, so the lease
+    /// starts at the origin of the output grid, has no alpha, and
+    /// publishes before the terminal outcome.
+    pub const Admitted = struct {
+        width: u32,
+        height: u32,
+        left: u32 = 0,
+        top: u32 = 0,
+        alpha: bool = false,
+        early_publication: bool = true,
+    };
+};
+
+/// The result of a step.
+pub const Step = struct {
+    /// The terminal outcome of the job, or null while the job waits for
+    /// more input.
+    outcome: ?Outcome,
+    report: Report,
+};
 
 /// A job handle: the opaque 64-bit value that the ABI carries.
 pub const Handle = enum(u64) {
@@ -87,6 +166,7 @@ pub const Handle = enum(u64) {
 /// The slot that a handle names and the generation that the handle
 /// expects there. The slot may hold another job, or none.
 const Named = struct {
+    engine: *Engine,
     job: *Job,
     generation: handles.Generation,
     /// Whether a shutdown of the engine has begun.
@@ -113,6 +193,7 @@ fn named(slot: *const Engine.Slot, value: Handle) error{InvalidHandle}!Named {
     if (bits.index >= jobs.len) return error.InvalidHandle;
 
     return .{
+        .engine = held.engine,
         .job = &jobs[bits.index],
         .generation = bits.generation,
         .closing = held.closing,
@@ -122,6 +203,7 @@ fn named(slot: *const Engine.Slot, value: Handle) error{InvalidHandle}!Named {
 /// A job of a live engine before its terminal outcome. Only `resolve`
 /// makes one, so a function that takes one validates nothing again.
 pub const Live = struct {
+    engine: *Engine,
     job: *Job,
 };
 
@@ -139,7 +221,7 @@ pub fn resolve(
     if (word.generation != found.generation) return error.InvalidHandle;
     if (found.closing or word.terminal) return error.Closed;
 
-    return .{ .job = found.job };
+    return .{ .engine = found.engine, .job = found.job };
 }
 
 /// An owned job of a live or closing engine, before or after its
@@ -170,15 +252,17 @@ pub const RequestError = error{
     /// The fields of the request alone name a region that the build
     /// does not support.
     UnsupportedOperation,
-    /// Every slot holds an owned job, or the count limit of leases is
-    /// reached.
+    /// Every slot holds an owned job, or the count limit of live leases
+    /// is reached.
     BudgetExceeded,
-    /// The serial of the process has retired.
+    /// The serial of the process retires before it issues both the job
+    /// and its lease.
     EngineFailure,
 };
 
 /// Admits the one job of `live` under `wanted` and returns its handle.
-/// A failure keeps nothing, and the call allocates nothing.
+/// The job takes its lease, which has no pixels yet. A failure keeps
+/// nothing, and the call allocates nothing.
 pub fn request(live: Content.Live, wanted: Request) RequestError!Handle {
     const engine = live.engine;
     const open_state = &live.content.state.open;
@@ -197,33 +281,133 @@ pub fn request(live: Content.Live, wanted: Request) RequestError!Handle {
         if (job.load(.monotonic).generation == 0) break at;
     } else return error.BudgetExceeded;
 
-    if (countLeased(engine) >= engine.output_lease_count) {
-        return error.BudgetExceeded;
-    }
+    const lease = Lease.vacant(engine) orelse return error.BudgetExceeded;
 
-    if (engine.serial.retired()) return error.EngineFailure;
+    if (!engine.serial.admits(2)) return error.EngineFailure;
 
     const generation = engine.serial.take();
+
+    lease.issue(engine.serial.take());
 
     const job = &engine.jobs[index];
 
     job.content = live.content;
     job.requested = wanted;
+    job.lease = lease;
+    job.revision = 0;
     open_state.job = .{ .live = job };
     job.store(.{ .generation = generation }, .release);
 
     return .pack(@intCast(index), generation);
 }
 
-/// Advances `live` and returns its terminal outcome. The step observes
-/// the cancellation flag when it starts. No decode exists, so a step
-/// that is not canceled ends the job as an engine failure.
-pub fn step(live: Live) Outcome {
+/// Advances `live` by the bytes that its content holds. The step
+/// observes the cancellation flag when it starts, before it consumes a
+/// byte, and its codec observes the flag at its own observation points.
+pub fn step(live: Live) Step {
     const job = live.job;
+    const engine = live.engine;
 
-    if (job.load(.acquire).canceled) return job.settle(.canceled);
+    if (job.load(.acquire).canceled) return job.conclude(engine, .canceled);
 
-    return job.settle(.engine_failure);
+    const complete = job.advance(engine) catch |failure|
+        return job.conclude(engine, .of(failure));
+
+    if (complete) return job.conclude(engine, .completed);
+
+    job.publish();
+
+    return .{ .outcome = null, .report = job.describe(engine) };
+}
+
+/// Hands the bytes that the content of the live job holds to the job's
+/// decode, and ends the decode once the input has ended. Returns whether
+/// the image is complete. No byte past the length ceiling of a
+/// representation reaches the codec: the step that would consume one
+/// fails as BudgetExceeded after the bytes before it.
+fn advance(job: *Job, engine: *Engine) Codec.Error!bool {
+    if (job.decode == null) {
+        job.decode = Decode.init(engine, job.lease.?, job.requested);
+        errdefer job.decode = null;
+
+        try job.decode.?.open(job.cancelFlag());
+    }
+
+    const decode = &job.decode.?;
+    const input = &job.content.?.state.open;
+
+    const staged = input.staging[input.consumed..input.staged];
+
+    // The position of the first staged byte in the representation.
+    const position = input.received - staged.len;
+
+    const within: usize = @intCast(
+        @min(staged.len, engine.content_length_bytes -| position),
+    );
+
+    if (within != 0) {
+        input.consumed += within;
+
+        try decode.feed(staged[0..within]);
+    }
+
+    if (within != staged.len) return error.BudgetExceeded;
+    if (!input.ended) return false;
+
+    try decode.finish();
+
+    // A completed job covers every row of its lease. A codec that ends
+    // its image short of that broke its promise, and the job fails.
+    if (!decode.admitted or decode.rows != job.lease.?.height) {
+        return error.EngineFailure;
+    }
+
+    return true;
+}
+
+/// Extends the coverage of the lease to the rows that the decode wrote.
+/// The first publication starts the caller's claim on the lease.
+fn publish(job: *Job) void {
+    const rows = (job.decode orelse return).rows;
+    const lease = job.lease.?;
+
+    if (rows == lease.covered) return;
+
+    if (job.revision == 0) lease.claims.caller = true;
+
+    lease.covered = rows;
+    job.revision += 1;
+}
+
+/// Returns the report of the live job.
+fn describe(job: *const Job, engine: *const Engine) Report {
+    const lease = job.lease.?;
+
+    var report: Report = .{
+        .revision = job.revision,
+        .covered_rows = lease.covered,
+    };
+
+    if (job.revision != 0) report.lease = lease.handle(engine);
+
+    if (job.decode) |decode| {
+        report.admission = decode.admission;
+        report.decoded_rows = decode.rows;
+
+        if (decode.admitted) {
+            report.admitted = .{ .width = lease.width, .height = lease.height };
+        }
+    }
+
+    return report;
+}
+
+/// Returns the cancellation flag of the job for its codec: the canceled
+/// bit of the job's word.
+fn cancelFlag(job: *const Job) Codec.Cancel {
+    const flag: Word = .{ .canceled = true };
+
+    return .{ .word = &job.word, .mask = @bitCast(flag) };
 }
 
 /// Requests the cancellation of the job of `value`, from any thread,
@@ -264,10 +448,10 @@ pub fn release(owned: Owned) error{BindingMismatch}!void {
     owned.job.store(.{}, .release);
 }
 
-/// Ends a live job as canceled, as the close of its content and the
-/// shutdown of its engine do. The job stays owned.
-pub fn end(job: *Job) void {
-    _ = job.settle(.canceled);
+/// Ends a live job of `engine` as canceled, as the close of its content
+/// and the shutdown of its engine do. The job stays owned.
+pub fn end(job: *Job, engine: *Engine) void {
+    _ = job.conclude(engine, .canceled);
 }
 
 /// Ends every live job of `engine` as canceled, while the contents of
@@ -276,7 +460,7 @@ pub fn endAll(engine: *Engine) void {
     for (engine.jobs) |*job| {
         const word = job.load(.monotonic);
 
-        if (word.generation != 0 and !word.terminal) job.end();
+        if (word.generation != 0 and !word.terminal) job.end(engine);
     }
 }
 
@@ -292,26 +476,35 @@ pub fn countOwned(engine: *const Engine) u64 {
     return count;
 }
 
-/// Returns the count of the live leases of `engine`. A lease lives from
-/// the request of its job until San reclaims it. No job publishes, so
-/// San reclaims a lease at the terminal outcome of its job, and the jobs
-/// before their terminal outcome hold the live leases.
-pub fn countLeased(engine: *const Engine) u64 {
-    var count: u64 = 0;
+/// Ends the live job of `engine` with `outcome`, or as canceled when a
+/// cancellation came first, and returns the outcome that the job keeps
+/// with its last report. An end that is not a cancellation publishes
+/// the rows that the decode wrote. The end releases the codec, removes
+/// the link between the job and its content, and ends the job's claim
+/// on its lease, so the job is quiescent when it returns.
+fn conclude(job: *Job, engine: *Engine, outcome: Outcome) Step {
+    const accepted = job.settle(outcome);
 
-    for (engine.jobs) |*job| {
-        const word = job.load(.monotonic);
+    if (accepted != .canceled) job.publish();
 
-        count += @intFromBool(word.generation != 0 and !word.terminal);
-    }
+    // The report names the lease while the job still links it.
+    const report = job.describe(engine);
 
-    return count;
+    if (job.decode) |*decode| decode.close();
+
+    job.decode = null;
+    job.content.?.state.open.job = .ended;
+    job.content = null;
+
+    job.lease.?.endJobClaim(engine);
+    job.lease = null;
+
+    return .{ .outcome = accepted, .report = report };
 }
 
-/// Ends the live job with `outcome`, or as canceled when a cancellation
-/// came first, and returns the outcome that the job keeps. It is the
-/// only writer of the terminal mark, and it removes the link between the
-/// job and its content.
+/// Sets the terminal mark of the live job for `outcome`, or for a
+/// cancellation that came first, and returns the outcome that the job
+/// keeps. It is the only writer of the terminal mark.
 fn settle(job: *Job, outcome: Outcome) Outcome {
     const generation = job.load(.monotonic).generation;
 
@@ -324,10 +517,10 @@ fn settle(job: *Job, outcome: Outcome) Outcome {
         .terminal = true,
     };
 
-    const ended: Word = switch (outcome) {
-        .canceled => canceled,
-        .engine_failure => .{ .generation = generation, .terminal = true },
-    };
+    const ended: Word = if (outcome == .canceled)
+        canceled
+    else
+        .{ .generation = generation, .terminal = true };
 
     var accepted = outcome;
 
@@ -346,9 +539,6 @@ fn settle(job: *Job, outcome: Outcome) Outcome {
         job.store(canceled, .release);
         accepted = .canceled;
     }
-
-    job.content.?.state.open.job = .ended;
-    job.content = null;
 
     return accepted;
 }
@@ -371,9 +561,9 @@ const TestBacking = Engine.Heap.TestBacking;
 /// The staging of each content of the tests below, in bytes.
 const portion_bytes = 64;
 
-/// The blocks of an engine's own state: the engine, the slots of its
-/// contents, and the slots of its jobs.
-const own_blocks = 3;
+/// The blocks of an engine's own state: the engine and the slots of its
+/// contents, of its jobs, and of its leases.
+const own_blocks = 4;
 
 /// An engine in a test, with the process that holds it. The engine
 /// names the slot and the backing by address, so a rig starts in place.
@@ -381,6 +571,8 @@ const Rig = struct {
     binding: Engine.Binding = .{},
     slot: Engine.Slot = .{},
     backing: TestBacking,
+    /// What the scripted codecs of the engine call inside a step.
+    hooks: Codec.Scripted.Hooks = .{},
     handle: Engine.Handle = undefined,
     engine: *Engine = undefined,
 
@@ -390,15 +582,8 @@ const Rig = struct {
         leases: i64 = 2,
     };
 
-    fn start(rig: *Rig, counts: Counts) !void {
-        rig.* = .{ .backing = .init(testing.allocator) };
-        rig.binding.establish();
-
-        try rig.create(counts);
-    }
-
-    /// Creates the engine of the rig, whose slot is free.
-    fn create(rig: *Rig, counts: Counts) !void {
+    /// Returns limits of `counts` slots, with every other limit roomy.
+    fn limitsOf(counts: Counts) Engine.Limits {
         var limits: Engine.Limits = undefined;
 
         inline for (Engine.Limits.names) |name| @field(limits, name) = 1 << 20;
@@ -408,10 +593,31 @@ const Rig = struct {
         limits.output_lease_count = counts.leases;
         limits.input_portion_bytes = portion_bytes;
 
+        return limits;
+    }
+
+    fn start(rig: *Rig, counts: Counts) !void {
+        try rig.startUnder(limitsOf(counts));
+    }
+
+    fn startUnder(rig: *Rig, limits: Engine.Limits) !void {
+        rig.* = .{ .backing = .init(testing.allocator) };
+        rig.binding.establish();
+
+        try rig.createUnder(limits);
+    }
+
+    /// Creates the engine of the rig, whose slot is free.
+    fn create(rig: *Rig, counts: Counts) !void {
+        try rig.createUnder(limitsOf(counts));
+    }
+
+    fn createUnder(rig: *Rig, limits: Engine.Limits) !void {
         rig.handle = try Engine.create(
             &rig.binding,
             &rig.slot,
             rig.backing.backing(),
+            Codec.Scripted.openerWith(&rig.hooks),
             limits,
         );
 
@@ -436,8 +642,73 @@ const Rig = struct {
         return rig.admit(try rig.open(), .{});
     }
 
-    fn advance(rig: *Rig, handle: Handle) !Outcome {
+    /// Supplies `bytes` as the next portion of the content of the live
+    /// job of `handle`, with or without the end of the input.
+    fn supply(
+        rig: *Rig,
+        handle: Handle,
+        bytes: []const u8,
+        end_of_input: bool,
+    ) !void {
+        const content = rig.slotOf(handle).content.?;
+
+        const target = try Content.feedable(.{
+            .engine = rig.engine,
+            .content = content,
+        });
+
+        try Content.feed(target, .{
+            .position = content.state.open.received,
+            .bytes = bytes,
+            .end = end_of_input,
+        });
+    }
+
+    /// Steps the job of `handle` and returns the whole result.
+    fn take(rig: *Rig, handle: Handle) !Step {
         return step(try resolve(&rig.slot, handle));
+    }
+
+    /// Steps the job of `handle` and returns its terminal outcome, or
+    /// null while the job waits for input.
+    fn advance(rig: *Rig, handle: Handle) !?Outcome {
+        return (try rig.take(handle)).outcome;
+    }
+
+    /// Ends the live job of `handle`, whose content took no input, with
+    /// an outcome that is no cancellation: its input ends before any
+    /// image.
+    fn fail(rig: *Rig, handle: Handle) !void {
+        try rig.supply(handle, &.{}, true);
+        try testing.expectEqual(.truncated_content, try rig.advance(handle));
+    }
+
+    /// Supplies `script` to the job of `handle` in one portion, then
+    /// steps the job.
+    fn run(
+        rig: *Rig,
+        handle: Handle,
+        script: []const u8,
+        end_of_input: bool,
+    ) !Step {
+        try rig.supply(handle, script, end_of_input);
+
+        return rig.take(handle);
+    }
+
+    /// Returns the lease of `value`, which the caller holds.
+    fn leaseOf(rig: *Rig, value: Lease.Handle) !*Lease {
+        return (try Lease.resolve(&rig.slot, value)).lease;
+    }
+
+    /// Releases the caller's claim on the lease of `value`.
+    fn releaseLease(rig: *Rig, value: Lease.Handle) !void {
+        Lease.release(try Lease.resolve(&rig.slot, value));
+    }
+
+    /// Checks that the ledger counts exactly what the backing holds.
+    fn expectSettled(rig: *Rig) !void {
+        try Engine.Heap.expectMatches(&rig.engine.heap, &rig.backing);
     }
 
     fn drop(rig: *Rig, handle: Handle) !void {
@@ -510,6 +781,42 @@ fn canceledWord(generation: handles.Generation) Word {
 
 const tag_job = @backingInt(handles.Tag.job);
 
+const Scripted = Codec.Scripted;
+
+/// The commands of the scripted codec that have one byte.
+const row_command = [_]u8{@backingInt(Scripted.Command.row)};
+const end_command = [_]u8{@backingInt(Scripted.Command.end)};
+const invalid_command = [_]u8{@backingInt(Scripted.Command.invalid)};
+
+/// The script of a whole image of one pixel.
+const pixel_script = Scripted.imageCommand(1, 1) ++ row_command ++ end_command;
+
+/// The script of an image of 3 by 4 pixels up to its admission, and the
+/// bytes of its lease with their block header.
+const image_script = Scripted.imageCommand(3, 4);
+const image_lease_bytes = 3 * 4 * Lease.pixel_bytes + Engine.Heap.header_size;
+
+/// Checks that the rows [0, rows) of `lease` hold the samples of the
+/// scripted codec, each pixel with an alpha of 255.
+fn expectRows(lease: *Lease, rows: u32) !void {
+    for (0..rows) |index| {
+        const pixels = lease.row(@intCast(index));
+
+        for (0..lease.width) |column| {
+            const pixel = pixels[column * Lease.pixel_bytes ..];
+
+            for (0..3) |channel| {
+                try testing.expectEqual(
+                    Scripted.sample(@intCast(index), column * 3 + channel),
+                    pixel[channel],
+                );
+            }
+
+            try testing.expectEqual(0xff, pixel[3]);
+        }
+    }
+}
+
 test "a job word holds its generation in the low 40 bits" {
     const word: Word = .{
         .generation = 0xab_cdef_0123,
@@ -521,7 +828,7 @@ test "a job word holds its generation in the low 40 bits" {
     try testing.expectEqual(0, @as(u64, @bitCast(Word{})));
 }
 
-test "a step without a cancellation ends the job as an engine failure" {
+test "a job that fails keeps its slot until its release" {
     var rig: Rig = undefined;
 
     try rig.start(.{});
@@ -535,15 +842,15 @@ test "a step without a cancellation ends the job as an engine failure" {
     try testing.expectEqual(tag_job, @backingInt(unpack(handle).tag));
     try testing.expectEqual(liveWord(generation), rig.wordOf(handle));
     try testing.expectEqual(1, countOwned(rig.engine));
-    try testing.expectEqual(1, countLeased(rig.engine));
+    try testing.expectEqual(1, Lease.countLive(rig.engine));
 
     // A release before the terminal outcome changes nothing.
     try testing.expectError(error.BindingMismatch, rig.drop(handle));
     try testing.expectEqual(liveWord(generation), rig.wordOf(handle));
-    try testing.expectEqual(.engine_failure, try rig.advance(handle));
+    try rig.fail(handle);
     try testing.expectEqual(terminalWord(generation), rig.wordOf(handle));
     try testing.expectEqual(1, countOwned(rig.engine));
-    try testing.expectEqual(0, countLeased(rig.engine));
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
 
     // The end removed the link in both directions.
     const live = try Content.resolve(&rig.slot, content);
@@ -577,13 +884,13 @@ test "a step that observes the flag ends the job as canceled" {
 
     // A flagged job is not terminal: it holds its lease and refuses a
     // release, and a second cancellation changes nothing.
-    try testing.expectEqual(1, countLeased(rig.engine));
+    try testing.expectEqual(1, Lease.countLive(rig.engine));
     try testing.expectError(error.BindingMismatch, rig.drop(handle));
     try cancel(&rig.slot, handle);
     try testing.expectEqual(flaggedWord(generation), rig.wordOf(handle));
     try testing.expectEqual(.canceled, try rig.advance(handle));
     try testing.expectEqual(canceledWord(generation), rig.wordOf(handle));
-    try testing.expectEqual(0, countLeased(rig.engine));
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
     try testing.expectError(error.Closed, rig.advance(handle));
     try cancel(&rig.slot, handle);
     try testing.expectEqual(canceledWord(generation), rig.wordOf(handle));
@@ -634,7 +941,7 @@ test "an invalid handle fails every job call and changes no word" {
     try testing.expectEqual(liveWord(bits.generation), rig.wordOf(handle));
     try testing.expectEqual(Word{}, rig.engine.jobs[1].load(.monotonic));
     try testing.expectEqual(1, countOwned(rig.engine));
-    try testing.expectEqual(.engine_failure, try rig.advance(handle));
+    try rig.fail(handle);
     try rig.drop(handle);
     try rig.finish();
 }
@@ -683,7 +990,7 @@ test "a request checks its content, its region, and the limits in order" {
 
     // A terminal job still holds its slot, and its content admits no
     // second job.
-    try testing.expectEqual(.engine_failure, try rig.advance(handle));
+    try rig.fail(handle);
     try testing.expectError(error.BudgetExceeded, rig.admit(second, .{}));
     try testing.expectError(error.BindingMismatch, rig.admit(first, .{}));
 
@@ -709,7 +1016,7 @@ test "a request checks its content, its region, and the limits in order" {
     try testing.expectEqual(untouched.content, rig.slotOf(later).content.?);
     try rig.expectInvalid(handle);
     try testing.expectEqual(liveWord(next), rig.wordOf(later));
-    try testing.expectEqual(.engine_failure, try rig.advance(later));
+    try rig.fail(later);
     try rig.drop(later);
     try rig.finish();
 }
@@ -728,14 +1035,14 @@ test "the count limit of leases refuses a request until a job ends" {
     try testing.expectEqual(1, countOwned(rig.engine));
 
     // Without a publication, the terminal outcome reclaims the lease.
-    try testing.expectEqual(.engine_failure, try rig.advance(first_job));
+    try rig.fail(first_job);
 
     const second_job = try rig.admit(second, .{});
 
     try testing.expectEqual(1, unpack(second_job).index);
     try testing.expectEqual(2, countOwned(rig.engine));
-    try testing.expectEqual(1, countLeased(rig.engine));
-    try testing.expectEqual(.engine_failure, try rig.advance(second_job));
+    try testing.expectEqual(1, Lease.countLive(rig.engine));
+    try rig.fail(second_job);
     try rig.drop(first_job);
     try rig.drop(second_job);
     try rig.finish();
@@ -778,7 +1085,7 @@ test "the close of a content ends its live job as canceled" {
     try testing.expectEqual(canceledWord(generation), rig.wordOf(handle));
     try testing.expectEqual(null, rig.slotOf(handle).content);
     try testing.expectEqual(1, countOwned(rig.engine));
-    try testing.expectEqual(0, countLeased(rig.engine));
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
     try testing.expectEqual(own_blocks, rig.backing.blocks);
 
     try testing.expectError(
@@ -804,7 +1111,7 @@ test "the close of a content leaves its terminal job as it ended" {
 
     const generation = unpack(handle).generation;
 
-    try testing.expectEqual(.engine_failure, try rig.advance(handle));
+    try rig.fail(handle);
     try rig.closeContent(content);
     try testing.expectEqual(terminalWord(generation), rig.wordOf(handle));
     try testing.expectEqual(1, countOwned(rig.engine));
@@ -815,7 +1122,7 @@ test "the close of a content leaves its terminal job as it ended" {
 
     try testing.expectEqual(1, unpack(later).index);
     try testing.expectEqual(terminalWord(generation), rig.wordOf(handle));
-    try testing.expectEqual(.engine_failure, try rig.advance(later));
+    try rig.fail(later);
     try rig.drop(later);
     try rig.drop(handle);
     try rig.finish();
@@ -845,7 +1152,7 @@ test "a close and a shutdown end a job whose flag no step observed" {
         rig.wordOf(shut),
     );
 
-    try testing.expectEqual(1, countLeased(rig.engine));
+    try testing.expectEqual(1, Lease.countLive(rig.engine));
 
     try testing.expectEqual(
         .pending,
@@ -857,7 +1164,7 @@ test "a close and a shutdown end a job whose flag no step observed" {
         rig.wordOf(shut),
     );
 
-    try testing.expectEqual(0, countLeased(rig.engine));
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
     try rig.drop(closed);
     try rig.drop(shut);
     try rig.finish();
@@ -876,7 +1183,7 @@ test "a shutdown stays pending until every job is released" {
     const live_generation = unpack(live_job).generation;
     const ended_generation = unpack(ended_job).generation;
 
-    try testing.expectEqual(.engine_failure, try rig.advance(ended_job));
+    try rig.fail(ended_job);
 
     const issued = rig.engine.serial.next;
 
@@ -900,7 +1207,7 @@ test "a shutdown stays pending until every job is released" {
         try testing.expectEqual(own_blocks, rig.backing.blocks);
         try testing.expectEqual(0, rig.engine.heap.ledger.usage.input);
         try testing.expectEqual(2, countOwned(rig.engine));
-        try testing.expectEqual(0, countLeased(rig.engine));
+        try testing.expectEqual(0, Lease.countLive(rig.engine));
 
         // A closing engine admits nothing and steps nothing.
         try testing.expectError(
@@ -957,7 +1264,7 @@ test "a job handle of a finished engine fails under a later engine" {
 
     const earlier = try rig.admitNew();
 
-    try testing.expectEqual(.engine_failure, try rig.advance(earlier));
+    try rig.fail(earlier);
     try rig.drop(earlier);
     try rig.finish();
     try rig.expectInvalid(earlier);
@@ -975,7 +1282,7 @@ test "a job handle of a finished engine fails under a later engine" {
         rig.wordOf(later),
     );
 
-    try testing.expectEqual(.engine_failure, try rig.advance(later));
+    try rig.fail(later);
     try rig.drop(later);
     try rig.finish();
 }
@@ -993,7 +1300,11 @@ test "a cancellation after the step's observation takes the outcome" {
     // step accepted its outcome.
     try testing.expect(!job.load(.acquire).canceled);
     try cancel(&rig.slot, handle);
-    try testing.expectEqual(.canceled, job.settle(.engine_failure));
+
+    try testing.expectEqual(
+        .canceled,
+        job.conclude(rig.engine, .engine_failure).outcome,
+    );
 
     try testing.expectEqual(
         canceledWord(unpack(handle).generation),
@@ -1014,7 +1325,11 @@ test "a cancellation after the step's acceptance changes nothing" {
     const job = rig.slotOf(handle);
 
     try testing.expect(!job.load(.acquire).canceled);
-    try testing.expectEqual(.engine_failure, job.settle(.engine_failure));
+    try testing.expectEqual(
+        .engine_failure,
+        job.conclude(rig.engine, .engine_failure).outcome,
+    );
+
     try cancel(&rig.slot, handle);
 
     try testing.expectEqual(
@@ -1121,6 +1436,9 @@ test "a cancellation that races a step leaves one terminal outcome" {
 
         const handle = try rig.admit(content, .{});
 
+        // The step completes the image unless the cancellation wins.
+        try rig.supply(handle, &pixel_script, true);
+
         const live = try resolve(&rig.slot, handle);
 
         var cancelers: Cancelers = .{};
@@ -1129,7 +1447,7 @@ test "a cancellation that races a step leaves one terminal outcome" {
 
         cancelers.signal();
 
-        const outcome = step(live);
+        const taken = step(live);
 
         cancelers.finish();
 
@@ -1143,10 +1461,26 @@ test "a cancellation that races a step leaves one terminal outcome" {
         // The step's status and the word agree on the one outcome, and a
         // flag that the request saw set is never lost.
         try testing.expect(word.terminal);
-        try testing.expectEqual(outcome == .canceled, word.canceled);
 
         if (attempt.seen.canceled) try testing.expect(word.canceled);
 
+        switch (taken.outcome.?) {
+            .completed => {
+                try testing.expect(!word.canceled);
+                try testing.expectEqual(1, taken.report.covered_rows);
+                try rig.releaseLease(taken.report.lease.?);
+            },
+            // A canceled step publishes nothing, also when the codec
+            // wrote the row before it observed the flag.
+            .canceled => {
+                try testing.expect(word.canceled);
+                try testing.expectEqual(null, taken.report.lease);
+                try testing.expectEqual(0, taken.report.covered_rows);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+
+        try testing.expectEqual(0, Lease.countLive(rig.engine));
         try testing.expectError(error.Closed, rig.advance(handle));
         try rig.drop(handle);
         try rig.closeContent(content);
@@ -1219,4 +1553,941 @@ test "cancellations that race the first shutdown call find their job" {
         try rig.drop(handle);
         try rig.finish();
     }
+}
+
+/// The admission of the image of `image_script` at a scale of 1:1.
+const image_admission: Decode.Admission = .{
+    .image = .{ .width = 3, .height = 4, .layout = .rgb8 },
+    .output_width = 3,
+    .output_height = 4,
+};
+
+test "a step without input waits with an empty report" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const content = try rig.open();
+
+    const handle = try rig.admit(content, .{});
+
+    for (0..2) |_| {
+        const taken = try rig.take(handle);
+
+        try testing.expectEqual(null, taken.outcome);
+        try testing.expectEqual(Report{}, taken.report);
+    }
+
+    // The first step opened the codec, which keeps its state in the
+    // heap beside the staging of the content.
+    try testing.expectEqual(own_blocks + 2, rig.backing.blocks);
+    try testing.expectEqual(0, rig.engine.heap.ledger.usage.output);
+
+    try testing.expectEqual(
+        liveWord(unpack(handle).generation),
+        rig.wordOf(handle),
+    );
+
+    // The end of the job releases the codec.
+    try rig.closeContent(content);
+    try testing.expectEqual(own_blocks, rig.backing.blocks);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "the admission step reports the image, the grid, and the lease" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const admitted: Report = .{
+        .admission = image_admission,
+        .admitted = .{ .width = 3, .height = 4 },
+    };
+
+    const taken = try rig.run(handle, &image_script, false);
+
+    try testing.expectEqual(null, taken.outcome);
+    try testing.expectEqual(admitted, taken.report);
+
+    // The lease holds all of its pixels as output before any row, and
+    // no reservation outlives the step.
+    const usage = &rig.engine.heap.ledger.usage;
+
+    try testing.expectEqual(image_lease_bytes, usage.output);
+    try testing.expectEqual(0, usage.reserved);
+    try rig.expectSettled();
+
+    // Neither group changes after the admission step, and without a
+    // publication the end of the job reclaims the lease.
+    try cancel(&rig.slot, handle);
+
+    const ended = try rig.take(handle);
+
+    try testing.expectEqual(.canceled, ended.outcome);
+    try testing.expectEqual(admitted, ended.report);
+    try testing.expectEqual(0, usage.output);
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "each step that yields rows publishes one more revision" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    // The image arrives with its first row.
+    var taken = try rig.run(handle, &(image_script ++ row_command), false);
+
+    const named_lease = taken.report.lease.?;
+
+    try testing.expectEqual(null, taken.outcome);
+    try testing.expectEqual(1, taken.report.revision);
+    try testing.expectEqual(1, taken.report.covered_rows);
+    try testing.expectEqual(1, taken.report.decoded_rows);
+
+    const lease = try rig.leaseOf(named_lease);
+
+    try testing.expectEqual(handles.Tag.lease, unpack(
+        @fromBackingInt(@backingInt(named_lease)),
+    ).tag);
+
+    try expectRows(lease, 1);
+
+    // A step that yields no row publishes nothing.
+    taken = try rig.take(handle);
+
+    try testing.expectEqual(null, taken.outcome);
+    try testing.expectEqual(1, taken.report.revision);
+    try testing.expectEqual(1, taken.report.covered_rows);
+
+    // Two rows of one step are one publication of the same lease.
+    taken = try rig.run(handle, &(row_command ++ row_command), false);
+
+    try testing.expectEqual(named_lease, taken.report.lease);
+    try testing.expectEqual(2, taken.report.revision);
+    try testing.expectEqual(3, taken.report.covered_rows);
+    try expectRows(lease, 3);
+
+    // The image is complete, and the job waits for the end of its input.
+    taken = try rig.run(handle, &(row_command ++ end_command), false);
+
+    try testing.expectEqual(null, taken.outcome);
+    try testing.expectEqual(3, taken.report.revision);
+    try testing.expectEqual(4, taken.report.covered_rows);
+
+    // The end of the input completes the job without a publication.
+    taken = try rig.run(handle, &.{}, true);
+
+    try testing.expectEqual(.completed, taken.outcome);
+
+    try testing.expectEqual(Report{
+        .lease = named_lease,
+        .revision = 3,
+        .covered_rows = 4,
+        .admission = image_admission,
+        .admitted = .{ .width = 3, .height = 4 },
+        .decoded_rows = 4,
+    }, taken.report);
+
+    try testing.expectEqual(
+        terminalWord(unpack(handle).generation),
+        rig.wordOf(handle),
+    );
+
+    // The job's claim ended, and the caller's keeps the lease past the
+    // release of the job.
+    try rig.drop(handle);
+    try testing.expectEqual(1, Lease.countLive(rig.engine));
+    try testing.expectEqual(lease, try rig.leaseOf(named_lease));
+    try expectRows(lease, 4);
+
+    const usage = &rig.engine.heap.ledger.usage;
+
+    try testing.expectEqual(image_lease_bytes, usage.output);
+    try rig.releaseLease(named_lease);
+    try testing.expectError(error.InvalidHandle, rig.releaseLease(named_lease));
+    try testing.expectEqual(0, usage.output);
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
+    try rig.finish();
+}
+
+test "a job that completes in one step publishes with its outcome" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const taken = try rig.run(handle, &pixel_script, true);
+
+    try testing.expectEqual(.completed, taken.outcome);
+    try testing.expectEqual(1, taken.report.revision);
+    try testing.expectEqual(1, taken.report.covered_rows);
+    try expectRows(try rig.leaseOf(taken.report.lease.?), 1);
+    try rig.releaseLease(taken.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "an input that ends before its image keeps the published rows" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const early = try rig.run(handle, &(image_script ++ row_command), false);
+
+    const named_lease = early.report.lease.?;
+
+    const taken = try rig.run(handle, &.{}, true);
+
+    try testing.expectEqual(.truncated_content, taken.outcome);
+    try testing.expectEqual(early.report, taken.report);
+
+    const lease = try rig.leaseOf(named_lease);
+
+    try testing.expectEqual(1, lease.covered);
+    try expectRows(lease, 1);
+    try rig.releaseLease(named_lease);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a failure publishes the rows that the step yielded before it" {
+    const scripts = [_][]const u8{
+        // A command that the format refuses, and a byte after the image.
+        &(image_script ++ row_command ++ invalid_command),
+        &(pixel_script ++ row_command),
+    };
+
+    for (scripts) |script| {
+        var rig: Rig = undefined;
+
+        try rig.start(.{});
+
+        const handle = try rig.admitNew();
+
+        const taken = try rig.run(handle, script, false);
+
+        try testing.expectEqual(.invalid_content, taken.outcome);
+        try testing.expectEqual(1, taken.report.revision);
+        try testing.expectEqual(1, taken.report.covered_rows);
+        try expectRows(try rig.leaseOf(taken.report.lease.?), 1);
+        try rig.releaseLease(taken.report.lease.?);
+        try rig.drop(handle);
+        try rig.finish();
+    }
+}
+
+test "a byte after the image fails in a later step as well" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const whole = try rig.run(handle, &pixel_script, false);
+
+    try testing.expectEqual(null, whole.outcome);
+
+    const taken = try rig.run(handle, &row_command, false);
+
+    try testing.expectEqual(.invalid_content, taken.outcome);
+    try testing.expectEqual(whole.report, taken.report);
+    try rig.releaseLease(whole.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a step that starts canceled consumes no byte and publishes nothing" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const early = try rig.run(handle, &(image_script ++ row_command), false);
+
+    try rig.supply(handle, &(row_command ++ row_command), false);
+    try cancel(&rig.slot, handle);
+
+    const input = &rig.slotOf(handle).content.?.state.open;
+
+    const taken = try rig.take(handle);
+
+    try testing.expectEqual(.canceled, taken.outcome);
+    try testing.expectEqual(early.report, taken.report);
+    try testing.expectEqual(0, input.consumed);
+    try testing.expectEqual(2, input.staged);
+
+    // The caller's claim keeps the lease of the canceled job.
+    const lease = try rig.leaseOf(early.report.lease.?);
+
+    try testing.expectEqual(1, lease.covered);
+    try rig.releaseLease(early.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+/// A hook that requests the cancellation of a job from inside a step,
+/// after one row of its image.
+const CancelAfter = struct {
+    slot: *const Engine.Slot,
+    handle: Handle,
+    row: u32,
+
+    fn hooks(canceling: *CancelAfter) Scripted.Hooks {
+        return .{ .ctx = canceling, .after_row = afterRow };
+    }
+
+    fn afterRow(ctx: ?*anyopaque, index: u32) void {
+        const canceling: *CancelAfter = @ptrCast(@alignCast(ctx.?));
+
+        if (index != canceling.row) return;
+
+        cancel(canceling.slot, canceling.handle) catch
+            @panic("the hook cancels a job that its test owns");
+    }
+};
+
+test "a cancellation inside a step ends it within one row, unpublished" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    var canceling: CancelAfter = .{
+        .slot = &rig.slot,
+        .handle = handle,
+        .row = 1,
+    };
+
+    rig.hooks = canceling.hooks();
+
+    const rows = row_command ++ row_command ++ row_command;
+
+    const taken = try rig.run(handle, &(image_script ++ rows), false);
+
+    // The codec wrote two rows and stopped, and the step publishes
+    // neither, so no report named the lease, and its end reclaims it.
+    try testing.expectEqual(.canceled, taken.outcome);
+
+    try testing.expectEqual(Report{
+        .admission = image_admission,
+        .admitted = .{ .width = 3, .height = 4 },
+        .decoded_rows = 2,
+    }, taken.report);
+
+    try testing.expectEqual(
+        canceledWord(unpack(handle).generation),
+        rig.wordOf(handle),
+    );
+
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
+    try testing.expectEqual(0, rig.engine.heap.ledger.usage.output);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a cancellation inside a step repeats the last publication" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const early = try rig.run(handle, &(image_script ++ row_command), false);
+
+    const lease = try rig.leaseOf(early.report.lease.?);
+
+    var canceling: CancelAfter = .{
+        .slot = &rig.slot,
+        .handle = handle,
+        .row = 2,
+    };
+
+    rig.hooks = canceling.hooks();
+
+    const rows = row_command ++ row_command ++ row_command;
+
+    const taken = try rig.run(handle, &rows, false);
+
+    var repeated = early.report;
+
+    repeated.decoded_rows = 3;
+
+    try testing.expectEqual(.canceled, taken.outcome);
+    try testing.expectEqual(repeated, taken.report);
+
+    // The rows that the step wrote stay outside the coverage.
+    try testing.expectEqual(1, lease.covered);
+    try expectRows(lease, 1);
+    try rig.releaseLease(early.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "the close of a content after early output keeps the held lease" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const content = try rig.open();
+
+    const handle = try rig.admit(content, .{});
+
+    const early = try rig.run(handle, &(image_script ++ row_command), false);
+
+    try rig.closeContent(content);
+
+    try testing.expectEqual(
+        canceledWord(unpack(handle).generation),
+        rig.wordOf(handle),
+    );
+
+    // The codec and the staging are gone, and the lease stays.
+    try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
+
+    const lease = try rig.leaseOf(early.report.lease.?);
+
+    try testing.expectEqual(1, lease.covered);
+    try expectRows(lease, 1);
+    try rig.drop(handle);
+    try rig.releaseLease(early.report.lease.?);
+    try rig.finish();
+}
+
+test "a lease that its caller releases early ends with its job" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const early = try rig.run(handle, &(image_script ++ row_command), false);
+
+    const named_lease = early.report.lease.?;
+
+    try rig.releaseLease(named_lease);
+    try testing.expectError(error.InvalidHandle, rig.leaseOf(named_lease));
+
+    // The job keeps the lease and goes on, and its reports name the
+    // lease that the caller no longer holds.
+    try testing.expectEqual(1, Lease.countLive(rig.engine));
+
+    const taken = try rig.run(handle, &row_command, false);
+
+    try testing.expectEqual(named_lease, taken.report.lease);
+    try testing.expectEqual(2, taken.report.revision);
+    try testing.expectEqual(2, taken.report.covered_rows);
+    try testing.expectError(error.InvalidHandle, rig.leaseOf(named_lease));
+
+    try cancel(&rig.slot, handle);
+    try testing.expectEqual(.canceled, try rig.advance(handle));
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
+    try testing.expectEqual(0, rig.engine.heap.ledger.usage.output);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+/// One admission of the image of `image_script`: a limit or a request
+/// that differs from the roomy ones, and what the admission step makes
+/// of it.
+const AdmissionCase = struct {
+    limit: ?[]const u8 = null,
+    value: i64 = 0,
+    wanted: Request = .{},
+    /// The outcome of the admission step, or null when it admits.
+    outcome: ?Outcome,
+    /// The output grid that the step reports, or null when the image
+    /// limits refuse the image before any geometry.
+    grid: ?[2]u32 = .{ 3, 4 },
+};
+
+fn regionOf(right: u31, bottom: u31) Request {
+    return .{
+        .region = .{ .left = 0, .top = 0, .right = right, .bottom = bottom },
+    };
+}
+
+const admission_cases = [_]AdmissionCase{
+    // The image limits, each at its ceiling and below it.
+    .{ .limit = "image_axis_pixels", .value = 4, .outcome = null },
+    .{
+        .limit = "image_axis_pixels",
+        .value = 3,
+        .outcome = .budget_exceeded,
+        .grid = null,
+    },
+    .{ .limit = "image_area_pixels", .value = 12, .outcome = null },
+    .{
+        .limit = "image_area_pixels",
+        .value = 11,
+        .outcome = .budget_exceeded,
+        .grid = null,
+    },
+    // The whole image as a region, a region past the image, and one
+    // inside it that is not whole.
+    .{ .wanted = regionOf(3, 4), .outcome = null },
+    .{ .wanted = regionOf(4, 4), .outcome = .unsupported_operation },
+    .{ .wanted = regionOf(3, 5), .outcome = .unsupported_operation },
+    .{ .wanted = regionOf(2, 4), .outcome = .unsupported_operation },
+    .{ .wanted = regionOf(3, 3), .outcome = .unsupported_operation },
+    // A largest output width of at least the image width, and a smaller
+    // one, which reports its grid.
+    .{ .wanted = .{ .max_output_width = 3 }, .outcome = null },
+    .{ .wanted = .{ .max_output_width = 4 }, .outcome = null },
+    .{
+        .wanted = .{ .max_output_width = 2 },
+        .outcome = .unsupported_operation,
+        .grid = .{ 2, 3 },
+    },
+    // The byte ceilings of the lease, which come after the region.
+    .{
+        .limit = "output_lease_bytes",
+        .value = image_lease_bytes,
+        .outcome = null,
+    },
+    .{
+        .limit = "output_lease_bytes",
+        .value = image_lease_bytes - 1,
+        .outcome = .budget_exceeded,
+    },
+    .{ .limit = "output_bytes", .value = image_lease_bytes, .outcome = null },
+    .{
+        .limit = "output_bytes",
+        .value = image_lease_bytes - 1,
+        .outcome = .budget_exceeded,
+    },
+    // Each check decides before the checks after it: the image limits
+    // before the region, and the region and the scale before the
+    // ceilings.
+    .{
+        .limit = "image_axis_pixels",
+        .value = 3,
+        .wanted = regionOf(4, 4),
+        .outcome = .budget_exceeded,
+        .grid = null,
+    },
+    .{
+        .limit = "output_lease_bytes",
+        .value = image_lease_bytes - 1,
+        .wanted = regionOf(4, 4),
+        .outcome = .unsupported_operation,
+    },
+    .{
+        .limit = "output_lease_bytes",
+        .value = image_lease_bytes - 1,
+        .wanted = .{ .max_output_width = 2 },
+        .outcome = .unsupported_operation,
+        .grid = .{ 2, 3 },
+    },
+};
+
+test "the admission step checks the limits, the region, and the ceilings" {
+    inline for (admission_cases) |case| {
+        var limits = Rig.limitsOf(.{});
+
+        if (case.limit) |name| @field(limits, name) = case.value;
+
+        var rig: Rig = undefined;
+
+        try rig.startUnder(limits);
+
+        const content = try rig.open();
+
+        const handle = try rig.admit(content, case.wanted);
+
+        const taken = try rig.run(handle, &image_script, false);
+
+        try testing.expectEqual(case.outcome, taken.outcome);
+        try testing.expectEqual(null, taken.report.lease);
+        try testing.expectEqual(0, taken.report.decoded_rows);
+
+        if (case.grid) |grid| {
+            const admission = taken.report.admission.?;
+
+            try testing.expectEqual(image_admission.image, admission.image);
+            try testing.expectEqual(grid[0], admission.output_width);
+            try testing.expectEqual(grid[1], admission.output_height);
+        } else {
+            try testing.expectEqual(null, taken.report.admission);
+        }
+
+        const usage = &rig.engine.heap.ledger.usage;
+
+        if (case.outcome == null) {
+            try testing.expectEqual(
+                Report.Admitted{ .width = 3, .height = 4 },
+                taken.report.admitted,
+            );
+
+            try testing.expectEqual(image_lease_bytes, usage.output);
+            try rig.closeContent(content);
+        } else {
+            // A refusal keeps nothing: the lease, its bytes, and the
+            // codec are gone with the job.
+            try testing.expectEqual(null, taken.report.admitted);
+            try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
+        }
+
+        try testing.expectEqual(0, usage.output);
+        try testing.expectEqual(0, usage.reserved);
+        try testing.expectEqual(0, Lease.countLive(rig.engine));
+        try rig.drop(handle);
+        try rig.finish();
+    }
+}
+
+test "a step hands no byte past the length ceiling to the codec" {
+    var limits = Rig.limitsOf(.{});
+
+    // The image command and one row.
+    limits.content_length_bytes = image_script.len + 1;
+
+    const rows = row_command ++ row_command ++ row_command;
+
+    // A portion that crosses the ceiling: the row before it decodes and
+    // publishes, and the job then ends.
+    {
+        var rig: Rig = undefined;
+
+        try rig.startUnder(limits);
+
+        const handle = try rig.admitNew();
+
+        const taken = try rig.run(handle, &(image_script ++ rows), false);
+
+        try testing.expectEqual(.budget_exceeded, taken.outcome);
+        try testing.expectEqual(1, taken.report.decoded_rows);
+        try testing.expectEqual(1, taken.report.covered_rows);
+        try rig.releaseLease(taken.report.lease.?);
+        try rig.drop(handle);
+        try rig.finish();
+    }
+
+    // A representation of exactly the ceiling passes, and the first
+    // byte past it ends the job without reaching the codec.
+    {
+        var rig: Rig = undefined;
+
+        try rig.startUnder(limits);
+
+        const handle = try rig.admitNew();
+
+        const within = try rig.run(
+            handle,
+            &(image_script ++ row_command),
+            false,
+        );
+
+        try testing.expectEqual(null, within.outcome);
+
+        const taken = try rig.run(handle, &row_command, false);
+
+        try testing.expectEqual(.budget_exceeded, taken.outcome);
+        try testing.expectEqual(within.report, taken.report);
+        try rig.releaseLease(within.report.lease.?);
+        try rig.drop(handle);
+        try rig.finish();
+    }
+
+    // An image of exactly the ceiling completes with the end of its
+    // input.
+    {
+        limits.content_length_bytes = pixel_script.len;
+
+        var rig: Rig = undefined;
+
+        try rig.startUnder(limits);
+
+        const handle = try rig.admitNew();
+
+        const taken = try rig.run(handle, &pixel_script, true);
+
+        try testing.expectEqual(.completed, taken.outcome);
+        try rig.releaseLease(taken.report.lease.?);
+        try rig.drop(handle);
+        try rig.finish();
+    }
+}
+
+test "a failure that follows an unobserved cancellation publishes nothing" {
+    const Canceling = struct {
+        slot: *const Engine.Slot,
+        handle: Handle,
+
+        fn beforeInvalid(ctx: ?*anyopaque) void {
+            const canceling: *@This() = @ptrCast(@alignCast(ctx.?));
+
+            cancel(canceling.slot, canceling.handle) catch
+                @panic("the hook cancels a job that its test owns");
+        }
+    };
+
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    var canceling: Canceling = .{ .slot = &rig.slot, .handle = handle };
+
+    rig.hooks = .{
+        .ctx = &canceling,
+        .before_invalid = Canceling.beforeInvalid,
+    };
+
+    // The codec wrote a row, observed a clear flag, and then failed
+    // after the request, without observing the flag again. The failure
+    // loses to the cancellation, so the row stays unpublished.
+    const script = image_script ++ row_command ++ invalid_command;
+
+    const taken = try rig.run(handle, &script, false);
+
+    try testing.expectEqual(.canceled, taken.outcome);
+    try testing.expectEqual(null, taken.report.lease);
+    try testing.expectEqual(0, taken.report.covered_rows);
+    try testing.expectEqual(1, taken.report.decoded_rows);
+
+    try testing.expectEqual(
+        canceledWord(unpack(handle).generation),
+        rig.wordOf(handle),
+    );
+
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a shutdown ends a decoding job and keeps the lease that it published" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const early = try rig.run(handle, &(image_script ++ row_command), false);
+
+    try testing.expectEqual(
+        .pending,
+        try Engine.shutdown(&rig.slot, rig.handle),
+    );
+
+    // The codec and the staging are gone, and the lease stays.
+    try testing.expectEqual(
+        canceledWord(unpack(handle).generation),
+        rig.wordOf(handle),
+    );
+
+    try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
+
+    const lease = try rig.leaseOf(early.report.lease.?);
+
+    try testing.expectEqual(1, lease.covered);
+    try expectRows(lease, 1);
+    try rig.drop(handle);
+
+    try testing.expectEqual(
+        .pending,
+        try Engine.shutdown(&rig.slot, rig.handle),
+    );
+
+    try rig.releaseLease(early.report.lease.?);
+    try rig.finish();
+}
+
+test "a codec that ends its image short of the lease fails the job" {
+    const cut_command = [_]u8{@backingInt(Scripted.Command.cut)};
+
+    const scripts = [_][]const u8{
+        // Before the image, and before its last row.
+        &cut_command,
+        &(image_script ++ row_command ++ cut_command),
+    };
+
+    for (scripts, 0..) |script, rows| {
+        var rig: Rig = undefined;
+
+        try rig.start(.{});
+
+        const handle = try rig.admitNew();
+
+        const taken = try rig.run(handle, script, true);
+
+        // The rows that arrived publish, and the job never completes.
+        try testing.expectEqual(.engine_failure, taken.outcome);
+        try testing.expectEqual(rows, taken.report.covered_rows);
+
+        if (taken.report.lease) |named_lease| try rig.releaseLease(named_lease);
+
+        try testing.expectEqual(0, Lease.countLive(rig.engine));
+        try rig.drop(handle);
+        try rig.finish();
+    }
+}
+
+test "each failed allocation of a decode ends the job and keeps nothing" {
+    // The state of the codec, the pixels of the lease, and the
+    // workspace of the codec, in the order of their allocation.
+    const reports = [_]Report{
+        .{},
+        .{ .admission = image_admission },
+        .{
+            .admission = image_admission,
+            .admitted = .{ .width = 3, .height = 4 },
+        },
+    };
+
+    const script = image_script ++ row_command;
+
+    for (reports, 0..) |report, fail_index| {
+        var rig: Rig = undefined;
+
+        try rig.start(.{});
+
+        const handle = try rig.admitNew();
+
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+
+        rig.backing.gpa = failing.allocator();
+
+        const taken = try rig.run(handle, &script, false);
+
+        rig.backing.gpa = testing.allocator;
+
+        try testing.expectEqual(.allocation_failed, taken.outcome);
+        try testing.expectEqual(report, taken.report);
+
+        const usage = &rig.engine.heap.ledger.usage;
+
+        try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
+        try testing.expectEqual(0, usage.output);
+        try testing.expectEqual(0, usage.reserved);
+        try testing.expectEqual(0, Lease.countLive(rig.engine));
+        try rig.expectSettled();
+        try rig.drop(handle);
+        try rig.finish();
+    }
+
+    // A decode allocates nothing else: with the fourth allocation
+    // failing, the same step succeeds.
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    var failing: testing.FailingAllocator = .init(testing.allocator, .{
+        .fail_index = reports.len,
+    });
+
+    rig.backing.gpa = failing.allocator();
+
+    const taken = try rig.run(handle, &script, false);
+
+    rig.backing.gpa = testing.allocator;
+
+    try testing.expectEqual(null, taken.outcome);
+    try testing.expectEqual(1, taken.report.covered_rows);
+    try rig.expectSettled();
+    try rig.releaseLease(taken.report.lease.?);
+    try cancel(&rig.slot, handle);
+    try testing.expectEqual(.canceled, try rig.advance(handle));
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a budget that refuses the codec ends the job as BudgetExceeded" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admitNew();
+
+    const ledger = &rig.engine.heap.ledger;
+    const budget = ledger.budget;
+
+    // The budget admits what the engine holds and nothing more.
+    ledger.budget = .{ .bytes = ledger.usage.live };
+
+    const taken = try rig.run(handle, &image_script, false);
+
+    ledger.budget = budget;
+
+    try testing.expectEqual(.budget_exceeded, taken.outcome);
+    try testing.expectEqual(Report{}, taken.report);
+    try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a request takes the generations of its job and its lease or none" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const content = try rig.open();
+
+    const last = std.math.maxInt(handles.Generation);
+
+    // One issue remains, and a request needs two.
+    rig.engine.serial = .{ .next = last - 1 };
+
+    try testing.expectError(error.EngineFailure, rig.admit(content, .{}));
+    try testing.expectEqual(last - 1, rig.engine.serial.next);
+    try testing.expectEqual(0, countOwned(rig.engine));
+    try testing.expectEqual(0, Lease.countLive(rig.engine));
+
+    rig.engine.serial = .{ .next = last - 2 };
+
+    const handle = try rig.admit(content, .{});
+
+    try testing.expectEqual(last - 2, unpack(handle).generation);
+    try testing.expectEqual(last - 1, rig.slotOf(handle).lease.?.generation);
+    try testing.expect(rig.engine.serial.retired());
+    try rig.fail(handle);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a held lease counts against its limit and keeps the shutdown pending" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{ .jobs = 2, .leases = 1 });
+
+    const second = try rig.open();
+
+    const first_job = try rig.admitNew();
+
+    const taken = try rig.run(first_job, &pixel_script, true);
+
+    try testing.expectEqual(.completed, taken.outcome);
+    try rig.drop(first_job);
+
+    // The caller's claim outlives the job, and the lease stays live.
+    try testing.expectEqual(0, countOwned(rig.engine));
+    try testing.expectError(error.BudgetExceeded, rig.admit(second, .{}));
+
+    for (0..2) |_| {
+        try testing.expectEqual(
+            .pending,
+            try Engine.shutdown(&rig.slot, rig.handle),
+        );
+    }
+
+    // The release works while the engine closes, and it lets the
+    // shutdown complete.
+    try rig.releaseLease(taken.report.lease.?);
+    try rig.finish();
 }

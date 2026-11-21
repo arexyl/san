@@ -9,19 +9,24 @@
 //! one for every function that the translation declares, so a function
 //! that drifts from the pinned header fails the compile.
 //!
+//! This file also composes the library: the engine names no codec, and
+//! every engine that these functions create takes the PNG decoder as the
+//! codec of its jobs.
+//!
 //! San implements the engine lifecycle, the counters read, the contents
-//! with their feed, and the lifecycle of a job. No decode exists: a step
-//! ends its job as canceled when the cancellation flag is set, and as
-//! SAN_STATUS_ENGINE_FAILURE otherwise. San issues no lease handle, so
-//! each function that takes one rejects every handle.
+//! with their feed, the jobs with their steps and reports, and the
+//! release of an output lease. The copy is not implemented yet:
+//! san_output_copy rejects every handle.
 
 const std = @import("std");
 const san = @import("san");
 const Engine = @import("engine");
+const Decoder = @import("png");
 
 const Content = Engine.Content;
 const Heap = Engine.Heap;
 const Job = Engine.Job;
+const Lease = Engine.Lease;
 
 /// The binding flag and the engine slot of one process.
 const Process = struct {
@@ -124,8 +129,8 @@ pub export fn san_output_copy(
     return san.SAN_STATUS_INVALID_HANDLE;
 }
 
-pub export fn san_output_release(_: san.san_handle) san.san_status {
-    return san.SAN_STATUS_INVALID_HANDLE;
+pub export fn san_output_release(lease: san.san_handle) san.san_status {
+    return releaseOutput(&process, lease);
 }
 
 comptime {
@@ -187,8 +192,9 @@ fn establish(state: *Process, abi_version: i32) san.san_status {
     return san.SAN_STATUS_OK;
 }
 
-/// Creates an engine in `state` with memory from `backing`. It writes
-/// the handle of the engine to `out`, or SAN_NO_HANDLE on a failure.
+/// Creates an engine in `state` with memory from `backing` and the PNG
+/// decoder as its codec. It writes the handle of the engine to `out`, or
+/// SAN_NO_HANDLE on a failure.
 fn create(
     state: *Process,
     backing: Heap.Backing,
@@ -201,6 +207,7 @@ fn create(
         &state.binding,
         &state.slot,
         backing,
+        Decoder.opener,
         engineLimits(limits),
     ) catch |err| return statusOf(err);
 
@@ -271,7 +278,7 @@ fn counters(
         reported(Content.countOpen(found));
 
     out[san.SAN_ENGINE_COUNTERS_JOB_COUNT] = reported(Job.countOwned(found));
-    out[san.SAN_ENGINE_COUNTERS_LEASE_COUNT] = reported(Job.countLeased(found));
+    out[san.SAN_ENGINE_COUNTERS_LEASE_COUNT] = reported(Lease.countLive(found));
 
     out[san.SAN_ENGINE_COUNTERS_LIVE_BYTES] = reported(usage.live);
     out[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES] = reported(usage.reserved);
@@ -467,15 +474,64 @@ fn stepJob(
         jobHandle(job),
     ) catch |err| return statusOf(err);
 
-    const outcome = Job.step(live);
+    const stepped = Job.step(live);
 
-    // No admission step ran and no lease exists, so every element is 0.
-    out.* = @splat(0);
+    out.* = reportOf(stepped.report);
+
+    // This build consumes every staged byte in one step, so a job that
+    // continues always waits for input.
+    const outcome = stepped.outcome orelse return san.SAN_STATUS_INPUT_NEEDED;
 
     return switch (outcome) {
+        .completed => san.SAN_STATUS_OK,
         .canceled => san.SAN_STATUS_CANCELED,
+        .unsupported_format => san.SAN_STATUS_UNSUPPORTED_FORMAT,
+        .unsupported_operation => san.SAN_STATUS_UNSUPPORTED_OPERATION,
+        .invalid_content => san.SAN_STATUS_INVALID_CONTENT,
+        .truncated_content => san.SAN_STATUS_TRUNCATED_CONTENT,
+        .budget_exceeded => san.SAN_STATUS_BUDGET_EXCEEDED,
+        .allocation_failed => san.SAN_STATUS_ALLOCATION_FAILED,
         .engine_failure => san.SAN_STATUS_ENGINE_FAILURE,
     };
+}
+
+/// Returns the report of the header for `report`. An element that the
+/// job does not know yet is 0, and no path of this build sets a warning
+/// bit.
+fn reportOf(report: Job.Report) Report {
+    var out: Report = @splat(0);
+
+    if (report.lease) |lease| {
+        out[san.SAN_JOB_REPORT_LEASE] = @bitCast(@backingInt(lease));
+    }
+
+    out[san.SAN_JOB_REPORT_REVISION] = @intCast(report.revision);
+    out[san.SAN_JOB_REPORT_COVERED_ROWS] = report.covered_rows;
+    out[san.SAN_JOB_REPORT_DECODED_ROWS] = report.decoded_rows;
+
+    if (report.admission) |admission| {
+        out[san.SAN_JOB_REPORT_IMAGE_WIDTH] = admission.image.width;
+        out[san.SAN_JOB_REPORT_IMAGE_HEIGHT] = admission.image.height;
+        out[san.SAN_JOB_REPORT_OUTPUT_WIDTH] = admission.output_width;
+        out[san.SAN_JOB_REPORT_OUTPUT_HEIGHT] = admission.output_height;
+    }
+
+    if (report.admitted) |admitted| {
+        out[san.SAN_JOB_REPORT_LEASE_WIDTH] = admitted.width;
+        out[san.SAN_JOB_REPORT_LEASE_HEIGHT] = admitted.height;
+        out[san.SAN_JOB_REPORT_LEASE_LEFT] = admitted.left;
+        out[san.SAN_JOB_REPORT_LEASE_TOP] = admitted.top;
+
+        out[san.SAN_JOB_REPORT_ALPHA] = if (admitted.alpha)
+            san.SAN_ALPHA_PREMULTIPLIED
+        else
+            san.SAN_ALPHA_OPAQUE;
+
+        out[san.SAN_JOB_REPORT_EARLY_PUBLICATION] =
+            @intFromBool(admitted.early_publication);
+    }
+
+    return out;
 }
 
 fn cancelJob(state: *Process, job: san.san_handle) san.san_status {
@@ -493,6 +549,23 @@ fn releaseJob(state: *Process, job: san.san_handle) san.san_status {
     Job.release(owned) catch |err| return statusOf(err);
 
     return san.SAN_STATUS_OK;
+}
+
+/// Releases the caller's claim on a lease of `state`, also while its
+/// engine shuts down and after its content closed.
+fn releaseOutput(state: *Process, lease: san.san_handle) san.san_status {
+    const held = Lease.resolve(
+        &state.slot,
+        leaseHandle(lease),
+    ) catch |err| return statusOf(err);
+
+    Lease.release(held);
+
+    return san.SAN_STATUS_OK;
+}
+
+fn leaseHandle(lease: san.san_handle) Lease.Handle {
+    return @fromBackingInt(@as(u64, @bitCast(lease)));
 }
 
 fn engineHandle(engine: san.san_handle) Engine.Handle {
@@ -548,9 +621,9 @@ const portion = 4096;
 const job_slots = 2;
 const lease_limit = 2;
 
-/// The blocks of an engine's own state: the engine, the slots of its
-/// contents, and the slots of its jobs.
-const own_blocks = 3;
+/// The blocks of an engine's own state: the engine and the slots of its
+/// contents, of its jobs, and of its leases.
+const own_blocks = 4;
 
 /// What a staging takes from the ledger: its portion and its header.
 const staged = portion + Heap.header_size;
@@ -770,7 +843,7 @@ test "the counters read reports the ledger and resets the peaks on request" {
         create(&state, test_backing.backing(), roomy, &handle),
     );
 
-    // The engine's own state is its three blocks, of the metadata kind.
+    // The engine's own state is its four blocks, of the metadata kind.
     const own = test_backing.outstanding;
 
     var report = unread;
@@ -920,6 +993,7 @@ fn openCount(state: *Process, engine: san.san_handle) !i64 {
 
 const input_bytes = san.SAN_ENGINE_COUNTERS_INPUT_BYTES;
 const metadata_bytes = san.SAN_ENGINE_COUNTERS_METADATA_BYTES;
+const output_bytes = san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES;
 
 /// Opens a content in `engine` and returns its handle.
 fn openOk(state: *Process, engine: san.san_handle) !san.san_handle {
@@ -1451,11 +1525,17 @@ test "a request beyond a count limit fails as BudgetExceeded" {
 
     try testing.expectEqual(san.SAN_NO_HANDLE, refused);
 
-    // A terminal job still holds its slot until its release.
+    // A terminal job still holds its slot until its release. The input
+    // of this one ends before any image.
     var report = unstepped;
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
+        san.SAN_STATUS_OK,
+        feedBytes(&state, opened[0], 0, "", 1),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_TRUNCATED_CONTENT,
         stepJob(&state, jobs[0], &report),
     );
 
@@ -1483,7 +1563,7 @@ test "a request beyond a count limit fails as BudgetExceeded" {
     try testing.expectEqual(0, test_backing.blocks);
 }
 
-test "a step ends its job and writes a report of zeros" {
+test "a step that fails before an image writes a report of zeros" {
     var state = established();
 
     var test_backing: TestBacking = .init(testing.allocator);
@@ -1507,10 +1587,11 @@ test "a step ends its job and writes a report of zeros" {
 
     try expectJobs(&state, engine, 1, 1);
 
+    // The bytes are no PNG signature.
     var report = unstepped;
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
+        san.SAN_STATUS_INVALID_CONTENT,
         stepJob(&state, job, &report),
     );
 
@@ -2137,11 +2218,11 @@ test "the exported functions run the lifecycle of the process" {
     try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_JOB_COUNT]);
     try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
 
-    // No decode exists, so the first step ends the job.
+    // The one byte is no PNG signature, so the first step ends the job.
     var report: Report = @splat(unwritten);
 
     try testing.expectEqual(
-        san.SAN_STATUS_ENGINE_FAILURE,
+        san.SAN_STATUS_INVALID_CONTENT,
         san_job_step(job, &report),
     );
 
@@ -2209,4 +2290,905 @@ test "the exported functions run the lifecycle of the process" {
         san.SAN_STATUS_INVALID_HANDLE,
         san_content_close(content),
     );
+}
+
+const fixtures = Decoder.fixtures;
+
+/// The image of most decode tests below: 8 by 16 pixels in IDAT chunks
+/// of 16 bytes, so that its rows arrive spread over its bytes.
+const striped: fixtures.Spec = .{
+    .width = 8,
+    .height = 16,
+    .filters = .cycle,
+    .idat_size = 16,
+};
+
+/// The bytes of the lease of the striped image with their block header.
+const striped_lease_bytes = 8 * 16 * Lease.pixel_bytes + Heap.header_size;
+
+/// A backing that requests the cancellation of a job when the heap
+/// takes a block of one length. With the length of the job's lease, the
+/// request comes from inside the feed of the decoder that reads the
+/// image header, before the first row. A length of 0 cancels nothing.
+const CancelingBacking = struct {
+    inner: *TestBacking,
+    state: *Process,
+    job: san.san_handle = san.SAN_NO_HANDLE,
+    at_len: usize = 0,
+    requests: u32 = 0,
+
+    fn backing(canceling: *CancelingBacking) Heap.Backing {
+        return .{
+            .ptr = canceling,
+            .vtable = &.{ .alloc = alloc, .free = free },
+        };
+    }
+
+    fn alloc(ptr: *anyopaque, len: usize) ?[*]align(16) u8 {
+        const canceling: *CancelingBacking = @ptrCast(@alignCast(ptr));
+
+        if (canceling.at_len != 0 and len == canceling.at_len) {
+            canceling.requests += 1;
+
+            const status = cancelJob(canceling.state, canceling.job);
+
+            if (status != san.SAN_STATUS_OK) {
+                @panic("the backing cancels a job that its test owns");
+            }
+        }
+
+        const inner = canceling.inner.backing();
+
+        return inner.vtable.alloc(inner.ptr, len);
+    }
+
+    fn free(ptr: *anyopaque, block: [*]align(16) u8, len: usize) void {
+        const canceling: *CancelingBacking = @ptrCast(@alignCast(ptr));
+        const inner = canceling.inner.backing();
+
+        inner.vtable.free(inner.ptr, block, len);
+    }
+};
+
+/// One job over an encoded test image, with the engine and the content
+/// that it needs. It starts in place, because the engine names its
+/// backing by address.
+const Decoding = struct {
+    state: Process,
+    backing: TestBacking,
+    canceling: CancelingBacking,
+    /// The encoded image, and the samples that its writer encoded.
+    bytes: []u8,
+    samples: []u8,
+    engine: san.san_handle = san.SAN_NO_HANDLE,
+    content: san.san_handle = san.SAN_NO_HANDLE,
+    job: san.san_handle = san.SAN_NO_HANDLE,
+    /// The bytes of the image that the content received.
+    fed: usize = 0,
+
+    const Stepped = struct {
+        status: san.san_status,
+        report: Report,
+    };
+
+    fn start(
+        decoding: *Decoding,
+        spec: fixtures.Spec,
+        limits: san.san_engine_limits,
+        request: san.san_output_request,
+    ) !void {
+        const bytes = try fixtures.encode(testing.allocator, spec);
+        errdefer testing.allocator.free(bytes);
+
+        const samples = try fixtures.samples(testing.allocator, spec);
+        errdefer testing.allocator.free(samples);
+
+        decoding.* = .{
+            .state = established(),
+            .backing = .init(testing.allocator),
+            .canceling = undefined,
+            .bytes = bytes,
+            .samples = samples,
+        };
+
+        decoding.canceling = .{
+            .inner = &decoding.backing,
+            .state = &decoding.state,
+        };
+
+        try testing.expectEqual(san.SAN_STATUS_OK, create(
+            &decoding.state,
+            decoding.canceling.backing(),
+            limits,
+            &decoding.engine,
+        ));
+
+        decoding.content = try openOk(&decoding.state, decoding.engine);
+
+        try testing.expectEqual(san.SAN_STATUS_OK, requestJob(
+            &decoding.state,
+            decoding.content,
+            request,
+            &decoding.job,
+        ));
+    }
+
+    fn deinit(decoding: *Decoding) void {
+        testing.allocator.free(decoding.bytes);
+        testing.allocator.free(decoding.samples);
+    }
+
+    /// Returns the bytes of the image that the content has not received.
+    fn rest(decoding: *const Decoding) usize {
+        return decoding.bytes.len - decoding.fed;
+    }
+
+    /// Feeds the next `len` bytes of the image, with or without the end
+    /// of the input, and steps the job.
+    fn advance(decoding: *Decoding, len: usize, end_of_input: i32) !Stepped {
+        try testing.expectEqual(san.SAN_STATUS_OK, feedBytes(
+            &decoding.state,
+            decoding.content,
+            @intCast(decoding.fed),
+            decoding.bytes[decoding.fed..][0..len],
+            end_of_input,
+        ));
+
+        decoding.fed += len;
+
+        return decoding.step();
+    }
+
+    fn step(decoding: *Decoding) Stepped {
+        var report = unstepped;
+
+        const status = stepJob(&decoding.state, decoding.job, &report);
+
+        return .{ .status = status, .report = report };
+    }
+
+    /// Returns the lease that `report` names, which the caller holds.
+    fn leaseOf(decoding: *Decoding, report: Report) !*Lease {
+        const held = try Lease.resolve(
+            &decoding.state.slot,
+            leaseHandle(report[san.SAN_JOB_REPORT_LEASE]),
+        );
+
+        return held.lease;
+    }
+
+    /// Checks that the lease of `report` covers `rows` rows and that each
+    /// holds the samples of the image with an alpha of 255. The tests
+    /// read the lease itself, because the copy is not implemented yet.
+    fn expectRows(decoding: *Decoding, report: Report, rows: u32) !void {
+        const lease = try decoding.leaseOf(report);
+        const width: usize = lease.width;
+
+        try testing.expectEqual(rows, lease.covered);
+        try testing.expectEqual(rows, report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+
+        for (0..rows) |index| {
+            const pixels = lease.row(@intCast(index));
+            const expected = decoding.samples[index * width * 3 ..];
+
+            for (0..width) |column| {
+                const pixel = pixels[column * Lease.pixel_bytes ..];
+
+                try testing.expectEqualSlices(
+                    u8,
+                    expected[column * 3 ..][0..3],
+                    pixel[0..3],
+                );
+
+                try testing.expectEqual(0xff, pixel[3]);
+            }
+        }
+    }
+
+    fn release(decoding: *Decoding, report: Report) san.san_status {
+        return releaseOutput(
+            &decoding.state,
+            report[san.SAN_JOB_REPORT_LEASE],
+        );
+    }
+
+    /// Releases the lease that `report` names, which the caller holds.
+    fn drop(decoding: *Decoding, report: Report) !void {
+        try testing.expectEqual(san.SAN_STATUS_OK, decoding.release(report));
+    }
+
+    fn counters(decoding: *Decoding) !Counters {
+        return readCounters(&decoding.state, decoding.engine);
+    }
+
+    /// Checks that the ledger counts exactly what the backing holds.
+    fn expectSettled(decoding: *Decoding) !void {
+        const found = try Engine.resolveClosing(
+            &decoding.state.slot,
+            engineHandle(decoding.engine),
+        );
+
+        try Heap.expectMatches(&found.heap, &decoding.backing);
+    }
+
+    /// Releases the job, which has its terminal outcome, and shuts down
+    /// the engine, which then holds no lease.
+    fn stop(decoding: *Decoding) !void {
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            releaseJob(&decoding.state, decoding.job),
+        );
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            shutdown(&decoding.state, decoding.engine),
+        );
+
+        try testing.expectEqual(0, decoding.backing.blocks);
+        try testing.expectEqual(0, decoding.backing.outstanding);
+    }
+};
+
+/// The elements of a report that the admission step writes, by group.
+const Geometry = struct {
+    image: [2]i64 = .{ 0, 0 },
+    grid: [2]i64 = .{ 0, 0 },
+    /// The width and the height of the lease, or null without a lease.
+    lease: ?[2]i64 = null,
+};
+
+/// Checks the image, grid, and lease elements of `report`.
+fn expectGeometry(geometry: Geometry, report: Report) !void {
+    const lease = geometry.lease orelse .{ 0, 0 };
+    const admitted: i64 = @intFromBool(geometry.lease != null);
+
+    try testing.expectEqual(geometry.image, .{
+        report[san.SAN_JOB_REPORT_IMAGE_WIDTH],
+        report[san.SAN_JOB_REPORT_IMAGE_HEIGHT],
+    });
+
+    try testing.expectEqual(geometry.grid, .{
+        report[san.SAN_JOB_REPORT_OUTPUT_WIDTH],
+        report[san.SAN_JOB_REPORT_OUTPUT_HEIGHT],
+    });
+
+    try testing.expectEqual(lease, .{
+        report[san.SAN_JOB_REPORT_LEASE_WIDTH],
+        report[san.SAN_JOB_REPORT_LEASE_HEIGHT],
+    });
+
+    // The lease of this build starts at the origin of the grid, has no
+    // alpha, and publishes before the terminal outcome.
+    try testing.expectEqual(0, report[san.SAN_JOB_REPORT_LEASE_LEFT]);
+    try testing.expectEqual(0, report[san.SAN_JOB_REPORT_LEASE_TOP]);
+
+    try testing.expectEqual(
+        admitted * san.SAN_ALPHA_OPAQUE,
+        report[san.SAN_JOB_REPORT_ALPHA],
+    );
+
+    try testing.expectEqual(
+        admitted,
+        report[san.SAN_JOB_REPORT_EARLY_PUBLICATION],
+    );
+}
+
+const striped_geometry: Geometry = .{
+    .image = .{ 8, 16 },
+    .grid = .{ 8, 16 },
+    .lease = .{ 8, 16 },
+};
+
+test "a PNG decodes into a lease that its report names" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    const stepped = try decoding.advance(decoding.rest(), 1);
+    const report = stepped.report;
+
+    try testing.expectEqual(san.SAN_STATUS_OK, stepped.status);
+    try testing.expect(report[san.SAN_JOB_REPORT_LEASE] != san.SAN_NO_HANDLE);
+    try testing.expectEqual(1, report[san.SAN_JOB_REPORT_REVISION]);
+    try testing.expectEqual(16, report[san.SAN_JOB_REPORT_DECODED_ROWS]);
+    try testing.expectEqual(0, report[san.SAN_JOB_REPORT_WARNINGS]);
+    try expectGeometry(striped_geometry, report);
+    try decoding.expectRows(report, 16);
+
+    // The codec is gone with the job's terminal outcome, and the lease
+    // counts as output until the caller releases it.
+    var counted = try decoding.counters();
+
+    try testing.expectEqual(1, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+    try testing.expectEqual(striped_lease_bytes, counted[output_bytes]);
+    try testing.expectEqual(own_blocks + 2, decoding.backing.blocks);
+    try decoding.expectSettled();
+
+    try testing.expectEqual(san.SAN_STATUS_OK, decoding.release(report));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        decoding.release(report),
+    );
+
+    counted = try decoding.counters();
+
+    try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+    try testing.expectEqual(0, counted[output_bytes]);
+    try decoding.stop();
+}
+
+test "a PNG decodes the same in portions of one byte" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    var revision: i64 = 0;
+    var covered: i64 = 0;
+
+    while (decoding.rest() > 1) {
+        const stepped = try decoding.advance(1, 0);
+
+        try testing.expectEqual(san.SAN_STATUS_INPUT_NEEDED, stepped.status);
+
+        // The revision rises by one exactly in a step that extends the
+        // coverage, and neither ever falls.
+        const extended =
+            stepped.report[san.SAN_JOB_REPORT_COVERED_ROWS] - covered;
+
+        try testing.expect(extended >= 0);
+
+        try testing.expectEqual(
+            revision + @intFromBool(extended > 0),
+            stepped.report[san.SAN_JOB_REPORT_REVISION],
+        );
+
+        revision = stepped.report[san.SAN_JOB_REPORT_REVISION];
+        covered = stepped.report[san.SAN_JOB_REPORT_COVERED_ROWS];
+    }
+
+    // The rows arrived over many steps, before the last byte.
+    try testing.expectEqual(16, covered);
+    try testing.expect(revision > 1);
+
+    const stepped = try decoding.advance(1, 1);
+
+    try testing.expectEqual(san.SAN_STATUS_OK, stepped.status);
+    try testing.expectEqual(
+        revision,
+        stepped.report[san.SAN_JOB_REPORT_REVISION],
+    );
+
+    try decoding.expectRows(stepped.report, 16);
+    try decoding.drop(stepped.report);
+    try decoding.stop();
+}
+
+test "rows publish while the rest of the payload is withheld" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    // Two thirds of the bytes hold some rows of the image and not all.
+    const early = try decoding.advance(decoding.bytes.len * 2 / 3, 0);
+    const rows = early.report[san.SAN_JOB_REPORT_COVERED_ROWS];
+
+    try testing.expectEqual(san.SAN_STATUS_INPUT_NEEDED, early.status);
+    try testing.expect(rows > 0 and rows < 16);
+    try testing.expectEqual(1, early.report[san.SAN_JOB_REPORT_REVISION]);
+    try testing.expectEqual(
+        rows,
+        early.report[san.SAN_JOB_REPORT_DECODED_ROWS],
+    );
+
+    try expectGeometry(striped_geometry, early.report);
+    try decoding.expectRows(early.report, @intCast(rows));
+
+    // A step without new bytes publishes nothing.
+    const idle = decoding.step();
+
+    try testing.expectEqual(san.SAN_STATUS_INPUT_NEEDED, idle.status);
+    try testing.expectEqual(early.report, idle.report);
+
+    // The released payload completes the image in the same lease.
+    const whole_image = try decoding.advance(decoding.rest(), 0);
+
+    try testing.expectEqual(san.SAN_STATUS_INPUT_NEEDED, whole_image.status);
+
+    try testing.expectEqual(
+        early.report[san.SAN_JOB_REPORT_LEASE],
+        whole_image.report[san.SAN_JOB_REPORT_LEASE],
+    );
+
+    try testing.expectEqual(2, whole_image.report[san.SAN_JOB_REPORT_REVISION]);
+    try decoding.expectRows(whole_image.report, 16);
+
+    // The image passed every check, and the job completes only with the
+    // end of its input.
+    const ended = try decoding.advance(0, 1);
+
+    try testing.expectEqual(san.SAN_STATUS_OK, ended.status);
+    try testing.expectEqual(whole_image.report, ended.report);
+    try decoding.drop(ended.report);
+    try decoding.stop();
+}
+
+test "a truncation after early output keeps the published rows" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    const early = try decoding.advance(decoding.bytes.len * 2 / 3, 0);
+    const rows = early.report[san.SAN_JOB_REPORT_COVERED_ROWS];
+
+    const ended = try decoding.advance(0, 1);
+
+    try testing.expectEqual(san.SAN_STATUS_TRUNCATED_CONTENT, ended.status);
+    try testing.expectEqual(early.report, ended.report);
+    try decoding.expectRows(ended.report, @intCast(rows));
+    try decoding.drop(ended.report);
+    try decoding.stop();
+}
+
+test "a cancellation after early output repeats the last publication" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    const early = try decoding.advance(decoding.bytes.len * 2 / 3, 0);
+    const rows = early.report[san.SAN_JOB_REPORT_COVERED_ROWS];
+
+    // The canceled step consumes none of the bytes that wait for it.
+    try testing.expectEqual(san.SAN_STATUS_OK, feedBytes(
+        &decoding.state,
+        decoding.content,
+        @intCast(decoding.fed),
+        decoding.bytes[decoding.fed..],
+        1,
+    ));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        cancelJob(&decoding.state, decoding.job),
+    );
+
+    const canceled = decoding.step();
+
+    try testing.expectEqual(san.SAN_STATUS_CANCELED, canceled.status);
+    try testing.expectEqual(early.report, canceled.report);
+    try decoding.expectRows(canceled.report, @intCast(rows));
+    try decoding.drop(canceled.report);
+    try decoding.stop();
+}
+
+test "a cancellation inside one feed ends the decode within one row" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    // The request comes when the admission step takes the lease, inside
+    // the decoder's feed, and the decoder observes it after its first
+    // row, which the canceled step does not publish.
+    decoding.canceling.job = decoding.job;
+    decoding.canceling.at_len = striped_lease_bytes;
+
+    const canceled = try decoding.advance(decoding.rest(), 1);
+
+    try testing.expectEqual(1, decoding.canceling.requests);
+    try testing.expectEqual(san.SAN_STATUS_CANCELED, canceled.status);
+
+    try testing.expectEqual(
+        san.SAN_NO_HANDLE,
+        canceled.report[san.SAN_JOB_REPORT_LEASE],
+    );
+
+    const report = canceled.report;
+
+    try testing.expectEqual(0, report[san.SAN_JOB_REPORT_REVISION]);
+    try testing.expectEqual(0, report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+    try testing.expectEqual(1, report[san.SAN_JOB_REPORT_DECODED_ROWS]);
+    try expectGeometry(striped_geometry, report);
+
+    // The codec context and the unpublished lease are gone.
+    const counted = try decoding.counters();
+
+    try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+    try testing.expectEqual(0, counted[output_bytes]);
+    try testing.expectEqual(own_blocks + 1, decoding.backing.blocks);
+    try decoding.expectSettled();
+    try decoding.stop();
+}
+
+test "a held lease outlives its content, its job, and the first shutdown" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    const early = try decoding.advance(decoding.bytes.len * 2 / 3, 0);
+    const rows: u32 = @intCast(early.report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        closeContent(&decoding.state, decoding.content),
+    );
+
+    try testing.expectEqual(
+        san.SAN_STATUS_CLOSED,
+        decoding.step().status,
+    );
+
+    try decoding.expectRows(early.report, rows);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        releaseJob(&decoding.state, decoding.job),
+    );
+
+    // The lease alone keeps the shutdown pending, and its release works
+    // while the engine closes.
+    for (0..2) |_| {
+        try testing.expectEqual(
+            san.SAN_STATUS_PENDING,
+            shutdown(&decoding.state, decoding.engine),
+        );
+    }
+
+    try decoding.expectRows(early.report, rows);
+    try decoding.drop(early.report);
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        shutdown(&decoding.state, decoding.engine),
+    );
+
+    try testing.expectEqual(0, decoding.backing.blocks);
+
+    // The handle of the lease died with its engine.
+    try testing.expectEqual(
+        san.SAN_STATUS_INVALID_HANDLE,
+        decoding.release(early.report),
+    );
+}
+
+test "bytes after the image end the job as InvalidContent" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, whole);
+    defer decoding.deinit();
+
+    const whole_image = try decoding.advance(decoding.rest(), 0);
+
+    try testing.expectEqual(san.SAN_STATUS_INPUT_NEEDED, whole_image.status);
+
+    try testing.expectEqual(san.SAN_STATUS_OK, feedBytes(
+        &decoding.state,
+        decoding.content,
+        @intCast(decoding.fed),
+        "x",
+        1,
+    ));
+
+    const trailing = decoding.step();
+
+    try testing.expectEqual(san.SAN_STATUS_INVALID_CONTENT, trailing.status);
+    try testing.expectEqual(whole_image.report, trailing.report);
+    try decoding.drop(trailing.report);
+    try decoding.stop();
+}
+
+test "rows publish before a failed check of the image data discredits them" {
+    // One IDAT chunk holds the whole image. libpng checks the CRC of a
+    // chunk after it handled the data of the chunk, so every row decodes
+    // before the CRC fails. The checksum of the stream fails in the call
+    // of zlib that yields the last row, and the pinned libpng raises
+    // that failure before it delivers the row; a library that delivered
+    // it first would cover all sixteen.
+    const Case = struct { faults: fixtures.Faults, least: u32 };
+
+    const cases = [_]Case{
+        .{ .faults = .{ .crc = "IDAT".* }, .least = 16 },
+        .{ .faults = .{ .adler32 = .wrong }, .least = 15 },
+    };
+
+    for (cases) |case| {
+        var spec = striped;
+
+        spec.idat_size = 0;
+        spec.faults = case.faults;
+
+        var decoding: Decoding = undefined;
+
+        try decoding.start(spec, roomy, whole);
+        defer decoding.deinit();
+
+        const stepped = try decoding.advance(decoding.rest(), 1);
+
+        const rows: u32 =
+            @intCast(stepped.report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+
+        // The rows stay covered, and the job never completes.
+        try testing.expectEqual(san.SAN_STATUS_INVALID_CONTENT, stepped.status);
+        try testing.expectEqual(1, stepped.report[san.SAN_JOB_REPORT_REVISION]);
+        try testing.expect(rows >= case.least and rows <= 16);
+        try testing.expectEqual(rows, stepped.report[san.SAN_JOB_REPORT_DECODED_ROWS]);
+        try decoding.expectRows(stepped.report, rows);
+        try decoding.drop(stepped.report);
+        try decoding.stop();
+    }
+}
+
+/// One refusal of the admission step for the striped image.
+const Refused = struct {
+    limit: ?[]const u8 = null,
+    value: i64 = 0,
+    request: san.san_output_request = whole,
+    status: san.san_status,
+    geometry: Geometry,
+};
+
+fn regionOf(right: i32, bottom: i32) san.san_output_request {
+    return .{
+        .left = 0,
+        .top = 0,
+        .right = right,
+        .bottom = bottom,
+        .max_output_width = 0,
+    };
+}
+
+const striped_without_lease: Geometry = .{
+    .image = .{ 8, 16 },
+    .grid = .{ 8, 16 },
+};
+
+const refusals = [_]Refused{
+    // An image limit refuses before any geometry.
+    .{
+        .limit = "image_axis_pixels",
+        .value = 15,
+        .status = san.SAN_STATUS_BUDGET_EXCEEDED,
+        .geometry = .{},
+    },
+    .{
+        .limit = "image_area_pixels",
+        .value = 127,
+        .status = san.SAN_STATUS_BUDGET_EXCEEDED,
+        .geometry = .{},
+    },
+    // A lease beyond its ceiling reports the image and the grid, so that
+    // a request that fits can follow.
+    .{
+        .limit = "output_lease_bytes",
+        .value = striped_lease_bytes - 1,
+        .status = san.SAN_STATUS_BUDGET_EXCEEDED,
+        .geometry = striped_without_lease,
+    },
+    .{
+        .limit = "output_bytes",
+        .value = striped_lease_bytes - 1,
+        .status = san.SAN_STATUS_BUDGET_EXCEEDED,
+        .geometry = striped_without_lease,
+    },
+    // A region past the image, and one inside it that is not whole.
+    .{
+        .request = regionOf(9, 16),
+        .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
+        .geometry = striped_without_lease,
+    },
+    .{
+        .request = regionOf(8, 15),
+        .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
+        .geometry = striped_without_lease,
+    },
+    // A largest output width below the image width, with its grid.
+    .{
+        .request = .{
+            .left = 0,
+            .top = 0,
+            .right = 0,
+            .bottom = 0,
+            .max_output_width = 4,
+        },
+        .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
+        .geometry = .{ .image = .{ 8, 16 }, .grid = .{ 4, 8 } },
+    },
+    // The region decides before the ceiling of the lease.
+    .{
+        .limit = "output_lease_bytes",
+        .value = striped_lease_bytes - 1,
+        .request = regionOf(9, 16),
+        .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
+        .geometry = striped_without_lease,
+    },
+};
+
+test "each refusal of the admission step reports its geometry" {
+    inline for (refusals) |refused| {
+        var limits = roomy;
+
+        if (refused.limit) |name| @field(limits, name) = refused.value;
+
+        var decoding: Decoding = undefined;
+
+        try decoding.start(striped, limits, refused.request);
+        defer decoding.deinit();
+
+        const stepped = try decoding.advance(decoding.rest(), 1);
+
+        try testing.expectEqual(refused.status, stepped.status);
+        try expectGeometry(refused.geometry, stepped.report);
+
+        try testing.expectEqual(
+            san.SAN_NO_HANDLE,
+            stepped.report[san.SAN_JOB_REPORT_LEASE],
+        );
+
+        try testing.expectEqual(0, stepped.report[san.SAN_JOB_REPORT_REVISION]);
+        try testing.expectEqual(0, stepped.report[san.SAN_JOB_REPORT_DECODED_ROWS]);
+
+        // The refusal kept nothing of the decode.
+        const counted = try decoding.counters();
+
+        try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+        try testing.expectEqual(0, counted[output_bytes]);
+        try testing.expectEqual(own_blocks + 1, decoding.backing.blocks);
+        try decoding.expectSettled();
+        try decoding.stop();
+    }
+}
+
+test "the limits and the whole region at their bounds admit the image" {
+    const Admitted = struct {
+        limit: ?[]const u8 = null,
+        value: i64 = 0,
+        request: san.san_output_request = whole,
+    };
+
+    const cases = comptime [_]Admitted{
+        .{ .limit = "image_axis_pixels", .value = 16 },
+        .{ .limit = "image_area_pixels", .value = 128 },
+        .{ .limit = "output_lease_bytes", .value = striped_lease_bytes },
+        .{ .limit = "output_bytes", .value = striped_lease_bytes },
+        .{ .request = regionOf(8, 16) },
+        .{ .request = .{
+            .left = 0,
+            .top = 0,
+            .right = 0,
+            .bottom = 0,
+            .max_output_width = 8,
+        } },
+    };
+
+    inline for (cases) |case| {
+        var limits = roomy;
+
+        if (case.limit) |name| @field(limits, name) = case.value;
+
+        var decoding: Decoding = undefined;
+
+        try decoding.start(striped, limits, case.request);
+        defer decoding.deinit();
+
+        const stepped = try decoding.advance(decoding.rest(), 1);
+
+        try testing.expectEqual(san.SAN_STATUS_OK, stepped.status);
+        try expectGeometry(striped_geometry, stepped.report);
+        try decoding.expectRows(stepped.report, 16);
+        try decoding.drop(stepped.report);
+        try decoding.stop();
+    }
+}
+
+test "a PNG of another variant ends the job as UnsupportedFormat" {
+    const specs = [_]fixtures.Spec{
+        .{ .width = 4, .height = 2, .format = .gray8 },
+        .{ .width = 4, .height = 2, .format = .rgba8 },
+        .{ .width = 4, .height = 2, .format = .palette8 },
+        .{ .width = 4, .height = 2, .interlaced = true },
+        // Its rows are RGB samples of 8 bits, and a tRNS chunk makes one
+        // color transparent, which an opaque lease would lose.
+        .{ .width = 4, .height = 2, .before = &.{fixtures.trns_rgb} },
+    };
+
+    for (specs) |spec| {
+        var decoding: Decoding = undefined;
+
+        try decoding.start(spec, roomy, whole);
+        defer decoding.deinit();
+
+        const stepped = try decoding.advance(decoding.rest(), 1);
+
+        try testing.expectEqual(san.SAN_STATUS_UNSUPPORTED_FORMAT, stepped.status);
+        try testing.expectEqual(@as(Report, @splat(0)), stepped.report);
+        try decoding.stop();
+    }
+}
+
+test "a representation beyond the length ceiling ends as BudgetExceeded" {
+    var limits = roomy;
+
+    var decoding: Decoding = undefined;
+
+    // The ceiling cuts the image two thirds into its bytes.
+    {
+        const bytes = try fixtures.encode(testing.allocator, striped);
+        defer testing.allocator.free(bytes);
+
+        limits.content_length_bytes = @intCast(bytes.len * 2 / 3);
+    }
+
+    try decoding.start(striped, limits, whole);
+    defer decoding.deinit();
+
+    const stepped = try decoding.advance(decoding.rest(), 1);
+    const rows = stepped.report[san.SAN_JOB_REPORT_COVERED_ROWS];
+
+    // The bytes before the ceiling decoded, and their rows publish with
+    // the terminal outcome.
+    try testing.expectEqual(san.SAN_STATUS_BUDGET_EXCEEDED, stepped.status);
+    try testing.expect(rows > 0 and rows < 16);
+    try decoding.expectRows(stepped.report, @intCast(rows));
+    try decoding.drop(stepped.report);
+    try decoding.stop();
+}
+
+test "every failed allocation of a decode ends the job and settles" {
+    var failures: usize = 0;
+
+    for (0..64) |fail_index| {
+        var decoding: Decoding = undefined;
+
+        try decoding.start(striped, roomy, whole);
+        defer decoding.deinit();
+
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+
+        decoding.backing.gpa = failing.allocator();
+
+        const stepped = try decoding.advance(decoding.rest(), 1);
+
+        decoding.backing.gpa = testing.allocator;
+
+        if (stepped.status == san.SAN_STATUS_OK) {
+            // No allocation of the decode has this index: every one
+            // before it failed once.
+            try decoding.expectRows(stepped.report, 16);
+            try decoding.drop(stepped.report);
+            try decoding.stop();
+
+            break;
+        }
+
+        failures += 1;
+
+        try testing.expectEqual(san.SAN_STATUS_ALLOCATION_FAILED, stepped.status);
+
+        // A failure after the first rows leaves their lease to its
+        // caller, and one before them leaves none.
+        if (stepped.report[san.SAN_JOB_REPORT_LEASE] != san.SAN_NO_HANDLE) {
+            try decoding.drop(stepped.report);
+        }
+
+        const counted = try decoding.counters();
+
+        try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+        try testing.expectEqual(0, counted[output_bytes]);
+        try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES]);
+        try testing.expectEqual(own_blocks + 1, decoding.backing.blocks);
+        try decoding.expectSettled();
+        try decoding.stop();
+    } else return error.TestUnexpectedResult;
+
+    // The decoder object, libpng's structs, its row buffers, zlib's state
+    // and window, and the lease, each failed once.
+    try testing.expect(failures > 6);
 }

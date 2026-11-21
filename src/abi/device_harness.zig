@@ -8,9 +8,14 @@
 //! established, the binding, the limits, one engine and the handles that
 //! do not name it, the functions that reject every handle, the contents
 //! of an engine, a job from its request to its release with a pending
-//! shutdown, cancellations that race the step of their job, a run of
-//! engines one after another, and creations that race from several
-//! threads.
+//! shutdown, one decode with the lease that outlives it, early output
+//! with the outcomes that keep it, cancellations that race the step of
+//! their job, a run of engines one after another, and creations that
+//! race from several threads.
+//!
+//! The decodes read an image that is built at compile time, and they
+//! check the reports and the counters. The copy that reads a lease is
+//! not implemented yet, so no case reads a pixel.
 //!
 //! The harness prints one line per case, ending in `ok` or `FAIL`, then
 //! a summary. It exits 0 only when every case passes, 1 when a case
@@ -18,6 +23,7 @@
 
 const std = @import("std");
 const san = @import("san");
+const tiny = @import("tiny_png");
 
 pub const panic = @import("engine").android_panic;
 
@@ -112,6 +118,8 @@ pub fn main(init: std.process.Init) !u8 {
     try harness.case("no content, job, or lease", noOtherHandle());
     try harness.case("contents", contents());
     try harness.case("one job", oneJob());
+    try harness.case("one decode", oneDecode());
+    try harness.case("early output", earlyOutput());
     try harness.case("racing cancellations", try racingCancellations());
     try harness.case("engines in turn", enginesInTurn());
     try harness.case("racing creations", try racingCreations());
@@ -503,9 +511,9 @@ fn oneJob() bool {
     if (san.san_job_release(job) !=
         san.SAN_STATUS_BINDING_MISMATCH) return false;
 
-    // No decode exists, so the first step ends the job, and a rejected
-    // step writes no element.
-    if (!steps(job, san.SAN_STATUS_ENGINE_FAILURE, 0)) return false;
+    // The byte is no PNG signature, so the first step ends the job, and
+    // a rejected step writes no element.
+    if (!steps(job, san.SAN_STATUS_INVALID_CONTENT, 0)) return false;
     if (!steps(job, san.SAN_STATUS_CLOSED, unwritten)) return false;
     if (!counts(engine, 1, 0)) return false;
 
@@ -538,6 +546,191 @@ fn oneJob() bool {
         rejects(job) and rejects(content);
 }
 
+/// The bytes of the lease of the tiny image with their block header.
+const tiny_lease_bytes = tiny.width * tiny.height * 4 + block_header;
+
+/// A content of an engine with its job.
+const Decode = struct {
+    content: san.san_handle,
+    job: san.san_handle,
+
+    /// Opens a content in `engine`, requests its job for the whole
+    /// image, and feeds `bytes` in one portion, with or without the end
+    /// of the input. Returns null when a call fails.
+    fn start(
+        engine: san.san_handle,
+        bytes: []const u8,
+        end_of_input: i32,
+    ) ?Decode {
+        const content = openContent(engine) orelse return null;
+
+        const job = requestJob(content) orelse return null;
+
+        const length: i32 = @intCast(bytes.len);
+
+        if (san.san_content_feed(content, 0, bytes.ptr, length, end_of_input) !=
+            san.SAN_STATUS_OK) return null;
+
+        return .{ .content = content, .job = job };
+    }
+
+    /// Reports whether the job and the content end their handles.
+    fn finish(decode: Decode) bool {
+        return san.san_job_release(decode.job) == san.SAN_STATUS_OK and
+            san.san_content_close(decode.content) == san.SAN_STATUS_OK;
+    }
+};
+
+/// Reports whether `report` holds the geometry of the tiny image, whole
+/// and at a scale of 1:1, in a lease without alpha that publishes early,
+/// and no warning.
+fn admitsTiny(report: Report) bool {
+    const expected = [_]struct { usize, i64 }{
+        .{ san.SAN_JOB_REPORT_IMAGE_WIDTH, tiny.width },
+        .{ san.SAN_JOB_REPORT_IMAGE_HEIGHT, tiny.height },
+        .{ san.SAN_JOB_REPORT_OUTPUT_WIDTH, tiny.width },
+        .{ san.SAN_JOB_REPORT_OUTPUT_HEIGHT, tiny.height },
+        .{ san.SAN_JOB_REPORT_LEASE_WIDTH, tiny.width },
+        .{ san.SAN_JOB_REPORT_LEASE_HEIGHT, tiny.height },
+        .{ san.SAN_JOB_REPORT_LEASE_LEFT, 0 },
+        .{ san.SAN_JOB_REPORT_LEASE_TOP, 0 },
+        .{ san.SAN_JOB_REPORT_ALPHA, san.SAN_ALPHA_OPAQUE },
+        .{ san.SAN_JOB_REPORT_EARLY_PUBLICATION, 1 },
+        .{ san.SAN_JOB_REPORT_WARNINGS, 0 },
+    };
+
+    for (expected) |element| {
+        const at, const value = element;
+
+        if (report[at] != value) return false;
+    }
+
+    return true;
+}
+
+/// Reports whether `report` names a lease at `revision` that covers
+/// `rows` rows, all of which the job decoded.
+fn publishes(report: Report, revision: i64, rows: i64) bool {
+    const lease = report[san.SAN_JOB_REPORT_LEASE];
+
+    return lease != san.SAN_NO_HANDLE and lease != unwritten and
+        report[san.SAN_JOB_REPORT_REVISION] == revision and
+        report[san.SAN_JOB_REPORT_COVERED_ROWS] == rows and
+        report[san.SAN_JOB_REPORT_DECODED_ROWS] == rows;
+}
+
+/// Reports whether `engine` counts `leased` live leases that hold
+/// `bytes` bytes of output. The read works while the engine shuts down.
+fn leases(engine: san.san_handle, leased: i64, bytes: i64) bool {
+    var counters: [san.SAN_ENGINE_COUNTERS_LENGTH]i64 = @splat(unwritten);
+
+    if (san.san_engine_counters(engine, 0, &counters) !=
+        san.SAN_STATUS_OK) return false;
+
+    return counters[san.SAN_ENGINE_COUNTERS_LEASE_COUNT] == leased and
+        counters[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] == bytes;
+}
+
+/// Reports whether an image decodes in one step into a lease that its
+/// report names, and whether that lease outlives its job and its content
+/// and holds the shutdown of its engine pending until its release.
+fn oneDecode() bool {
+    const engine = createEngine() orelse return false;
+
+    const decode = Decode.start(engine, &tiny.bytes, 1) orelse return false;
+
+    var report = unstepped;
+
+    if (san.san_job_step(decode.job, &report) !=
+        san.SAN_STATUS_OK) return false;
+
+    if (!publishes(report, 1, tiny.height) or !admitsTiny(report)) return false;
+
+    const lease = report[san.SAN_JOB_REPORT_LEASE];
+
+    if (!decode.finish() or !leases(engine, 1, tiny_lease_bytes)) return false;
+
+    // The lease alone keeps the engine closing, and its release works
+    // there.
+    for (0..2) |_| {
+        if (san.san_engine_shutdown(engine) !=
+            san.SAN_STATUS_PENDING) return false;
+    }
+
+    if (san.san_output_release(lease) != san.SAN_STATUS_OK) return false;
+
+    if (san.san_output_release(lease) !=
+        san.SAN_STATUS_INVALID_HANDLE) return false;
+
+    return leases(engine, 0, 0) and
+        san.san_engine_shutdown(engine) == san.SAN_STATUS_OK;
+}
+
+/// Reports whether rows publish before the end of their image, and
+/// whether an input that ends early, a failed check of the image data,
+/// and a cancellation each keep the published rows in a lease that the
+/// caller releases. The failed check leaves the decoder through its
+/// error path.
+fn earlyOutput() bool {
+    const engine = createEngine() orelse return false;
+
+    // The input holds two of the three rows.
+    const two_rows = comptime tiny.through(2);
+
+    const cut = Decode.start(engine, tiny.bytes[0..two_rows], 0) orelse
+        return false;
+
+    var early = unstepped;
+
+    if (san.san_job_step(cut.job, &early) !=
+        san.SAN_STATUS_INPUT_NEEDED) return false;
+
+    if (!publishes(early, 1, 2) or !admitsTiny(early)) return false;
+
+    // The end of the input before the image repeats the publication.
+    if (san.san_content_feed(cut.content, two_rows, null, 0, 1) !=
+        san.SAN_STATUS_OK) return false;
+
+    var ended = unstepped;
+
+    if (san.san_job_step(cut.job, &ended) !=
+        san.SAN_STATUS_TRUNCATED_CONTENT) return false;
+
+    if (!std.mem.eql(i64, &early, &ended)) return false;
+    if (!cut.finish()) return false;
+
+    if (san.san_output_release(early[san.SAN_JOB_REPORT_LEASE]) !=
+        san.SAN_STATUS_OK) return false;
+
+    // A wrong CRC of the image data fails after every row decoded, and
+    // the rows publish with the failure.
+    var corrupt = tiny.bytes;
+
+    corrupt[tiny.data_crc_at] ^= 1;
+
+    const failed = Decode.start(engine, &corrupt, 1) orelse return false;
+
+    var invalid = unstepped;
+
+    if (san.san_job_step(failed.job, &invalid) !=
+        san.SAN_STATUS_INVALID_CONTENT) return false;
+
+    if (!publishes(invalid, 1, tiny.height) or !failed.finish()) return false;
+
+    if (san.san_output_release(invalid[san.SAN_JOB_REPORT_LEASE]) !=
+        san.SAN_STATUS_OK) return false;
+
+    // A step that starts canceled consumes nothing and names no lease.
+    const canceled = Decode.start(engine, &tiny.bytes, 1) orelse return false;
+
+    if (san.san_job_cancel(canceled.job) != san.SAN_STATUS_OK) return false;
+    if (!steps(canceled.job, san.SAN_STATUS_CANCELED, 0)) return false;
+    if (!canceled.finish()) return false;
+
+    return counts(engine, 0, 0) and leases(engine, 0, 0) and
+        san.san_engine_shutdown(engine) == san.SAN_STATUS_OK;
+}
+
 /// One cancellation from another thread, and what it returned.
 const Cancellation = struct {
     job: san.san_handle,
@@ -556,14 +749,16 @@ fn cancelAtOnce(cancellation: *Cancellation) void {
 
 /// Reports whether, in every round, a cancellation that races the step
 /// of its job finds the job, and the step ends the job with one terminal
-/// outcome, as canceled or as an engine failure.
+/// outcome: it completes the image and names its lease, or it is
+/// canceled and publishes nothing.
 fn racingCancellations() !bool {
     const engine = createEngine() orelse return false;
 
     for (0..cancel_rounds) |_| {
-        const content = openContent(engine) orelse return false;
+        const decode = Decode.start(engine, &tiny.bytes, 1) orelse
+            return false;
 
-        const job = requestJob(content) orelse return false;
+        const job = decode.job;
 
         var cancellation: Cancellation = .{ .job = job };
         var report = unstepped;
@@ -583,16 +778,29 @@ fn racingCancellations() !bool {
 
         if (cancellation.status != san.SAN_STATUS_OK) return false;
 
-        if (status != san.SAN_STATUS_CANCELED and
-            status != san.SAN_STATUS_ENGINE_FAILURE) return false;
+        const lease = report[san.SAN_JOB_REPORT_LEASE];
 
-        if (!std.mem.allEqual(i64, &report, 0)) return false;
+        switch (status) {
+            san.SAN_STATUS_OK => {
+                if (!publishes(report, 1, tiny.height)) return false;
+
+                if (san.san_output_release(lease) !=
+                    san.SAN_STATUS_OK) return false;
+            },
+            // The codec may have written rows before it observed the
+            // flag, and the step publishes none of them.
+            san.SAN_STATUS_CANCELED => {
+                if (lease != san.SAN_NO_HANDLE or
+                    report[san.SAN_JOB_REPORT_COVERED_ROWS] != 0) return false;
+            },
+            else => return false,
+        }
+
         if (!steps(job, san.SAN_STATUS_CLOSED, unwritten)) return false;
-        if (san.san_job_release(job) != san.SAN_STATUS_OK) return false;
-        if (san.san_content_close(content) != san.SAN_STATUS_OK) return false;
+        if (!decode.finish()) return false;
     }
 
-    return counts(engine, 0, 0) and
+    return counts(engine, 0, 0) and leases(engine, 0, 0) and
         san.san_engine_shutdown(engine) == san.SAN_STATUS_OK;
 }
 

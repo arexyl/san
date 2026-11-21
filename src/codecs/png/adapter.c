@@ -240,6 +240,8 @@ static void san_png_read_header( png_const_structrp png, png_const_inforp info,
   header->interlace  = png_get_interlace_type( png, info );
   header->channels   = png_get_channels( png, info );
 
+  header->transparency = png_get_valid( png, info, PNG_INFO_tRNS ) != 0;
+
   /* At most 2^31 - 1 pixels of 64 bits: no overflow. */
   bits = ( uint64_t ) header->width * header->channels * header->bit_depth;
   header->row_bytes = ( bits + 7 ) / 8;

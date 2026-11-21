@@ -76,6 +76,9 @@ pub const Category = enum(u32) {
     invalid_content,
     truncated_content,
     unsupported_format,
+    /// A sink refused the output that its owner requested. The sink of
+    /// the device test refuses none.
+    unsupported_operation,
     budget_exceeded,
     allocation_failed,
     canceled,
@@ -90,6 +93,7 @@ pub const Category = enum(u32) {
             error.InvalidContent => .invalid_content,
             error.TruncatedContent => .truncated_content,
             error.UnsupportedFormat => .unsupported_format,
+            error.UnsupportedOperation => .unsupported_operation,
             error.BudgetExceeded => .budget_exceeded,
             error.AllocationFailed => .allocation_failed,
             error.Canceled => .canceled,

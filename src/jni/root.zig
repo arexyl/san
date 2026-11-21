@@ -549,6 +549,7 @@ fn entryAt(comptime descriptor: []const u8, comptime start: usize) ?Entry {
 const testing = std.testing;
 const bindings = @import("bindings");
 const table = @import("table");
+const tiny = @import("tiny_png");
 const fake = @import("fake.zig");
 
 /// A value that no method writes, so that a test sees whether a call
@@ -838,7 +839,7 @@ test "the methods convert their arguments and run the lifecycle" {
 
         for (counted) |element| try testing.expect(element != unwritten);
 
-        // The engine's own state is its three blocks, of the metadata kind.
+        // The engine's own state is its four blocks, of the metadata kind.
         const live = counted[san.SAN_ENGINE_COUNTERS_LIVE_BYTES];
 
         try testing.expect(live > 0);
@@ -920,10 +921,74 @@ test "the methods convert their arguments and run the lifecycle" {
     try testing.expectEqual(0, env.forbidden_calls);
 }
 
+/// The image that the decodes of the limits test read, and the bytes of
+/// its lease with their block header.
+const tiny_png = tiny.bytes;
+const tiny_lease_bytes = tiny.width * tiny.height * 4 + 16;
+
+/// Decodes `tiny_png` in a new content of `engine` through the
+/// registered methods of `env`, in one portion with the end of the
+/// input, so that its one step ends the job. Releases the job and
+/// returns the status of the step with the lease that it names.
+fn decodeTiny(
+    env: *fake.Env,
+    engine: jni.jlong,
+) !struct { jni.jint, jni.jlong } {
+    const open = try methodOf(env, "contentOpen", contentOpen);
+    const feed = try methodOf(env, "contentFeed", contentFeed);
+    const request = try methodOf(env, "jobRequest", jobRequest);
+    const step = try methodOf(env, "jobStep", jobStep);
+    const release = try methodOf(env, "jobRelease", jobRelease);
+
+    const jenv = env.pointer();
+
+    var handle = [_]jni.jlong{unwritten};
+    var out: fake.Array = .{ .longs = &handle };
+
+    var report: [san.SAN_JOB_REPORT_LENGTH]jni.jlong = @splat(unwritten);
+    var report_array: fake.Array = .{ .longs = &report };
+
+    var bytes: [tiny_png.len]jni.jbyte = @bitCast(tiny_png);
+    var bytes_array: fake.Array = .{ .bytes = &bytes };
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        open(jenv, null, engine, out.object()),
+    );
+
+    const content = handle[0];
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        request(jenv, null, content, 0, 0, 0, 0, 0, out.object()),
+    );
+
+    const job = handle[0];
+
+    try testing.expectEqual(san.SAN_STATUS_OK, feed(
+        jenv,
+        null,
+        content,
+        0,
+        bytes_array.object(),
+        0,
+        tiny_png.len,
+        jni.JNI_TRUE,
+    ));
+
+    const status = step(jenv, null, job, report_array.object());
+
+    try testing.expectEqual(san.SAN_STATUS_OK, release(jenv, null, job));
+
+    return .{ status, report[san.SAN_JOB_REPORT_LEASE] };
+}
+
 // The sixteen limits share one descriptor letter, so only what the
 // engine does with each value tells two parameters apart. The test
 // covers the limits that the engine enforces: the budget, the three
-// count limits, the input portion, and the metadata limit.
+// count limits, the input portion, and the metadata limit at the
+// creation of an engine and at its admissions, and the length ceiling,
+// the two image limits, and the two output ceilings at a decode.
 test "each enforced limit reaches the engine from its own parameter" {
     var env: fake.Env = .{};
 
@@ -935,7 +1000,9 @@ test "each enforced limit reaches the engine from its own parameter" {
     const open = try methodOf(&env, "contentOpen", contentOpen);
     const request = try methodOf(&env, "jobRequest", jobRequest);
     const step = try methodOf(&env, "jobStep", jobStep);
+    const cancel = try methodOf(&env, "jobCancel", jobCancel);
     const release = try methodOf(&env, "jobRelease", jobRelease);
+    const drop = try methodOf(&env, "outputRelease", outputRelease);
 
     const jenv = env.pointer();
 
@@ -1091,39 +1158,38 @@ test "each enforced limit reaches the engine from its own parameter" {
 
     // Each job gets its request after the refusal that only one limit
     // causes: none for the first, the one live lease for the second, and
-    // the two owned jobs for the third. The step of a job reclaims its
-    // lease and keeps its slot, and the release frees the slot.
+    // the two owned jobs for the third. The step of a canceled job
+    // reclaims its lease and keeps its slot, and the release frees the
+    // slot.
     for (&jobs, contents, 0..) |*job, content, at| {
         if (at != 0) {
             try testing.expectEqual(
                 san.SAN_STATUS_BUDGET_EXCEEDED,
                 request(jenv, null, content, 0, 0, 0, 0, 0, out.object()),
             );
+
+            try testing.expectEqual(
+                san.SAN_STATUS_OK,
+                cancel(jenv, null, jobs[at - 1]),
+            );
+
+            try testing.expectEqual(
+                san.SAN_STATUS_CANCELED,
+                step(jenv, null, jobs[at - 1], report_array.object()),
+            );
         }
 
-        switch (at) {
-            0 => {},
-            1 => try testing.expectEqual(
-                san.SAN_STATUS_ENGINE_FAILURE,
-                step(jenv, null, jobs[0], report_array.object()),
-            ),
-            else => {
-                try testing.expectEqual(
-                    san.SAN_STATUS_ENGINE_FAILURE,
-                    step(jenv, null, jobs[1], report_array.object()),
-                );
+        if (at == 2) {
+            // Both jobs are terminal, and both still hold a slot.
+            try testing.expectEqual(
+                san.SAN_STATUS_BUDGET_EXCEEDED,
+                request(jenv, null, content, 0, 0, 0, 0, 0, out.object()),
+            );
 
-                // Both jobs are terminal, and both still hold a slot.
-                try testing.expectEqual(
-                    san.SAN_STATUS_BUDGET_EXCEEDED,
-                    request(jenv, null, content, 0, 0, 0, 0, 0, out.object()),
-                );
-
-                try testing.expectEqual(
-                    san.SAN_STATUS_OK,
-                    release(jenv, null, jobs[0]),
-                );
-            },
+            try testing.expectEqual(
+                san.SAN_STATUS_OK,
+                release(jenv, null, jobs[0]),
+            );
         }
 
         try testing.expectEqual(
@@ -1144,6 +1210,80 @@ test "each enforced limit reaches the engine from its own parameter" {
     }
 
     try testing.expectEqual(san.SAN_STATUS_OK, shutdown(jenv, null, engine));
+
+    // What two decodes of the image need of each limit that a decode
+    // reads, exactly, while the lease of the first is held. The five
+    // values differ, so any exchange among them puts a smaller value
+    // where a larger one is needed.
+    const length_at = limitAt("content_length_bytes");
+    const axis_at = limitAt("image_axis_pixels");
+    const area_at = limitAt("image_area_pixels");
+    const output_at = limitAt("output_bytes");
+    const lease_at = limitAt("output_lease_bytes");
+
+    var exact = limitsUnder(1 << 20);
+
+    exact[length_at] = tiny_png.len;
+    exact[axis_at] = tiny.height;
+    exact[area_at] = tiny.width * tiny.height;
+    exact[output_at] = 2 * tiny_lease_bytes;
+    exact[lease_at] = tiny_lease_bytes;
+
+    // The exact limits admit both decodes. One byte or pixel less in a
+    // limit refuses the first decode, and one byte less of all output
+    // refuses the second, whose lease the first one's leaves no room for.
+    const lowered = [_]?usize{
+        null,
+        length_at,
+        axis_at,
+        area_at,
+        lease_at,
+        output_at,
+    };
+
+    const admitted: jni.jint = san.SAN_STATUS_OK;
+    const refused: jni.jint = san.SAN_STATUS_BUDGET_EXCEEDED;
+
+    for (lowered) |at| {
+        var limits = exact;
+
+        if (at) |index| limits[index] -= 1;
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            try createWith(&env, limits, out.object()),
+        );
+
+        const decoding = handle[0];
+
+        const first_refused = at != null and at != output_at;
+        const second_refused = at != null;
+
+        const first_status, const first_lease = try decodeTiny(&env, decoding);
+        const second_status, const second_lease = try decodeTiny(&env, decoding);
+
+        try testing.expectEqual(
+            if (first_refused) refused else admitted,
+            first_status,
+        );
+
+        try testing.expectEqual(
+            if (second_refused) refused else admitted,
+            second_status,
+        );
+
+        for ([_]jni.jlong{ first_lease, second_lease }) |lease| {
+            if (lease == san.SAN_NO_HANDLE) continue;
+
+            try testing.expectEqual(san.SAN_STATUS_OK, drop(jenv, null, lease));
+        }
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            shutdown(jenv, null, decoding),
+        );
+    }
+
     try testing.expect(!env.pending);
     try testing.expectEqual(0, env.forbidden_calls);
 }

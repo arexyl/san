@@ -203,7 +203,7 @@ pub fn close(live: Live) void {
     // The end of the job removes its link to this content.
     switch (open_state.job) {
         .none, .ended => {},
-        .live => |job| job.end(),
+        .live => |job| job.end(live.engine),
     }
 
     live.engine.heap.free(open_state.staging.ptr);
@@ -265,6 +265,7 @@ const Process = struct {
             &process.binding,
             &process.slot,
             test_backing.backing(),
+            Engine.Codec.Scripted.opener,
             limits,
         );
     }
@@ -305,9 +306,9 @@ const Process = struct {
 /// The job slots of each engine of the tests below.
 const job_slots = 2;
 
-/// The blocks of an engine's own state: the engine, the slots of its
-/// contents, and the slots of its jobs.
-const own_blocks = 3;
+/// The blocks of an engine's own state: the engine and the slots of its
+/// contents, of its jobs, and of its leases.
+const own_blocks = 4;
 
 /// Returns limits of `count` contents of one portion each, with every
 /// other limit roomy.
@@ -329,7 +330,8 @@ fn limitsFor(count: i64) Engine.Limits {
 fn ownBytes(count: usize) u64 {
     return Heap.accounted(@sizeOf(Engine)).? +
         Heap.accounted(count * @sizeOf(Content)).? +
-        Heap.accounted(job_slots * @sizeOf(Job)).?;
+        Heap.accounted(job_slots * @sizeOf(Job)).? +
+        Heap.accounted(job_slots * @sizeOf(Engine.Lease)).?;
 }
 
 fn unpack(handle: Handle) handles.Slotted {
@@ -931,9 +933,10 @@ test "a feed after the terminal outcome of the job fails as Closed" {
     // A live job leaves its content open to input.
     try process.feedContent(content, 0, "abc", false);
 
-    const outcome = Job.step(try Job.resolve(&process.slot, job));
+    // The scripted codec of the engine reads no command in these bytes.
+    const stepped = Job.step(try Job.resolve(&process.slot, job));
 
-    try testing.expectEqual(.engine_failure, outcome);
+    try testing.expectEqual(.invalid_content, stepped.outcome);
 
     const before = (try openOf(&process, content)).*;
 

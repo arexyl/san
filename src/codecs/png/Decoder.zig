@@ -20,18 +20,24 @@
 //! the adapter's status. Every terminal outcome destroys the codec context
 //! at once, so its memory returns to the heap before the outcome reaches
 //! the caller.
+//!
+//! `opener` gives the decoder the form of the codec of an engine's job:
+//! a decoder in a block of the heap, which delivers the one variant that
+//! this build decodes, opaque RGB samples of 8 bits, to the target of
+//! the job.
 
 const std = @import("std");
 const c = @import("adapter");
-const Heap = @import("engine").Heap;
+const engine = @import("engine");
+
+const Codec = engine.Codec;
+const Heap = engine.Heap;
 
 const Decoder = @This();
 
 heap: *Heap,
 sink: Sink,
-/// The cancellation flag of the decode's owner, which another thread may
-/// set at any time.
-cancel: *const std.atomic.Value(bool),
+cancel: Cancel,
 /// The codec context until a terminal outcome.
 codec: ?*c.san_png_decoder = null,
 /// The cause of the stop verdict that a callback returned during the
@@ -42,26 +48,20 @@ image: ?Header = null,
 /// The adapter's records after the latest call.
 records: Report = .{},
 
-/// The causes with which a callback stops the decode.
-pub const Stop = error{
-    /// The owner canceled the decode.
-    Canceled,
-    /// The sink cannot admit the image or its output within the limits.
-    BudgetExceeded,
-    /// The decoder or the sink cannot decode this variant of PNG.
-    UnsupportedFormat,
-};
+/// The cancellation flag of the decode's owner, which another thread may
+/// set at any time.
+pub const Cancel = Codec.Cancel;
 
-/// The failures of a decode, by category.
-pub const Error = Heap.Refusal || Stop || error{
-    /// The input violates the format or San's strictness rules.
-    InvalidContent,
-    /// The input completed before IEND.
-    TruncatedContent,
-    /// The codec context could not be set up, or the adapter answered
-    /// what this decoder never asks for.
-    EngineFailure,
-};
+/// The causes with which a callback stops the decode: the refusal of a
+/// target that admits no such image, a cancellation, or a variant of PNG
+/// that the decoder or the sink does not decode.
+pub const Stop = Codec.Refusal || error{ Canceled, UnsupportedFormat };
+
+/// The failures of a decode, by category: the stop causes, an input that
+/// violates the format or San's strictness rules, an input that completed
+/// before IEND, and a codec context that could not be set up or an answer
+/// of the adapter that this decoder never asks for.
+pub const Error = Codec.Error;
 
 /// What a fed portion leaves the decode needing.
 pub const Progress = enum {
@@ -91,6 +91,9 @@ pub const Header = struct {
     color_type: u8,
     interlaced: bool,
     channels: u8,
+    /// Whether a tRNS chunk gives the image transparency that its rows
+    /// do not carry. The value is final at the header callback.
+    transparency: bool,
     /// The bytes of one row without its filter byte.
     row_bytes: u64,
 
@@ -102,8 +105,17 @@ pub const Header = struct {
             .color_type = record.color_type,
             .interlaced = record.interlace != 0,
             .channels = record.channels,
+            .transparency = record.transparency != 0,
             .row_bytes = record.row_bytes,
         };
+    }
+
+    /// Reports whether the rows alone are the image as opaque RGB
+    /// samples of 8 bits: color type 2 of the PNG specification at a bit
+    /// depth of 8, without a transparent color beside them.
+    pub fn isOpaqueRgb8(found: Header) bool {
+        return found.color_type == 2 and found.bit_depth == 8 and
+            !found.transparency;
     }
 };
 
@@ -151,7 +163,7 @@ pub fn init(
     decoder: *Decoder,
     heap: *Heap,
     sink: Sink,
-    cancel: *const std.atomic.Value(bool),
+    cancel: Cancel,
 ) Error!void {
     decoder.* = .{ .heap = heap, .sink = sink, .cancel = cancel };
 
@@ -357,15 +369,109 @@ fn hookRow(
     decoder.sink.row(decoder.sink.ctx, index, bytes[0..len]) catch |cause|
         return decoder.stopWith(cause);
 
-    if (decoder.cancel.load(.acquire)) return decoder.stopWith(error.Canceled);
+    if (decoder.cancel.requested()) return decoder.stopWith(error.Canceled);
 
     return c.SAN_PNG_CONTINUE;
 }
 
+/// The opener of PNG decoders for the jobs of an engine.
+pub const opener: Codec.Opener = .{ .ptr = undefined, .open = open };
+
+/// A decoder as the codec of a job. It lies in a block of the job's
+/// heap, so that it stays in place for the adapter's callbacks.
+const Opened = struct {
+    decoder: Decoder,
+    target: Codec.Target,
+
+    const vtable: Codec.VTable = .{
+        .feed = feedCodec,
+        .finish = finishCodec,
+        .destroy = destroy,
+    };
+
+    fn of(ptr: *anyopaque) *Opened {
+        return @ptrCast(@alignCast(ptr));
+    }
+
+    fn feedCodec(ptr: *anyopaque, bytes: []const u8) Error!void {
+        _ = try of(ptr).decoder.feed(bytes);
+    }
+
+    fn finishCodec(ptr: *anyopaque) Error!void {
+        return of(ptr).decoder.finish();
+    }
+
+    fn destroy(ptr: *anyopaque) void {
+        const opened = of(ptr);
+        const heap = opened.decoder.heap;
+
+        opened.decoder.deinit();
+        heap.free(opened);
+    }
+
+    /// The header callback: describes the image to the target, which
+    /// admits or refuses it. An image of another variant than opaque
+    /// RGB samples of 8 bits ends the decode before the target sees it:
+    /// rows of another layout, and rows whose transparency a tRNS chunk
+    /// holds, which the target would write as opaque.
+    fn describe(ctx: *anyopaque, found: Header) Stop!void {
+        const opened = of(ctx);
+
+        if (!found.isOpaqueRgb8()) return error.UnsupportedFormat;
+
+        // libpng reads no axis beyond 31 bits, and none of zero.
+        const image: Codec.Image = .{
+            .width = std.math.cast(u31, found.width) orelse
+                return error.UnsupportedFormat,
+            .height = std.math.cast(u31, found.height) orelse
+                return error.UnsupportedFormat,
+            .layout = .rgb8,
+        };
+
+        try opened.target.admit(opened.target.ctx, image);
+    }
+
+    fn deliver(ctx: *anyopaque, index: u32, bytes: []const u8) Stop!void {
+        const opened = of(ctx);
+
+        opened.target.row(opened.target.ctx, index, bytes);
+    }
+};
+
+fn open(
+    _: *anyopaque,
+    heap: *Heap,
+    target: Codec.Target,
+    cancel: Cancel,
+) Error!Codec {
+    // A refusal that an earlier call left would name the wrong cause.
+    _ = heap.takeRefusal();
+
+    const memory = heap.alloc(@sizeOf(Opened)) orelse
+        return heap.takeRefusal() orelse error.EngineFailure;
+    errdefer heap.free(memory);
+
+    const opened: *Opened = @ptrCast(memory);
+
+    opened.target = target;
+
+    const sink: Sink = .{
+        .ctx = opened,
+        .header = Opened.describe,
+        .row = Opened.deliver,
+    };
+
+    try opened.decoder.init(heap, sink, cancel);
+
+    return .{ .ptr = opened, .vtable = &Opened.vtable };
+}
+
 const testing = std.testing;
-const fixtures = @import("fixtures.zig");
+/// The writer of test images, which the tests of the modules that
+/// compose this decoder share.
+pub const fixtures = @import("fixtures.zig");
 const cases = @import("cases.zig");
-const Ledger = @import("engine").Ledger;
+const Ledger = engine.Ledger;
 const TestBacking = Heap.TestBacking;
 
 test {
@@ -376,12 +482,29 @@ test {
 /// A budget that admits every decode of the tests below.
 const roomy: Ledger.Budget = .{ .bytes = 64 << 20 };
 
+/// The word of a test decode's owner. It holds bits beside the
+/// cancellation flag from the start, which must not cancel the decode.
+const TestWord = struct {
+    word: std.atomic.Value(u64) = .init(other_bits),
+
+    const flag_bit: u64 = 1 << 40;
+    const other_bits: u64 = ~flag_bit;
+
+    fn flag(test_word: *const TestWord) Cancel {
+        return .{ .word = &test_word.word, .mask = flag_bit };
+    }
+
+    fn request(test_word: *TestWord) void {
+        test_word.word.store(other_bits | flag_bit, .release);
+    }
+};
+
 /// A sink that collects the rows of a test decode. At every callback it
 /// checks that the ledger counts exactly what the backing holds.
 const Collector = struct {
     heap: *const Heap,
     backing: *const TestBacking,
-    cancel: *std.atomic.Value(bool),
+    cancel: *TestWord,
     /// The row whose delivery sets the cancellation flag.
     cancel_at: ?u32 = null,
     /// The cause with which the header callback stops the decode.
@@ -431,9 +554,7 @@ const Collector = struct {
         collector.samples.appendSlice(testing.allocator, bytes) catch
             @panic("the test ran out of memory");
 
-        if (collector.cancel_at == index) {
-            collector.cancel.store(true, .release);
-        }
+        if (collector.cancel_at == index) collector.cancel.request();
 
         if (collector.row_stop == index) return error.BudgetExceeded;
     }
@@ -481,7 +602,7 @@ fn decodeWith(
 
     var heap: Heap = .init(backing.backing(), options.budget);
 
-    var cancel: std.atomic.Value(bool) = .init(false);
+    var cancel: TestWord = .{};
 
     var collector: Collector = .{
         .heap = &heap,
@@ -500,7 +621,7 @@ fn decodeWith(
     var decoder: Decoder = undefined;
 
     const result = run: {
-        decoder.init(&heap, collector.sink(), &cancel) catch |err|
+        decoder.init(&heap, collector.sink(), cancel.flag()) catch |err|
             break :run err;
 
         break :run cases.feed(&decoder, bytes, options.plan);
@@ -586,6 +707,7 @@ test "a valid image decodes to the writer's samples in every split" {
             .color_type = 2,
             .interlaced = false,
             .channels = 3,
+            .transparency = false,
             .row_bytes = 15,
         }, outcome.header.?);
     }
@@ -714,7 +836,7 @@ test "bytes after IEND fail in the same portion and in a later one" {
 
     var heap: Heap = .init(backing.backing(), roomy);
 
-    var cancel: std.atomic.Value(bool) = .init(false);
+    var cancel: TestWord = .{};
 
     var collector: Collector = .{
         .heap = &heap,
@@ -726,13 +848,13 @@ test "bytes after IEND fail in the same portion and in a later one" {
     var decoder: Decoder = undefined;
 
     // An empty portion after IEND is no byte after it.
-    try decoder.init(&heap, collector.sink(), &cancel);
+    try decoder.init(&heap, collector.sink(), cancel.flag());
     try testing.expectEqual(.ended, try decoder.feed(bytes));
     try testing.expectEqual(.ended, try decoder.feed(&.{}));
     try decoder.finish();
     decoder.deinit();
 
-    try decoder.init(&heap, collector.sink(), &cancel);
+    try decoder.init(&heap, collector.sink(), cancel.flag());
     try testing.expectEqual(.ended, try decoder.feed(bytes));
     try testing.expectError(error.InvalidContent, decoder.feed(&.{0}));
     try testing.expectEqual(Reason.trailing, decoder.report().reason);
@@ -1112,7 +1234,7 @@ test "the settle check catches a block that a decode leaves behind" {
 
     var heap: Heap = .init(backing.backing(), roomy);
 
-    var cancel: std.atomic.Value(bool) = .init(false);
+    var cancel: TestWord = .{};
 
     var collector: Collector = .{
         .heap = &heap,
@@ -1123,7 +1245,7 @@ test "the settle check catches a block that a decode leaves behind" {
 
     var decoder: Decoder = undefined;
 
-    try decoder.init(&heap, collector.sink(), &cancel);
+    try decoder.init(&heap, collector.sink(), cancel.flag());
     try cases.feed(&decoder, bytes, .whole);
     decoder.deinit();
 
@@ -1140,7 +1262,7 @@ test "deinit before any input releases the codec context once" {
 
     var heap: Heap = .init(backing.backing(), roomy);
 
-    var cancel: std.atomic.Value(bool) = .init(false);
+    var cancel: TestWord = .{};
 
     var collector: Collector = .{
         .heap = &heap,
@@ -1151,10 +1273,200 @@ test "deinit before any input releases the codec context once" {
 
     var decoder: Decoder = undefined;
 
-    try decoder.init(&heap, collector.sink(), &cancel);
+    try decoder.init(&heap, collector.sink(), cancel.flag());
     try testing.expect(heap.ledger.usage.live > 0);
     decoder.deinit();
     decoder.deinit();
     try testing.expectEqual(0, heap.ledger.usage.live);
     try testing.expectEqual(0, backing.blocks);
+}
+
+/// A target that records what an opened decoder delivers.
+const Receiver = struct {
+    images: u32 = 0,
+    image: ?Codec.Image = null,
+    /// The cause with which the receiver refuses the image.
+    refusal: ?Codec.Refusal = null,
+    rows: u32 = 0,
+    /// The rows' samples, kept outside the heap under test.
+    samples: std.ArrayList(u8) = .empty,
+
+    fn target(receiver: *Receiver) Codec.Target {
+        return .{ .ctx = receiver, .admit = admit, .row = row };
+    }
+
+    fn admit(ctx: *anyopaque, image: Codec.Image) Codec.Refusal!void {
+        const receiver: *Receiver = @ptrCast(@alignCast(ctx));
+
+        receiver.images += 1;
+        receiver.image = image;
+
+        if (receiver.refusal) |refusal| return refusal;
+    }
+
+    fn row(ctx: *anyopaque, index: u32, bytes: []const u8) void {
+        const receiver: *Receiver = @ptrCast(@alignCast(ctx));
+
+        if (index != receiver.rows) @panic("a row arrived out of order");
+
+        receiver.rows += 1;
+
+        receiver.samples.appendSlice(testing.allocator, bytes) catch
+            @panic("the test ran out of memory");
+    }
+};
+
+/// Decodes `bytes` through the opener, over a backing that takes its
+/// blocks from `gpa`, and returns the outcome of the decode. Checks that
+/// the destroyed codec leaves no block.
+fn decodeOpened(
+    gpa: std.mem.Allocator,
+    bytes: []const u8,
+    receiver: *Receiver,
+) !Error!void {
+    var backing: TestBacking = .init(gpa);
+
+    var heap: Heap = .init(backing.backing(), roomy);
+
+    var cancel: TestWord = .{};
+
+    const result: Error!void = run: {
+        const codec = opener.open(
+            opener.ptr,
+            &heap,
+            receiver.target(),
+            cancel.flag(),
+        ) catch |err| break :run err;
+        defer codec.vtable.destroy(codec.ptr);
+
+        codec.vtable.feed(codec.ptr, bytes) catch |err| break :run err;
+
+        break :run codec.vtable.finish(codec.ptr);
+    };
+
+    try testing.expectEqual(0, backing.blocks);
+    try testing.expect(heap.ledger.settled());
+    try Heap.expectMatches(&heap, &backing);
+
+    return result;
+}
+
+test "an opened decoder describes an RGB8 image and delivers its rows" {
+    const bytes = try encode(cases.small);
+    defer testing.allocator.free(bytes);
+
+    const expected = try fixtures.samples(testing.allocator, cases.small);
+    defer testing.allocator.free(expected);
+
+    var receiver: Receiver = .{};
+    defer receiver.samples.deinit(testing.allocator);
+
+    try (try decodeOpened(testing.allocator, bytes, &receiver));
+
+    try testing.expectEqual(1, receiver.images);
+
+    try testing.expectEqual(Codec.Image{
+        .width = cases.small.width,
+        .height = cases.small.height,
+        .layout = .rgb8,
+    }, receiver.image);
+
+    try testing.expectEqual(cases.small.height, receiver.rows);
+    try testing.expectEqualSlices(u8, expected, receiver.samples.items);
+}
+
+test "a tRNS chunk before the image data marks the header" {
+    const spec: fixtures.Spec = .{
+        .width = 4,
+        .height = 2,
+        .before = &.{fixtures.trns_rgb},
+    };
+
+    const bytes = try encode(spec);
+    defer testing.allocator.free(bytes);
+
+    // The decoder itself delivers the rows as they are.
+    const outcome = try decode(bytes, .{});
+    defer outcome.deinit();
+
+    try expectImage(spec, outcome);
+    try testing.expect(outcome.header.?.transparency);
+    try testing.expect(!outcome.header.?.isOpaqueRgb8());
+}
+
+test "an opened decoder refuses every other variant before its target" {
+    const specs = [_]fixtures.Spec{
+        .{ .width = 4, .height = 2, .format = .gray8 },
+        .{ .width = 4, .height = 2, .format = .gray16 },
+        .{ .width = 4, .height = 2, .format = .palette8 },
+        .{ .width = 4, .height = 2, .format = .rgba8 },
+        .{ .width = 4, .height = 2, .interlaced = true },
+        // RGB samples of 8 bits with a transparent color beside them.
+        .{ .width = 4, .height = 2, .before = &.{fixtures.trns_rgb} },
+    };
+
+    for (specs) |spec| {
+        const bytes = try encode(spec);
+        defer testing.allocator.free(bytes);
+
+        var receiver: Receiver = .{};
+        defer receiver.samples.deinit(testing.allocator);
+
+        try testing.expectError(
+            error.UnsupportedFormat,
+            try decodeOpened(testing.allocator, bytes, &receiver),
+        );
+
+        try testing.expectEqual(0, receiver.images);
+        try testing.expectEqual(0, receiver.rows);
+    }
+}
+
+test "a refusal of the target ends an opened decode with its cause" {
+    const bytes = try encode(cases.small);
+    defer testing.allocator.free(bytes);
+
+    const refusals = [_]Codec.Refusal{
+        error.BudgetExceeded,
+        error.AllocationFailed,
+        error.UnsupportedOperation,
+    };
+
+    for (refusals) |refusal| {
+        var receiver: Receiver = .{ .refusal = refusal };
+        defer receiver.samples.deinit(testing.allocator);
+
+        try testing.expectError(
+            refusal,
+            try decodeOpened(testing.allocator, bytes, &receiver),
+        );
+
+        try testing.expectEqual(1, receiver.images);
+        try testing.expectEqual(0, receiver.rows);
+    }
+}
+
+/// Runs one opened decode of `bytes` over `gpa`, as
+/// std.testing.checkAllAllocationFailures expects.
+fn injectOpened(gpa: std.mem.Allocator, bytes: []const u8) !void {
+    var receiver: Receiver = .{};
+    defer receiver.samples.deinit(testing.allocator);
+
+    (try decodeOpened(gpa, bytes, &receiver)) catch |err| switch (err) {
+        error.AllocationFailed => return error.OutOfMemory,
+        else => return err,
+    };
+
+    try testing.expectEqual(cases.small.height, receiver.rows);
+}
+
+test "every allocation failure of an opened decode fails and settles" {
+    const bytes = try encode(cases.small);
+    defer testing.allocator.free(bytes);
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        injectOpened,
+        .{bytes},
+    );
 }

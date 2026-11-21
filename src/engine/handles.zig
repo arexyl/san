@@ -2,11 +2,11 @@
 //! its caller, and its lowest byte holds the kind, so one comparison on
 //! the bits alone rejects a handle of another kind.
 //!
-//! A handle of a slot, a content's or a job's, holds the index of the slot
-//! and the generation of its issuance. The generations of a process come
-//! from one serial that only rises, so a generation is issued once in a
-//! process, and a handle that an earlier engine issued matches no slot
-//! of a later one.
+//! A handle of a slot, a content's, a job's, or a lease's, holds the index
+//! of the slot and the generation of its issuance. The generations of a
+//! process come from one serial that only rises, so a generation is
+//! issued once in a process, and a handle that an earlier engine issued
+//! matches no slot of a later one.
 
 const std = @import("std");
 
@@ -15,6 +15,7 @@ pub const Tag = enum(u8) {
     engine = 1,
     content = 2,
     job = 3,
+    lease = 4,
     _,
 };
 
@@ -41,7 +42,13 @@ pub const Serial = struct {
     /// Reports whether the serial has retired: it issues no generation
     /// again, so that none ever repeats.
     pub fn retired(serial: Serial) bool {
-        return serial.next == std.math.maxInt(Generation);
+        return !serial.admits(1);
+    }
+
+    /// Reports whether the serial issues `count` more generations before
+    /// it retires, so that a call that needs several takes all or none.
+    pub fn admits(serial: Serial, count: Generation) bool {
+        return std.math.maxInt(Generation) - serial.next >= count;
     }
 
     /// Returns the generation of one issuance. The serial has not
@@ -87,4 +94,18 @@ test "the serial retires before its generation wraps" {
     try testing.expectEqual(last - 1, serial.take());
     try testing.expect(serial.retired());
     try testing.expectEqual(last, serial.next);
+}
+
+test "the serial admits several issues only while all of them remain" {
+    const last = std.math.maxInt(Generation);
+
+    var serial: Serial = .{ .next = last - 2 };
+
+    try testing.expect(serial.admits(2));
+    try testing.expect(!serial.admits(3));
+
+    _ = serial.take();
+
+    try testing.expect(serial.admits(1));
+    try testing.expect(!serial.admits(2));
 }

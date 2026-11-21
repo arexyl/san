@@ -16,9 +16,12 @@
 
 const std = @import("std");
 
+pub const Codec = @import("Codec.zig");
 pub const Content = @import("Content.zig");
+pub const Decode = @import("Decode.zig");
 pub const Heap = @import("Heap.zig");
 pub const Job = @import("Job.zig");
+pub const Lease = @import("Lease.zig");
 pub const Ledger = @import("Ledger.zig");
 pub const handles = @import("handles.zig");
 
@@ -32,18 +35,29 @@ const Engine = @This();
 
 /// The engine's heap. Its first block holds this engine.
 heap: Heap,
+/// The source of the codecs of the engine's jobs.
+opener: Codec.Opener,
 /// The slots of the contents, one block of the heap. They never move.
 contents: []Content,
 /// The slots of the jobs, one block of the heap. Creation writes the
 /// slice before it publishes the engine, and nothing writes it again, so
 /// a cancellation reads it from any thread.
 jobs: []Job,
+/// The slots of the leases, one block of the heap, as many as the count
+/// limit of live leases. They never move.
+leases: []Lease,
 /// The serial of the process while this engine lives.
 serial: handles.Serial,
 /// The staging that the opening of a content admits, in bytes.
 input_portion_bytes: usize,
-/// The count limit of live output leases.
-output_lease_count: handles.Index,
+/// The ceiling of the received length of one representation, in bytes.
+content_length_bytes: u64,
+/// The ceilings of an image: each axis, and the width times the height,
+/// in pixels.
+image_axis_pixels: u64,
+image_area_pixels: u64,
+/// The ceiling of one output lease with its block header, in bytes.
+output_lease_bytes: u64,
 
 /// The limits of an engine, under the names of `san_engine_limits`, each
 /// in the unit that its name ends in.
@@ -85,6 +99,11 @@ pub const Limits = struct {
                 usize,
                 limits.input_portion_bytes,
             ) orelse return error.BudgetExceeded,
+            .content_length_bytes = @intCast(limits.content_length_bytes),
+            .image_axis_pixels = @intCast(limits.image_axis_pixels),
+            .image_area_pixels = @intCast(limits.image_area_pixels),
+            .output_bytes = @intCast(limits.output_bytes),
+            .output_lease_bytes = @intCast(limits.output_lease_bytes),
         };
     }
 
@@ -102,20 +121,29 @@ const Config = struct {
     job_count: handles.Index,
     output_lease_count: handles.Index,
     input_portion_bytes: usize,
+    content_length_bytes: u64,
+    image_axis_pixels: u64,
+    image_area_pixels: u64,
+    output_bytes: u64,
+    output_lease_bytes: u64,
 
     /// Returns the bytes that the engine's own state takes from its
-    /// budget: the engine, the slots of its contents, and the slots of
-    /// its jobs, each a block. The sizes are bounded, so the sum cannot
-    /// overflow.
+    /// budget: the engine and the slots of its contents, of its jobs,
+    /// and of its leases, each a block. The sizes are bounded, so the
+    /// sum cannot overflow.
     fn footprint(config: Config) u64 {
         const content_slots =
             @as(usize, config.content_count) * @sizeOf(Content);
 
         const job_slots = @as(usize, config.job_count) * @sizeOf(Job);
 
+        const lease_slots =
+            @as(usize, config.output_lease_count) * @sizeOf(Lease);
+
         return Heap.accounted(@sizeOf(Engine)).? +
             Heap.accounted(content_slots).? +
-            Heap.accounted(job_slots).?;
+            Heap.accounted(job_slots).? +
+            Heap.accounted(lease_slots).?;
     }
 };
 
@@ -134,12 +162,13 @@ pub const CreateError = error{
 };
 
 /// Creates an engine under `limits` in `slot`, with memory from
-/// `backing`, and returns its handle. A failure releases every partial
-/// resource and leaves the slot as it was.
+/// `backing` and codecs from `opener`, and returns its handle. A failure
+/// releases every partial resource and leaves the slot as it was.
 pub fn create(
     binding: *const Binding,
     slot: *Slot,
     backing: Heap.Backing,
+    opener: Codec.Opener,
     limits: Limits,
 ) CreateError!Handle {
     if (!binding.established()) return error.BindingMismatch;
@@ -148,10 +177,13 @@ pub fn create(
 
     var heap: Heap = .init(backing, config.budget);
 
-    heap.ledger.ceilings = .{ .metadata = config.metadata_bytes };
+    heap.ledger.ceilings = .{
+        .metadata = config.metadata_bytes,
+        .output = config.output_bytes,
+    };
 
     // One reservation admits the engine and its slots before any of
-    // them exists, and the three blocks take all of it.
+    // them exists, and the four blocks take all of it.
     var reservation = try heap.ledger.reserve(.metadata, config.footprint());
     errdefer heap.ledger.cancel(&reservation);
 
@@ -174,19 +206,32 @@ pub fn create(
         &reservation,
         config.job_count,
     ) orelse return error.AllocationFailed;
+    errdefer heap.free(jobs.ptr);
+
+    const leases = heap.allocReservedSlice(
+        Lease,
+        &reservation,
+        config.output_lease_count,
+    ) orelse return error.AllocationFailed;
 
     @memset(contents, .{});
     @memset(jobs, .{});
+    @memset(leases, .{});
 
     // The heap moves into the block that it already counts. Nothing after
     // this point fails, so no cleanup touches the moved heap.
     engine.* = .{
         .heap = heap,
+        .opener = opener,
         .contents = contents,
         .jobs = jobs,
+        .leases = leases,
         .serial = slot.serial,
         .input_portion_bytes = config.input_portion_bytes,
-        .output_lease_count = config.output_lease_count,
+        .content_length_bytes = config.content_length_bytes,
+        .image_axis_pixels = config.image_axis_pixels,
+        .image_area_pixels = config.image_area_pixels,
+        .output_lease_bytes = config.output_lease_bytes,
     };
 
     slot.publish(generation, engine);
@@ -196,7 +241,8 @@ pub fn create(
 
 /// How far a call of `shutdown` came.
 pub const Shutdown = enum {
-    /// The caller still owns a job, and the engine stays closing.
+    /// The caller still owns a job or holds a lease, and the engine stays
+    /// closing.
     pending,
     /// The engine is closed, and its handle is invalid.
     complete,
@@ -205,8 +251,8 @@ pub const Shutdown = enum {
 /// Advances the shutdown of the engine of `handle`. The first call
 /// stops admission, ends every live job as canceled, and closes every
 /// content. Each call then completes the shutdown once the caller has
-/// released every job: it returns the serial, releases the engine's
-/// state, and releases the slot.
+/// released every job and every lease: it returns the serial, releases
+/// the engine's state, and releases the slot.
 pub fn shutdown(slot: *Slot, handle: Handle) error{InvalidHandle}!Shutdown {
     const engine = try slot.close(handle);
 
@@ -216,7 +262,10 @@ pub fn shutdown(slot: *Slot, handle: Handle) error{InvalidHandle}!Shutdown {
     Job.endAll(engine);
     Content.shutAll(engine);
 
+    // No job is live, so every lease that still lives is one that the
+    // caller holds.
     if (Job.countOwned(engine) != 0) return .pending;
+    if (Lease.countLive(engine) != 0) return .pending;
 
     slot.serial = engine.serial;
     engine.destroy();
@@ -270,6 +319,7 @@ fn heldBy(slot: *const Slot, handle: Handle) error{InvalidHandle}!Slot.Held {
 fn destroy(engine: *Engine) void {
     var heap = engine.heap;
 
+    heap.free(engine.leases.ptr);
     heap.free(engine.jobs.ptr);
     heap.free(engine.contents.ptr);
     heap.free(engine);
@@ -501,9 +551,9 @@ const roomy: Limits = limits: {
 /// state.
 const footprint = (roomy.admit() catch unreachable).footprint();
 
-/// The blocks of an engine's own state: the engine, the slots of its
-/// contents, and the slots of its jobs.
-const own_blocks = 3;
+/// The blocks of an engine's own state: the engine and the slots of its
+/// contents, of its jobs, and of its leases.
+const own_blocks = 4;
 
 /// The count limits, each of which sizes a table or bounds one.
 const count_limits = .{ "content_count", "job_count", "output_lease_count" };
@@ -550,7 +600,13 @@ const Process = struct {
         backing: Heap.Backing,
         limits: Limits,
     ) CreateError!Handle {
-        return Engine.create(&process.binding, &process.slot, backing, limits);
+        return Engine.create(
+            &process.binding,
+            &process.slot,
+            backing,
+            Codec.Scripted.opener,
+            limits,
+        );
     }
 };
 
@@ -755,7 +811,7 @@ test "each count limit beyond the slot index fails as BudgetExceeded" {
     }
 }
 
-test "the job slots count against the engine's own state" {
+test "the job and lease slots count against the engine's own state" {
     var few = roomy;
     var many = roomy;
 
@@ -767,11 +823,14 @@ test "the job slots count against the engine's own state" {
         try footprintOf(many) - try footprintOf(few),
     );
 
-    // The count limit of leases sizes no table.
+    few = many;
+    few.output_lease_count = 1;
     many.output_lease_count = 9;
-    few.job_count = 9;
 
-    try testing.expectEqual(try footprintOf(few), try footprintOf(many));
+    try testing.expectEqual(
+        8 * @sizeOf(Lease),
+        try footprintOf(many) - try footprintOf(few),
+    );
 }
 
 test "the metadata ceiling admits exactly the engine's own state" {
@@ -1357,9 +1416,12 @@ fn hold(
 }
 
 test {
+    _ = Codec;
     _ = Content;
+    _ = Decode;
     _ = Heap;
     _ = Job;
+    _ = Lease;
     _ = handles;
     _ = Ledger;
 }

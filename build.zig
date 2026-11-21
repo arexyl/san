@@ -156,8 +156,8 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         std.lang.Optimize,
         "optimize",
         "Optimization mode of the Android checks and of the Zig code of " ++
-            "test-codecs; requests the codec packages: " ++
-            profile.optimize_names,
+            "test-codecs, test-abi, and test-jni; requests the codec " ++
+            "packages: " ++ profile.optimize_names,
     );
 
     const ndk_root = b.option(
@@ -194,12 +194,14 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
 
     const test_abi = b.step(
         "test-abi",
-        "Run the host tests of the C ABI against the translated header",
+        "Run the host tests of the C ABI against the translated header, " ++
+            "linked with the host codec archives, for -Doptimize",
     );
 
     const test_jni = b.step(
         "test-jni",
-        "Run the host tests of the JNI layer against the NDK's JNI header",
+        "Run the host tests of the JNI layer against the NDK's JNI header, " ++
+            "linked with the host codec archives, for -Doptimize",
     );
 
     const check_header = b.step(
@@ -290,7 +292,6 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
     addClean(b, clean_step, layout);
     addVerifyStore(b, verify_store, layout);
     addHeaderTest(b, test_header, layout);
-    addAbiTest(b, test_abi, layout);
 
     const selection: Selection = .{
         .abi = abi,
@@ -299,7 +300,6 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         .guard_ndk_major = guard_ndk_major,
     };
 
-    addJniTest(b, test_jni, layout, selection);
     addHeaderCheck(b, check_header, layout, selection);
     addEngineCheck(b, check_engine, selection);
 
@@ -307,10 +307,21 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
 
     addInspectCheck(b, check_inspect, selection, inspection);
 
+    // Every step from here on links the codecs, and only -Doptimize
+    // requests their packages. A missing package ends the configuration
+    // at the request, after the steps above, which need none.
+    const codec_packages: ?codecs.Packages = if (optimize != null)
+        try requestCodecs(b, layout)
+    else
+        null;
+
+    addAbiTest(b, test_abi, layout, selection, codec_packages);
+    addJniTest(b, test_jni, layout, selection, codec_packages);
+
     addLibraryStage(b, .{
         .stage_library = stage_library,
         .stage_device = stage_device,
-    }, layout, selection, inspection);
+    }, layout, selection, codec_packages, inspection);
 
     addLocalStage(
         b,
@@ -318,14 +329,15 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         verify_store,
         layout,
         selection,
+        codec_packages,
         inspection,
     );
 
-    try addCodecSteps(b, .{
+    addCodecSteps(b, .{
         .test_codecs = test_codecs,
         .check_codecs = check_codecs,
         .stage_device = stage_device,
-    }, layout, selection, inspection);
+    }, layout, selection, codec_packages, inspection);
 }
 
 /// Returns the absolute San root. A supported invocation passes
@@ -541,9 +553,132 @@ fn addHeaderTest(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
     step.dependOn(&b.addRunArtifact(tests).step);
 }
 
-/// Adds the host tests of the C ABI, in the modes of the Zig core. The
-/// module reaches the header through its host translation.
-fn addAbiTest(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
+/// The codec packages with the mode of -Doptimize, for a host step that
+/// links the codecs: the option requests the packages and selects the
+/// mode of the step's Zig code.
+const HostCodecs = struct {
+    packages: codecs.Packages,
+    optimize: std.lang.Optimize,
+
+    /// Returns the codecs of `selection`, or fails `step` and returns
+    /// null for a missing or unsupported -Doptimize.
+    fn of(
+        b: *std.Build,
+        step: *std.Build.Step,
+        selection: Selection,
+        requested: ?codecs.Packages,
+    ) ?HostCodecs {
+        const optimize = selection.optimize orelse {
+            failSteps(b, &.{step}, missing_optimize);
+
+            return null;
+        };
+
+        if (!profile.supportedOnSomeAbi(optimize)) {
+            failSteps(b, &.{step}, b.fmt(
+                "unsupported -Doptimize={t} for {s}; supported: {s}",
+                .{ optimize, step.name, profile.optimize_names },
+            ));
+
+            return null;
+        }
+
+        // The request follows -Doptimize.
+        return .{ .packages = requested.?, .optimize = optimize };
+    }
+};
+
+/// The outcome of adding the PNG decoder of one compile: its module, or
+/// a message that names the unsupported target.
+const PngAdded = union(enum) {
+    ok: *std.Build.Module,
+    rejected: []const u8,
+};
+
+/// The NDK of the Android target of a PNG decoder.
+const PngAndroid = struct {
+    abi: profile.Abi,
+    found: ndk.Root,
+};
+
+/// Returns the module of the PNG decoder for a compile on `target`
+/// whose engine module is `engine`: the decoder over the translation of
+/// its adapter's header, with the codec archives of the target, which
+/// the compile then links. The decoder imports the engine for its heap
+/// and for the codec port, so the compile holds one engine module.
+/// `android` is null for the host.
+fn addPng(
+    b: *std.Build,
+    comptime Translator: type,
+    codec_packages: codecs.Packages,
+    target: std.Build.ResolvedTarget,
+    android: ?PngAndroid,
+    layout: Layout,
+    engine: *std.Build.Module,
+) PngAdded {
+    const platform: codecs.Platform = if (android) |selected| .{ .android = .{
+        .abi = selected.abi,
+        .include_dirs = selected.found.include_dirs,
+    } } else .host;
+
+    const system: header.System = if (android) |selected| .{ .android = .{
+        .api_level = profile.api_level,
+        .include_dirs = selected.found.include_dirs,
+    } } else .host;
+
+    const added = codecs.addArchives(
+        b,
+        codec_packages,
+        target,
+        platform,
+        layout.root,
+    );
+
+    const archives = switch (added) {
+        .ok => |valid| valid,
+        .rejected => |message| return .{ .rejected = message },
+    };
+
+    const adapter = header.translateFile(
+        b,
+        Translator,
+        b.dependency("translate_c", .{}),
+        target,
+        system,
+        "adapter",
+        b.path(codecs.png_adapter_header),
+    );
+
+    const png = b.createModule(.{
+        .root_source_file = b.path(png_decoder_root),
+        // An Android library links no libc.
+        .link_libc = if (android != null) false else null,
+        .imports = &.{
+            .{ .name = "adapter", .module = adapter },
+            .{ .name = "engine", .module = engine },
+        },
+    });
+
+    png.linkLibrary(archives.png);
+    png.linkLibrary(archives.zlib);
+
+    return .{ .ok = png };
+}
+
+/// Adds the host tests of the C ABI, in the mode of -Doptimize. The
+/// module reaches the header through its host translation, and it
+/// composes the engine with the PNG decoder, so the tests link the host
+/// codec archives.
+fn addAbiTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    layout: Layout,
+    selection: Selection,
+    requested: ?codecs.Packages,
+) void {
+    const host_codecs = HostCodecs.of(b, step, selection, requested) orelse
+        return;
+
     if (failMissingPackage(b, step, layout)) return;
 
     const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
@@ -564,36 +699,53 @@ fn addAbiTest(b: *std.Build, step: *std.Build.Step, layout: Layout) void {
         .root_source_file = b.path(engine_root),
     });
 
-    for (engine_test_modes) |optimize| {
-        const tests = b.addTest(.{
-            .name = b.fmt("abi-{t}", .{optimize}),
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(abi_root),
-                .target = target,
-                .optimize = optimize,
-                // The tests run the system backing on the host libc.
-                .link_libc = true,
-                .imports = &.{
-                    .{ .name = "san", .module = translation.san },
-                    .{ .name = "engine", .module = engine },
-                },
-            }),
-        });
+    const png = switch (addPng(
+        b,
+        translate_c.Translator,
+        host_codecs.packages,
+        target,
+        null,
+        layout,
+        engine,
+    )) {
+        .ok => |module| module,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
 
-        step.dependOn(&b.addRunArtifact(tests).step);
-    }
+    const tests = b.addTest(.{
+        .name = b.fmt("abi-{t}", .{host_codecs.optimize}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(abi_root),
+            .target = target,
+            .optimize = host_codecs.optimize,
+            // The tests run the system backing on the host libc.
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "san", .module = translation.san },
+                .{ .name = "engine", .module = engine },
+                .{ .name = "png", .module = png },
+            },
+        }),
+    });
+
+    step.dependOn(&b.addRunArtifact(tests).step);
 }
 
-/// Adds the host tests of the JNI layer, in the modes of the Zig core.
-/// The JNI header comes from the NDK, and it includes only <stdarg.h>
-/// and <stdint.h>, so the host translates it alone, without another NDK
-/// header.
+/// Adds the host tests of the JNI layer, in the mode of -Doptimize. The
+/// JNI header comes from the NDK, and it includes only <stdarg.h> and
+/// <stdint.h>, so the host translates it alone, without another NDK
+/// header. The layer runs the C ABI, which composes the engine with the
+/// PNG decoder, so the tests link the host codec archives.
 fn addJniTest(
     b: *std.Build,
     step: *std.Build.Step,
     layout: Layout,
     selection: Selection,
+    requested: ?codecs.Packages,
 ) void {
+    const host_codecs = HostCodecs.of(b, step, selection, requested) orelse
+        return;
+
     // The header lies in the include directory that every ABI shares, so
     // any ABI opens the NDK for it.
     const found = openNdk(b, step, selection, .@"arm64-v8a") orelse return;
@@ -626,38 +778,53 @@ fn addJniTest(
         .host,
     );
 
+    const engine = b.createModule(.{
+        .root_source_file = b.path(engine_root),
+    });
+
+    const png = switch (addPng(
+        b,
+        translate_c.Translator,
+        host_codecs.packages,
+        target,
+        null,
+        layout,
+        engine,
+    )) {
+        .ok => |module| module,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
+
     const abi = b.createModule(.{
         .root_source_file = b.path(abi_root),
         .imports = &.{
             .{ .name = "san", .module = translation.san },
-            .{ .name = "engine", .module = b.createModule(.{
-                .root_source_file = b.path(engine_root),
-            }) },
+            .{ .name = "engine", .module = engine },
+            .{ .name = "png", .module = png },
         },
     });
 
-    for (engine_test_modes) |optimize| {
-        const tests = b.addTest(.{
-            .name = b.fmt("jni-{t}", .{optimize}),
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(jni_root),
-                .target = target,
-                .optimize = optimize,
-                // The methods run the C ABI on the system backing, which
-                // is the host libc here.
-                .link_libc = true,
-                .imports = &.{
-                    .{ .name = "jni", .module = jni },
-                    .{ .name = "san", .module = translation.san },
-                    .{ .name = "abi", .module = abi },
-                    .{ .name = "bindings", .module = header.bindingsModule(b) },
-                    .{ .name = "table", .module = tableModule(b) },
-                },
-            }),
-        });
+    const tests = b.addTest(.{
+        .name = b.fmt("jni-{t}", .{host_codecs.optimize}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(jni_root),
+            .target = target,
+            .optimize = host_codecs.optimize,
+            // The methods run the C ABI on the system backing, which is
+            // the host libc here.
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "jni", .module = jni },
+                .{ .name = "san", .module = translation.san },
+                .{ .name = "abi", .module = abi },
+                .{ .name = "bindings", .module = header.bindingsModule(b) },
+                .{ .name = "table", .module = tableModule(b) },
+                .{ .name = "tiny_png", .module = tinyPngModule(b) },
+            },
+        }),
+    });
 
-        step.dependOn(&b.addRunArtifact(tests).step);
-    }
+    step.dependOn(&b.addRunArtifact(tests).step);
 }
 
 /// Returns the JNI header of the NDK.
@@ -829,15 +996,17 @@ fn addCodecSteps(
     steps: CodecSteps,
     layout: Layout,
     selection: Selection,
+    requested: ?codecs.Packages,
     inspection: *std.Build.Step.Compile,
-) error{LazyDependencyNeeded}!void {
+) void {
     const optimize = selection.optimize orelse return failSteps(
         b,
         &.{ steps.test_codecs, steps.check_codecs, steps.stage_device },
         missing_optimize,
     );
 
-    const codec_packages = try requestCodecs(b, layout);
+    // The request follows -Doptimize.
+    const codec_packages = requested.?;
 
     addCodecTest(b, steps.test_codecs, layout, codec_packages, optimize);
     addCodecCheck(b, steps.check_codecs, layout, selection, codec_packages);
@@ -1133,9 +1302,21 @@ fn addDeviceStage(
         } },
     );
 
-    const abi_imports: []const std.Build.Module.Import = &.{
-        .{ .name = "san", .module = translation.san },
-        .{ .name = "engine", .module = androidEngine(b) },
+    const abi_engine = androidEngine(b);
+
+    // The C ABI composes the engine with the PNG decoder, as in the San
+    // library.
+    const abi_png = switch (addPng(
+        b,
+        translate_c.Translator,
+        codec_packages,
+        target,
+        .{ .abi = android.abi, .found = found },
+        layout,
+        abi_engine,
+    )) {
+        .ok => |module| module,
+        .rejected => |message| return failSteps(b, &.{step}, message),
     };
 
     const abi_library = library.add(b, .{
@@ -1145,11 +1326,23 @@ fn addDeviceStage(
             .target = target,
             .optimize = android.optimize,
             .link_libc = false,
-            .imports = abi_imports,
+            .imports = &.{
+                .{ .name = "san", .module = translation.san },
+                .{ .name = "engine", .module = abi_engine },
+                .{ .name = "png", .module = abi_png },
+            },
         }),
         .artifact = .abi_device_test,
         .ndk = found,
     });
+
+    // The harness decodes the PNG that is built at compile time, because
+    // the writer of the test images is no part of it.
+    const abi_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "san", .module = translation.san },
+        .{ .name = "engine", .module = androidEngine(b) },
+        .{ .name = "tiny_png", .module = tinyPngModule(b) },
+    };
 
     const abi_inspected = addInspection(
         b,
@@ -1265,6 +1458,7 @@ fn addLibraryStage(
     steps: LibrarySteps,
     layout: Layout,
     selection: Selection,
+    requested: ?codecs.Packages,
     inspection: *std.Build.Step.Compile,
 ) void {
     const step = steps.stage_library;
@@ -1280,13 +1474,19 @@ fn addLibraryStage(
 
     const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
 
-    const built = addSanLibrary(
+    // The selection holds -Doptimize, which requested the packages.
+    const built = switch (addSanLibrary(
         b,
         translate_c.Translator,
+        requested.?,
         android,
         found,
+        layout,
         inspection,
-    );
+    )) {
+        .ok => |valid| valid,
+        .rejected => |message| return failSteps(b, &.{step}, message),
+    };
 
     const prefix = addPrefixCheck(b, layout, android);
 
@@ -1348,15 +1548,26 @@ const SanLibrary = struct {
     engine: *std.Build.Module,
 };
 
-/// Adds libsan.so for `android` with its inspection and its report.
-/// `Translator` is the Translator type of the translate_c package.
+/// The outcome of adding libsan.so: the library, or a message that names
+/// the unsupported target of its codecs.
+const SanLibraryAdded = union(enum) {
+    ok: SanLibrary,
+    rejected: []const u8,
+};
+
+/// Adds libsan.so for `android` with its inspection and its report. The
+/// C ABI composes the engine with the PNG decoder, so the library links
+/// the codec archives of the ABI. `Translator` is the Translator type of
+/// the translate_c package.
 fn addSanLibrary(
     b: *std.Build,
     comptime Translator: type,
+    codec_packages: codecs.Packages,
     android: Android,
     found: ndk.Root,
+    layout: Layout,
     inspection: *std.Build.Step.Compile,
-) SanLibrary {
+) SanLibraryAdded {
     const target = b.resolveTargetQuery(android.abi.targetQuery());
 
     const translator = b.dependency("translate_c", .{});
@@ -1386,12 +1597,26 @@ fn addSanLibrary(
 
     const engine = androidEngine(b);
 
+    const png = switch (addPng(
+        b,
+        Translator,
+        codec_packages,
+        target,
+        .{ .abi = android.abi, .found = found },
+        layout,
+        engine,
+    )) {
+        .ok => |module| module,
+        .rejected => |message| return .{ .rejected = message },
+    };
+
     const abi = b.createModule(.{
         .root_source_file = b.path(abi_root),
         .link_libc = false,
         .imports = &.{
             .{ .name = "san", .module = translation.san },
             .{ .name = "engine", .module = engine },
+            .{ .name = "png", .module = png },
         },
     });
 
@@ -1431,14 +1656,14 @@ fn addSanLibrary(
 
     inspected.expectExitCode(0);
 
-    return .{
+    return .{ .ok = .{
         .library = san_library,
         .inspected = inspected,
         .report = addReport(b, android.abi, .san, san_library, found),
         .jni = jni,
         .san = translation.san,
         .engine = engine,
-    };
+    } };
 }
 
 /// Adds stage-local: the San library of every ABI in the mode of
@@ -1455,6 +1680,7 @@ fn addLocalStage(
     verify_store: *std.Build.Step,
     layout: Layout,
     selection: Selection,
+    requested: ?codecs.Packages,
     inspection: *std.Build.Step.Compile,
 ) void {
     const abis = comptime std.enums.values(profile.Abi);
@@ -1523,13 +1749,19 @@ fn addLocalStage(
     });
 
     for (abis, roots) |abi, found| {
-        const built = addSanLibrary(
+        // The request of the packages follows -Doptimize.
+        const built = switch (addSanLibrary(
             b,
             translate_c.Translator,
+            requested.?,
             .{ .abi = abi, .optimize = optimize },
             found,
+            layout,
             inspection,
-        );
+        )) {
+            .ok => |valid| valid,
+            .rejected => |message| return failSteps(b, &.{step}, message),
+        };
 
         // No library compiles before the checkout passed its check.
         built.library.step.dependOn(&check.step);
@@ -1843,6 +2075,14 @@ fn dependOnArchives(step: *std.Build.Step, archives: codecs.Archives) void {
         _ = archive.getEmittedBin();
         step.dependOn(&archive.step);
     }
+}
+
+/// Returns the module of the PNG that the tests decode where they cannot
+/// link the writer of the test images.
+fn tinyPngModule(b: *std.Build) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("src/codecs/png/tiny.zig"),
+    });
 }
 
 fn tableModule(b: *std.Build) *std.Build.Module {
