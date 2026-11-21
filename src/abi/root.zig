@@ -1501,11 +1501,9 @@ test "the job request checks its content, then its fields" {
         .{ min, 0, 0, 0, 0 },
     };
 
-    const unsupported = [_][5]i32{
-        .{ 1, 0, 2, 2, 0 },
-        .{ 0, 1, 2, 2, 0 },
-        .{ max - 1, max - 1, max, max, 0 },
-    };
+    // The step that learns the image decides a region, so the request
+    // takes every well-formed one.
+    const inside = [5]i32{ 1, 1, 2, 2, 0 };
 
     const invalid = [_]san.san_handle{
         san.SAN_NO_HANDLE,
@@ -1536,17 +1534,6 @@ test "the job request checks its content, then its fields" {
         try testing.expectEqual(san.SAN_NO_HANDLE, job);
     }
 
-    for (unsupported) |fields| {
-        var job = unwritten;
-
-        try testing.expectEqual(
-            san.SAN_STATUS_UNSUPPORTED_OPERATION,
-            requestJob(&state, content, requestWith(fields), &job),
-        );
-
-        try testing.expectEqual(san.SAN_NO_HANDLE, job);
-    }
-
     // No refusal admitted a job or took the content's one admission.
     try expectJobs(&state, engine, 0, 0);
 
@@ -1555,15 +1542,15 @@ test "the job request checks its content, then its fields" {
     try testing.expectEqual(san.SAN_STATUS_OK, requestJob(
         &state,
         content,
-        requestWith(.{ 0, 0, max, max, max }),
+        requestWith(.{ max - 1, max - 1, max, max, max }),
         &job,
     ));
 
     try testing.expect(job != san.SAN_NO_HANDLE);
     try expectJobs(&state, engine, 1, 1);
 
-    // The content admitted its job, which decides before the region.
-    for ([_][5]i32{ .{ 0, 0, 0, 0, 0 }, unsupported[0] }) |fields| {
+    // The content admitted its job, which decides before the fields.
+    for ([_][5]i32{ .{ 0, 0, 0, 0, 0 }, inside }) |fields| {
         var second = unwritten;
 
         try testing.expectEqual(
@@ -3375,19 +3362,27 @@ const refusals = [_]Refused{
         .status = san.SAN_STATUS_BUDGET_EXCEEDED,
         .geometry = striped_without_lease,
     },
-    // A region past the image, and one inside it that is not whole.
+    // A region past the image on either axis, and one inside it that
+    // leaves a column out.
     .{
         .request = regionOf(9, 16),
         .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
         .geometry = striped_without_lease,
     },
     .{
-        .request = regionOf(8, 15),
+        .request = regionOf(8, 17),
         .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
         .geometry = striped_without_lease,
     },
-    // A largest output width below the image width, with its grid.
     .{
+        .request = regionOf(7, 16),
+        .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
+        .geometry = striped_without_lease,
+    },
+    // A scaled lease beyond its ceiling reports the grid of its scale.
+    .{
+        .limit = "output_lease_bytes",
+        .value = 4 * 8 * 4 + Heap.header_size - 1,
         .request = .{
             .left = 0,
             .top = 0,
@@ -3395,7 +3390,7 @@ const refusals = [_]Refused{
             .bottom = 0,
             .max_output_width = 4,
         },
-        .status = san.SAN_STATUS_UNSUPPORTED_OPERATION,
+        .status = san.SAN_STATUS_BUDGET_EXCEEDED,
         .geometry = .{ .image = .{ 8, 16 }, .grid = .{ 4, 8 } },
     },
     // The region decides before the ceiling of the lease.

@@ -126,10 +126,10 @@ pub const Report = struct {
     /// The image rows that the codec delivered so far.
     decoded_rows: u32 = 0,
 
-    /// The geometry and the kind of an admitted lease. This build
-    /// decodes the whole image without alpha, row by row, so the lease
-    /// starts at the origin of the output grid, has no alpha, and
-    /// publishes before the terminal outcome.
+    /// The geometry and the kind of an admitted lease, with its origin
+    /// in the output grid. This build decodes every column without
+    /// alpha, row by row, so the lease starts at the left edge of the
+    /// grid, has no alpha, and publishes before the terminal outcome.
     pub const Admitted = struct {
         width: u32,
         height: u32,
@@ -249,8 +249,9 @@ pub fn resolveOwned(
 pub const RequestError = error{
     /// The content already admitted its job.
     BindingMismatch,
-    /// The fields of the request alone name a region that the build
-    /// does not support.
+    /// The fields of the request alone name an output that the build
+    /// does not support. This build decides every region and scale
+    /// when it learns the image, so its request never fails this way.
     UnsupportedOperation,
     /// Every slot holds an owned job, or the count limit of live leases
     /// is reached.
@@ -268,14 +269,6 @@ pub fn request(live: Content.Live, wanted: Request) RequestError!Handle {
     const open_state = &live.content.state.open;
 
     if (open_state.job != .none) return error.BindingMismatch;
-
-    // Only a region that starts at the image's origin can be the whole
-    // image, whatever the size of the image.
-    if (wanted.region) |region| {
-        if (region.left != 0 or region.top != 0) {
-            return error.UnsupportedOperation;
-        }
-    }
 
     const index = for (engine.jobs, 0..) |*job, at| {
         if (job.load(.monotonic).generation == 0) break at;
@@ -348,11 +341,11 @@ fn advance(job: *Job, engine: *Engine) Codec.Error!bool {
     if (within != 0) {
         input.consumed += within;
 
-        // No decode of this build ends before its image, so a codec that
-        // reports a satisfied target broke its promise.
         switch (try decode.feed(staged[0..within])) {
             .more => {},
-            .satisfied => return error.EngineFailure,
+            // The decode has the last row of a band, so the job is
+            // complete without the rest of its input.
+            .satisfied => return job.covered(),
         }
     }
 
@@ -361,9 +354,16 @@ fn advance(job: *Job, engine: *Engine) Codec.Error!bool {
 
     try decode.finish();
 
-    // A completed job covers every row of its lease. A codec that ends
-    // its image short of that broke its promise, and the job fails.
-    if (!decode.admitted or decode.rows != job.lease.?.height) {
+    return job.covered();
+}
+
+/// Returns true for a decode that wrote every row of its lease, as a
+/// completed job needs. A codec that ends short of that broke its
+/// promise, and the job fails.
+fn covered(job: *const Job) error{EngineFailure}!bool {
+    const decode = &job.decode.?;
+
+    if (!decode.admitted or decode.written != job.lease.?.height) {
         return error.EngineFailure;
     }
 
@@ -373,7 +373,7 @@ fn advance(job: *Job, engine: *Engine) Codec.Error!bool {
 /// Extends the coverage of the lease to the rows that the decode wrote.
 /// The first publication starts the caller's claim on the lease.
 fn publish(job: *Job) void {
-    const rows = (job.decode orelse return).rows;
+    const rows = (job.decode orelse return).written;
     const lease = job.lease.?;
 
     if (rows == lease.covered) return;
@@ -400,7 +400,11 @@ fn describe(job: *const Job, engine: *const Engine) Report {
         report.decoded_rows = decode.rows;
 
         if (decode.admitted) {
-            report.admitted = .{ .width = lease.width, .height = lease.height };
+            report.admitted = .{
+                .width = lease.width,
+                .height = lease.height,
+                .top = decode.band.top,
+            };
         }
     }
 
@@ -951,7 +955,7 @@ test "an invalid handle fails every job call and changes no word" {
     try rig.finish();
 }
 
-test "a request checks its content, its region, and the limits in order" {
+test "a request checks its content and then the limits" {
     var rig: Rig = undefined;
 
     try rig.start(.{ .jobs = 1, .leases = 1 });
@@ -959,38 +963,20 @@ test "a request checks its content, its region, and the limits in order" {
     const first = try rig.open();
     const second = try rig.open();
 
+    // The step that learns the image decides a region, so a request
+    // never refuses one.
     const off_left: Request = .{
         .region = .{ .left = 1, .top = 0, .right = 2, .bottom = 2 },
     };
-
-    const off_top: Request = .{
-        .region = .{ .left = 0, .top = 1, .right = 2, .bottom = 2 },
-    };
-
-    // The one slot is free, so only the region refuses these.
-    for ([_]Request{ off_left, off_top }) |wanted| {
-        try testing.expectError(
-            error.UnsupportedOperation,
-            rig.admit(second, wanted),
-        );
-    }
-
-    try testing.expectEqual(0, countOwned(rig.engine));
 
     const handle = try rig.admit(first, .{});
 
     const next = rig.engine.serial.next;
 
-    // A content that admitted its job decides before the region does,
-    // and the region before the count limits.
+    // A content that admitted its job decides before the count limits.
     try testing.expectError(error.BindingMismatch, rig.admit(first, off_left));
     try testing.expectError(error.BindingMismatch, rig.admit(first, .{}));
-
-    try testing.expectError(
-        error.UnsupportedOperation,
-        rig.admit(second, off_left),
-    );
-
+    try testing.expectError(error.BudgetExceeded, rig.admit(second, off_left));
     try testing.expectError(error.BudgetExceeded, rig.admit(second, .{}));
 
     // A terminal job still holds its slot, and its content admits no
@@ -2039,22 +2025,22 @@ const admission_cases = [_]AdmissionCase{
         .outcome = .budget_exceeded,
         .grid = null,
     },
-    // The whole image as a region, a region past the image, and one
-    // inside it that is not whole.
+    // The whole image as a region, a region past the image on either
+    // axis, and one inside it that leaves a column out.
     .{ .wanted = regionOf(3, 4), .outcome = null },
     .{ .wanted = regionOf(4, 4), .outcome = .unsupported_operation },
     .{ .wanted = regionOf(3, 5), .outcome = .unsupported_operation },
     .{ .wanted = regionOf(2, 4), .outcome = .unsupported_operation },
-    .{ .wanted = regionOf(3, 3), .outcome = .unsupported_operation },
-    // A largest output width of at least the image width, and a smaller
-    // one, which reports its grid.
+    .{
+        .wanted = .{
+            .region = .{ .left = 1, .top = 0, .right = 3, .bottom = 4 },
+        },
+        .outcome = .unsupported_operation,
+    },
+    // A largest output width of at least the image width keeps the
+    // image grid.
     .{ .wanted = .{ .max_output_width = 3 }, .outcome = null },
     .{ .wanted = .{ .max_output_width = 4 }, .outcome = null },
-    .{
-        .wanted = .{ .max_output_width = 2 },
-        .outcome = .unsupported_operation,
-        .grid = .{ 2, 3 },
-    },
     // The byte ceilings of the lease, which come after the region.
     .{
         .limit = "output_lease_bytes",
@@ -2073,8 +2059,7 @@ const admission_cases = [_]AdmissionCase{
         .outcome = .budget_exceeded,
     },
     // Each check decides before the checks after it: the image limits
-    // before the region, and the region and the scale before the
-    // ceilings.
+    // before the region, and the region before the ceilings.
     .{
         .limit = "image_axis_pixels",
         .value = 3,
@@ -2091,9 +2076,8 @@ const admission_cases = [_]AdmissionCase{
     .{
         .limit = "output_lease_bytes",
         .value = image_lease_bytes - 1,
-        .wanted = .{ .max_output_width = 2 },
+        .wanted = regionOf(2, 4),
         .outcome = .unsupported_operation,
-        .grid = .{ 2, 3 },
     },
 };
 
@@ -2495,4 +2479,440 @@ test "a held lease counts against its limit and keeps the shutdown pending" {
     // shutdown complete.
     try rig.releaseLease(taken.report.lease.?);
     try rig.finish();
+}
+
+/// Checks that the row `row` of `lease` holds the image row `index` of
+/// a scripted codec at the image size, with an alpha of 255.
+fn expectImageRow(lease: *Lease, row: u32, index: u32) !void {
+    for (lease.row(row), 0..) |byte, at| {
+        const expected = if (at % 4 == 3)
+            0xff
+        else
+            Scripted.sample(index, at / 4 * 3 + at % 4);
+
+        try testing.expectEqual(expected, byte);
+    }
+}
+
+/// Checks that the row `row` of `lease` holds the grid row `grid_row` of
+/// a scripted image scaled to half its size: each sample is the mean of
+/// a block of two by two samples, halves up.
+fn expectHalvedRow(lease: *Lease, row: u32, grid_row: u32) !void {
+    for (lease.row(row), 0..) |byte, at| {
+        if (at % 4 == 3) {
+            try testing.expectEqual(0xff, byte);
+
+            continue;
+        }
+
+        var sum: u32 = 2;
+
+        for ([_]u32{ 2 * grid_row, 2 * grid_row + 1 }) |index| {
+            for ([_]usize{ 2 * (at / 4), 2 * (at / 4) + 1 }) |column| {
+                sum += Scripted.sample(index, column * 3 + at % 4);
+            }
+        }
+
+        try testing.expectEqual(sum / 4, byte);
+    }
+}
+
+test "a band at the image size ends the job at its last row" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admit(try rig.open(), .{
+        .region = .{ .left = 0, .top = 1, .right = 3, .bottom = 3 },
+    });
+
+    // The input goes on behind the band, with a command that would fail
+    // a job that read it.
+    const script = image_script ++ row_command ++ row_command ++
+        row_command ++ invalid_command;
+
+    const taken = try rig.run(handle, &script, false);
+
+    try testing.expectEqual(.completed, taken.outcome);
+    try testing.expectEqual(3, taken.report.decoded_rows);
+    try testing.expectEqual(2, taken.report.covered_rows);
+    try testing.expectEqual(1, taken.report.revision);
+
+    try testing.expectEqual(
+        Report.Admitted{ .width = 3, .height = 2, .top = 1 },
+        taken.report.admitted,
+    );
+
+    const lease = try rig.leaseOf(taken.report.lease.?);
+
+    try expectImageRow(lease, 0, 1);
+    try expectImageRow(lease, 1, 2);
+    try rig.releaseLease(taken.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a band publishes no row above it and each of its rows" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admit(try rig.open(), .{
+        .region = .{ .left = 0, .top = 2, .right = 3, .bottom = 4 },
+    });
+
+    const above = try rig.run(
+        handle,
+        &(image_script ++ row_command ++ row_command),
+        false,
+    );
+
+    try testing.expectEqual(null, above.outcome);
+    try testing.expectEqual(2, above.report.decoded_rows);
+    try testing.expectEqual(0, above.report.covered_rows);
+    try testing.expectEqual(null, above.report.lease);
+
+    const inside = try rig.run(handle, &row_command, false);
+
+    try testing.expectEqual(null, inside.outcome);
+    try testing.expectEqual(1, inside.report.covered_rows);
+    try expectImageRow(try rig.leaseOf(inside.report.lease.?), 0, 2);
+
+    // The band reaches the last row of the image, so the job reads its
+    // input to the end, and a command that breaks the format fails it.
+    const last = try rig.run(handle, &row_command, false);
+
+    try testing.expectEqual(null, last.outcome);
+    try testing.expectEqual(2, last.report.covered_rows);
+
+    const ended = try rig.run(handle, &invalid_command, true);
+
+    try testing.expectEqual(.invalid_content, ended.outcome);
+    try testing.expectEqual(2, ended.report.covered_rows);
+    try rig.releaseLease(ended.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+const halved_script = Scripted.imageCommand(4, 4);
+
+const halved_admission: Decode.Admission = .{
+    .image = .{ .width = 4, .height = 4, .layout = .rgb8 },
+    .output_width = 2,
+    .output_height = 2,
+};
+
+test "a scaled image publishes each grid row as its image rows arrive" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admit(try rig.open(), .{ .max_output_width = 2 });
+
+    const first = try rig.run(handle, &(halved_script ++ row_command), false);
+
+    try testing.expectEqual(null, first.outcome);
+    try testing.expectEqual(halved_admission, first.report.admission);
+    try testing.expectEqual(1, first.report.decoded_rows);
+    try testing.expectEqual(0, first.report.covered_rows);
+    try testing.expectEqual(null, first.report.lease);
+
+    try testing.expectEqual(
+        Report.Admitted{ .width = 2, .height = 2 },
+        first.report.admitted,
+    );
+
+    const second = try rig.run(handle, &row_command, false);
+
+    try testing.expectEqual(1, second.report.covered_rows);
+    try testing.expectEqual(1, second.report.revision);
+
+    const rest = row_command ++ row_command ++ end_command;
+
+    const last = try rig.run(handle, &rest, true);
+
+    try testing.expectEqual(.completed, last.outcome);
+    try testing.expectEqual(4, last.report.decoded_rows);
+    try testing.expectEqual(2, last.report.covered_rows);
+
+    const lease = try rig.leaseOf(last.report.lease.?);
+
+    try expectHalvedRow(lease, 0, 0);
+    try expectHalvedRow(lease, 1, 1);
+    try rig.releaseLease(last.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a scaled band takes the image rows that its grid rows cover" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    // The image rows 2 to 5 of 8 are the grid rows 1 and 2 of 4.
+    const handle = try rig.admit(try rig.open(), .{
+        .region = .{ .left = 0, .top = 2, .right = 4, .bottom = 6 },
+        .max_output_width = 2,
+    });
+
+    const script = comptime Scripted.imageCommand(4, 8) ++ row_command ++
+        row_command ++ row_command ++ row_command ++ row_command ++
+        row_command ++ invalid_command;
+
+    const taken = try rig.run(handle, &script, false);
+
+    try testing.expectEqual(.completed, taken.outcome);
+    try testing.expectEqual(6, taken.report.decoded_rows);
+    try testing.expectEqual(2, taken.report.covered_rows);
+
+    try testing.expectEqual(
+        Report.Admitted{ .width = 2, .height = 2, .top = 1 },
+        taken.report.admitted,
+    );
+
+    const lease = try rig.leaseOf(taken.report.lease.?);
+
+    try expectHalvedRow(lease, 0, 1);
+    try expectHalvedRow(lease, 1, 2);
+    try rig.releaseLease(taken.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a band from the first row ends above the last row" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const handle = try rig.admit(try rig.open(), regionOf(3, 3));
+
+    const script = image_script ++ row_command ++ row_command ++
+        row_command ++ invalid_command;
+
+    const taken = try rig.run(handle, &script, false);
+
+    try testing.expectEqual(.completed, taken.outcome);
+    try testing.expectEqual(3, taken.report.decoded_rows);
+
+    try testing.expectEqual(
+        Report.Admitted{ .width = 3, .height = 3 },
+        taken.report.admitted,
+    );
+
+    const lease = try rig.leaseOf(taken.report.lease.?);
+
+    for (0..3) |row| try expectImageRow(lease, @intCast(row), @intCast(row));
+
+    try rig.releaseLease(taken.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+/// Returns a script of `count` rows.
+fn rowsOf(comptime count: usize) [count]u8 {
+    return @splat(@backingInt(Scripted.Command.row));
+}
+
+/// The units that the cell `cell` of a grid with cells of `size` units
+/// shares with the cell `other` of a grid with cells of `other_size`.
+fn sharedUnits(cell: u64, size: u64, other: u64, other_size: u64) u64 {
+    const low = @max(cell * size, other * other_size);
+    const high = @min((cell + 1) * size, (other + 1) * other_size);
+
+    return high -| low;
+}
+
+/// The area average of one sample of the grid of a scripted image, over
+/// every pixel of the image at once.
+fn averaged(
+    image: [2]u32,
+    grid: [2]u32,
+    column: usize,
+    row: u32,
+    channel: usize,
+) u8 {
+    var sum: u128 = 0;
+
+    for (0..image[1]) |y| {
+        const rows = sharedUnits(y, grid[1], row, image[1]);
+
+        for (0..image[0]) |x| {
+            const columns = sharedUnits(x, grid[0], column, image[0]);
+            const sample = Scripted.sample(@intCast(y), x * 3 + channel);
+
+            sum += @as(u128, rows) * columns * sample;
+        }
+    }
+
+    const area = @as(u128, image[0]) * image[1];
+
+    return @intCast((sum + area / 2) / area);
+}
+
+test "a scaled band between grid edges publishes as its rows arrive" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    // 36 by 100 pixels scale to 27 by 75, so a grid row covers 1.33
+    // image rows. The image rows 41 to 58 lie in the grid rows 30 to
+    // 44, which cover the image rows 40 to 59.
+    const handle = try rig.admit(try rig.open(), .{
+        .region = .{ .left = 0, .top = 41, .right = 36, .bottom = 59 },
+        .max_output_width = 27,
+    });
+
+    // The image row 40 starts the first grid row and does not end it.
+    const above = comptime Scripted.imageCommand(36, 100) ++ rowsOf(41);
+
+    const started = try rig.run(handle, &above, false);
+
+    try testing.expectEqual(null, started.outcome);
+    try testing.expectEqual(41, started.report.decoded_rows);
+    try testing.expectEqual(0, started.report.covered_rows);
+
+    try testing.expectEqual(
+        Report.Admitted{ .width = 27, .height = 15, .top = 30 },
+        started.report.admitted,
+    );
+
+    // The image row 41 ends it, in the step that delivers that row.
+    const first = try rig.run(handle, &rowsOf(1), false);
+
+    try testing.expectEqual(null, first.outcome);
+    try testing.expectEqual(1, first.report.covered_rows);
+
+    // The image row 59 ends the last grid row and the job, in a later
+    // step than the first row, and nothing behind it is read.
+    const last = try rig.run(handle, &(rowsOf(18) ++ invalid_command), false);
+
+    try testing.expectEqual(.completed, last.outcome);
+    try testing.expectEqual(60, last.report.decoded_rows);
+    try testing.expectEqual(15, last.report.covered_rows);
+
+    const lease = try rig.leaseOf(last.report.lease.?);
+
+    for (0..15) |row| {
+        for (lease.row(@intCast(row)), 0..) |byte, at| {
+            const expected = if (at % 4 == 3) 0xff else averaged(
+                .{ 36, 100 },
+                .{ 27, 75 },
+                at / 4,
+                @intCast(30 + row),
+                at % 4,
+            );
+
+            try testing.expectEqual(expected, byte);
+        }
+    }
+
+    try rig.releaseLease(last.report.lease.?);
+    try rig.drop(handle);
+    try rig.finish();
+}
+
+test "a scale of an image beyond the exact sums is no operation of the build" {
+    var limits = Rig.limitsOf(.{});
+
+    limits.image_axis_pixels = std.math.maxInt(u31);
+    limits.image_area_pixels = std.math.maxInt(i64);
+
+    // An area of 2^60 pixels, above the 2^56 that the sums of a scale
+    // hold exactly.
+    const script = comptime Scripted.imageCommand(1 << 30, 1 << 30);
+
+    const Case = struct { wanted: Request, outcome: Outcome, width: u32 };
+
+    const cases = [_]Case{
+        // The scale decides before the ceilings, and the image at its
+        // own size only meets the ceiling of its lease.
+        .{
+            .wanted = .{ .max_output_width = 1 },
+            .outcome = .unsupported_operation,
+            .width = 1,
+        },
+        .{ .wanted = .{}, .outcome = .budget_exceeded, .width = 1 << 30 },
+    };
+
+    for (cases) |case| {
+        var rig: Rig = undefined;
+
+        try rig.startUnder(limits);
+
+        const handle = try rig.admit(try rig.open(), case.wanted);
+
+        const taken = try rig.run(handle, &script, false);
+
+        const admission = taken.report.admission.?;
+
+        try testing.expectEqual(case.outcome, taken.outcome);
+        try testing.expectEqual(case.width, admission.output_width);
+        try testing.expectEqual(null, taken.report.admitted);
+        try testing.expectEqual(0, Lease.countLive(rig.engine));
+        try rig.expectSettled();
+        try rig.drop(handle);
+        try rig.finish();
+    }
+}
+
+test "each failed allocation of a scaled decode keeps nothing" {
+    // The state of the codec, the pixels of the lease, the words of the
+    // scale, and the workspace of the codec, in the order of their
+    // allocation. A decode whose words fail holds its pixels until the
+    // job ends, without an admitted lease.
+    const reports = [_]Report{
+        .{},
+        .{ .admission = halved_admission },
+        .{ .admission = halved_admission },
+        .{
+            .admission = halved_admission,
+            .admitted = .{ .width = 2, .height = 2 },
+        },
+    };
+
+    const script = halved_script ++ row_command ++ row_command;
+
+    for (0..reports.len + 1) |fail_index| {
+        var rig: Rig = undefined;
+
+        try rig.start(.{});
+
+        const handle = try rig.admit(try rig.open(), .{
+            .max_output_width = 2,
+        });
+
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+
+        rig.backing.gpa = failing.allocator();
+
+        const taken = try rig.run(handle, &script, false);
+
+        rig.backing.gpa = testing.allocator;
+
+        if (fail_index == reports.len) {
+            // A scaled decode allocates nothing else, so the step
+            // succeeds and covers the first grid row.
+            try testing.expectEqual(null, taken.outcome);
+            try testing.expectEqual(1, taken.report.covered_rows);
+            try rig.expectSettled();
+            try rig.releaseLease(taken.report.lease.?);
+            try cancel(&rig.slot, handle);
+            try testing.expectEqual(.canceled, try rig.advance(handle));
+        } else {
+            try testing.expectEqual(.allocation_failed, taken.outcome);
+            try testing.expectEqual(reports[fail_index], taken.report);
+            try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
+        }
+
+        const usage = &rig.engine.heap.ledger.usage;
+
+        try testing.expectEqual(0, usage.output);
+        try testing.expectEqual(0, usage.reserved);
+        try testing.expectEqual(0, Lease.countLive(rig.engine));
+        try rig.expectSettled();
+        try rig.drop(handle);
+        try rig.finish();
+    }
 }
