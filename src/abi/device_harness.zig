@@ -134,6 +134,7 @@ pub fn main(init: std.process.Init) !u8 {
     inline for (.{
         .{ "corpus: ordinary page", corpus.decodesOrdinary },
         .{ "corpus: long segment", corpus.refusesLong },
+        .{ "corpus: scaled band", corpus.scalesLongBand },
     }) |named| {
         const name, const run = named;
 

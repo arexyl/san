@@ -1,8 +1,13 @@
-//! The corpus cases of the C ABI: decodes of two fixtures of a reader
+//! The corpus cases of the C ABI: decodes of three fixtures of a reader
 //! corpus through the functions of the Bindings header, as a caller
-//! makes them. The host tests of this file and the Android harness of
-//! the C ABI run the same cases against a directory that the caller
-//! names. San holds no fixture of the corpus.
+//! makes them. The host tests of this file run every case against a
+//! directory that the caller names, and the Android harness of the C
+//! ABI runs those that it lists. San holds no fixture of the corpus.
+//!
+//! A case that scales compares its pixels with the area average of the
+//! same image decoded at the image size: for each sample, the sum over
+//! the pixels that its grid cell covers, without the row-by-row sums of
+//! the engine.
 //!
 //! The directory holds `manifest.json` and the fixtures at the paths
 //! that it states. For each fixture of a case, the manifest gives the
@@ -53,6 +58,7 @@ const manifest_schema = 1;
 /// lease, and a segment of 1440 by 40000 pixels, whose lease does not.
 const ordinary_path = "journey/ordinary.png";
 const long_path = "journey/long.png";
+const large_path = "qualification/timed/large.png";
 
 /// The largest file that a case reads, above the largest of the corpus.
 const max_file_bytes = 32 << 20;
@@ -200,18 +206,13 @@ const Fixture = struct {
             .held_rows = hold.source_rows,
         };
     }
-
-    /// The bytes of one row of the lease.
-    fn rowBytes(fixture: Fixture) usize {
-        return @as(usize, @intCast(fixture.width)) * 4;
-    }
 };
 
 /// The value of every byte of a destination that no copy wrote.
 const untouched: u8 = 0xa5;
 
-/// A destination of rows of a fixture with a padded stride, which no
-/// copy has written.
+/// A destination of rows of `width` pixels with a padded stride, which
+/// no copy has written.
 const Canvas = struct {
     pixels: []u8,
     rows: i32,
@@ -219,8 +220,8 @@ const Canvas = struct {
 
     const padding = 16;
 
-    fn init(arena: Allocator, fixture: Fixture, rows: i32) Error!Canvas {
-        const row_bytes = fixture.rowBytes();
+    fn init(arena: Allocator, width: i32, rows: i32) Error!Canvas {
+        const row_bytes = @as(usize, @intCast(width)) * 4;
         const count: usize = @intCast(rows);
 
         const pixels = try arena.alloc(u8, count * (row_bytes + padding));
@@ -308,7 +309,7 @@ fn expectStatus(expected: san.san_status, status: san.san_status) Error!void {
 
 const Report = [san.SAN_JOB_REPORT_LENGTH]i64;
 
-/// One engine with one content and its job for the whole image.
+/// One engine with one content and its job.
 const Decode = struct {
     engine: san.san_handle,
     content: san.san_handle,
@@ -321,7 +322,10 @@ const Decode = struct {
     /// holds from then on.
     lease: san.san_handle = san.SAN_NO_HANDLE,
 
-    fn start(limits: san.san_engine_limits) Error!Decode {
+    fn start(
+        limits: san.san_engine_limits,
+        request: san.san_output_request,
+    ) Error!Decode {
         var engine: san.san_handle = san.SAN_NO_HANDLE;
 
         try expectStatus(
@@ -344,10 +348,57 @@ const Decode = struct {
 
         try expectStatus(
             san.SAN_STATUS_OK,
-            san.san_job_request(decode.content, &whole, &decode.job),
+            san.san_job_request(decode.content, &request, &decode.job),
         );
 
         return decode;
+    }
+
+    /// Feeds `bytes` from the bytes received on, in portions with a step
+    /// after each, until a step returns another status than
+    /// SAN_STATUS_INPUT_NEEDED, and ends the input with the last portion.
+    /// Returns that status. A job that completes before the end of
+    /// `bytes` leaves the rest unfed.
+    fn run(decode: *Decode, bytes: []const u8) Error!san.san_status {
+        while (true) {
+            const length = @min(bytes.len - decode.fed, portion_bytes);
+            const last = decode.fed + length == bytes.len;
+
+            try expectStatus(san.SAN_STATUS_OK, san.san_content_feed(
+                decode.content,
+                @intCast(decode.fed),
+                bytes[decode.fed..].ptr,
+                @intCast(length),
+                @intFromBool(last),
+            ));
+
+            decode.fed += length;
+
+            const status = try decode.step();
+
+            if (last or status != san.SAN_STATUS_INPUT_NEEDED) return status;
+        }
+    }
+
+    /// Releases the job, the content, and the held lease of a case that
+    /// is done, and ends the engine.
+    fn finish(decode: Decode) Error!void {
+        try expectStatus(san.SAN_STATUS_OK, san.san_job_release(decode.job));
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_content_close(decode.content),
+        );
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_output_release(decode.lease),
+        );
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_engine_shutdown(decode.engine),
+        );
     }
 
     /// Feeds `bytes` from the bytes received up to `upto`, in portions
@@ -418,18 +469,13 @@ const Decode = struct {
     }
 
     /// Copies the first `rows` rows of the lease to the top of `canvas`.
-    fn copy(
-        decode: Decode,
-        fixture: Fixture,
-        canvas: Canvas,
-        rows: i32,
-    ) san.san_status {
+    fn copy(decode: Decode, canvas: Canvas, rows: i32) san.san_status {
         return san.san_output_copy(
             decode.lease,
             0,
             rows,
             canvas.pixels.ptr,
-            fixture.width,
+            @intCast(canvas.row_bytes / 4),
             canvas.rows,
             @intCast(canvas.stride()),
             0,
@@ -489,13 +535,25 @@ fn expectRows(report: Report, rows: i64) Error!void {
 /// hold an image in the pixel profile. Every pixel of an image without
 /// alpha has an alpha of 255.
 fn samplesOf(arena: Allocator, canvas: Canvas) Error!Digest {
+    var hash: Sha256 = .init(.{});
+
+    try hashRows(arena, &hash, canvas, canvas.rows);
+
+    return hash.finalResult();
+}
+
+/// Adds the RGB samples of the first `rows` rows of `canvas` to `hash`.
+fn hashRows(
+    arena: Allocator,
+    hash: *Sha256,
+    canvas: Canvas,
+    rows: i32,
+) Error!void {
     const width = canvas.row_bytes / 4;
 
     const samples = try arena.alloc(u8, width * 3);
 
-    var hash: Sha256 = .init(.{});
-
-    for (0..@intCast(canvas.rows)) |index| {
+    for (0..@intCast(rows)) |index| {
         const row = canvas.row(index);
 
         for (0..width) |column| {
@@ -508,8 +566,388 @@ fn samplesOf(arena: Allocator, canvas: Canvas) Error!Digest {
 
         hash.update(samples);
     }
+}
 
-    return hash.finalResult();
+/// The request of the image rows [top, bottom) of `fixture` at every
+/// column, in a grid of at most `max_output_width` columns, or at the
+/// image size for 0.
+fn rowsOf(
+    fixture: Fixture,
+    top: i32,
+    bottom: i32,
+    max_output_width: i32,
+) san.san_output_request {
+    return .{
+        .left = 0,
+        .top = top,
+        .right = fixture.width,
+        .bottom = bottom,
+        .max_output_width = max_output_width,
+    };
+}
+
+/// The output grid and the lease of an admitted job.
+const Shape = struct {
+    grid_width: i64,
+    grid_height: i64,
+    /// The rows of the lease, and its first row in the grid.
+    rows: i64,
+    top: i64,
+
+    /// Returns the grid of `fixture` at `width` columns, with the height
+    /// rounded to the nearest row, halves up, and the lease of the grid
+    /// rows [top, bottom).
+    fn of(fixture: Fixture, width: i64, top: i64, bottom: i64) Shape {
+        const image_width: i64 = fixture.width;
+        const image_height: i64 = fixture.height;
+
+        const height = @divFloor(
+            2 * image_height * width + image_width,
+            2 * image_width,
+        );
+
+        return .{
+            .grid_width = width,
+            .grid_height = @max(1, height),
+            .rows = bottom - top,
+            .top = top,
+        };
+    }
+};
+
+/// Checks the elements that the admission step of `fixture` writes for
+/// an admitted lease of `shape`, which holds every column of its grid.
+fn expectShape(report: Report, fixture: Fixture, shape: Shape) Error!void {
+    const expected = [_]struct { usize, i64 }{
+        .{ san.SAN_JOB_REPORT_IMAGE_WIDTH, fixture.width },
+        .{ san.SAN_JOB_REPORT_IMAGE_HEIGHT, fixture.height },
+        .{ san.SAN_JOB_REPORT_OUTPUT_WIDTH, shape.grid_width },
+        .{ san.SAN_JOB_REPORT_OUTPUT_HEIGHT, shape.grid_height },
+        .{ san.SAN_JOB_REPORT_LEASE_WIDTH, shape.grid_width },
+        .{ san.SAN_JOB_REPORT_LEASE_HEIGHT, shape.rows },
+        .{ san.SAN_JOB_REPORT_LEASE_LEFT, 0 },
+        .{ san.SAN_JOB_REPORT_LEASE_TOP, shape.top },
+        .{ san.SAN_JOB_REPORT_ALPHA, san.SAN_ALPHA_OPAQUE },
+        .{ san.SAN_JOB_REPORT_EARLY_PUBLICATION, 1 },
+        .{ san.SAN_JOB_REPORT_WARNINGS, 0 },
+    };
+
+    for (expected) |element| {
+        const index, const value = element;
+
+        if (report[index] != value) return error.UnexpectedReport;
+    }
+}
+
+/// Decodes the image rows [top, bottom) of `fixture` at the image size
+/// into the top of `canvas`, whose rows are unwritten. A band that ends
+/// above the last row of the image completes at its last row, with
+/// exactly the rows down to it decoded.
+fn decodeBand(
+    fixture: Fixture,
+    canvas: Canvas,
+    top: i32,
+    bottom: i32,
+) Error!void {
+    var decode: Decode =
+        try .start(page_limits, rowsOf(fixture, top, bottom, 0));
+    errdefer decode.abandon();
+
+    try expectStatus(san.SAN_STATUS_OK, try decode.run(fixture.bytes));
+
+    const report = decode.report;
+    const rows = bottom - top;
+
+    if (report[san.SAN_JOB_REPORT_COVERED_ROWS] != rows or
+        report[san.SAN_JOB_REPORT_DECODED_ROWS] != bottom)
+    {
+        return error.UnexpectedReport;
+    }
+
+    try expectShape(
+        report,
+        fixture,
+        .of(fixture, fixture.width, top, bottom),
+    );
+
+    try expectStatus(san.SAN_STATUS_OK, decode.copy(canvas, rows));
+    try canvas.expectRest(rows);
+    try decode.finish();
+}
+
+/// Checks that the rows of `scaled`, the grid rows from `shape.top` on,
+/// are the area average of the image of `fixture`, whose rows from
+/// `first` on `reference` holds at the image size. Each sample is the
+/// sum over the pixels that its grid cell covers, each times the part
+/// of it that the cell covers on either axis, divided by the area of
+/// the image and rounded to the nearest value, halves up.
+fn expectAverage(
+    fixture: Fixture,
+    reference: Canvas,
+    first: usize,
+    scaled: Canvas,
+    shape: Shape,
+) Error!void {
+    const image_width: u64 = @intCast(fixture.width);
+    const image_height: u64 = @intCast(fixture.height);
+    const width: u64 = @intCast(shape.grid_width);
+    const height: u64 = @intCast(shape.grid_height);
+    const area = image_width * image_height;
+    const top: u64 = @intCast(shape.top);
+
+    for (0..@intCast(shape.rows)) |index| {
+        const row_low = (top + index) * image_height;
+        const row_high = row_low + image_height;
+
+        for (0..@intCast(width)) |column| {
+            const column_low = column * image_width;
+            const column_high = column_low + image_width;
+
+            var sums: [3]u64 = @splat(0);
+            var y = row_low / height;
+
+            while (y * height < row_high) : (y += 1) {
+                const rows = @min((y + 1) * height, row_high) -
+                    @max(y * height, row_low);
+
+                const source = reference.row(@intCast(y - first));
+
+                var x = column_low / width;
+
+                while (x * width < column_high) : (x += 1) {
+                    const columns = @min((x + 1) * width, column_high) -
+                        @max(x * width, column_low);
+
+                    const pixel = source[@intCast(x * 4)..][0..3];
+
+                    for (&sums, pixel) |*sum, sample| {
+                        sum.* += rows * columns * sample;
+                    }
+                }
+            }
+
+            const pixel = scaled.row(index)[column * 4 ..][0..4];
+
+            for (sums, pixel[0..3]) |sum, sample| {
+                if ((sum + area / 2) / area != sample) {
+                    return error.UnexpectedPixels;
+                }
+            }
+
+            if (pixel[3] != 0xff) return error.UnexpectedPixels;
+        }
+    }
+}
+
+/// The rows of one band of the long segment at the image size: one
+/// reference viewport at the width of the segment.
+const band_rows = 2560;
+
+/// The columns of the reference viewport, which the scaled cases request.
+const viewport_width = 1080;
+
+/// Decodes the long segment at the image size in bands of one viewport
+/// each, every band in a job of its own under the ceiling of one lease
+/// that refuses the whole segment. The samples of the bands in order
+/// hash to the value of the manifest for the whole image.
+pub fn joinsLongBands(
+    io: std.Io,
+    arena: Allocator,
+    directory: []const u8,
+) Error!void {
+    const fixture: Fixture = try .read(io, arena, directory, long_path);
+
+    const canvas: Canvas = try .init(arena, fixture.width, band_rows);
+
+    var hash: Sha256 = .init(.{});
+    var top: i32 = 0;
+
+    while (top < fixture.height) : (top += band_rows) {
+        const bottom = @min(top + band_rows, fixture.height);
+
+        @memset(canvas.pixels, untouched);
+        try decodeBand(fixture, canvas, top, bottom);
+        try hashRows(arena, &hash, canvas, bottom - top);
+    }
+
+    if (!std.mem.eql(u8, &hash.finalResult(), &fixture.samples)) {
+        return error.UnexpectedPixels;
+    }
+}
+
+/// Decodes one viewport in the middle of the long segment, scaled to
+/// the width of the reference viewport. The region lies one image row
+/// inside the edges of its grid rows, so the job takes one image row
+/// above and one below it. The job completes at its last image row,
+/// before the end of the input, and its rows are the area average of
+/// the same image rows at the image size.
+pub fn scalesLongBand(
+    io: std.Io,
+    arena: Allocator,
+    directory: []const u8,
+) Error!void {
+    const fixture: Fixture = try .read(io, arena, directory, long_path);
+
+    // Four image rows scale to three grid rows, so these edges are
+    // edges of grid rows.
+    const top = 18720;
+    const bottom = top + band_rows;
+
+    if (bottom >= fixture.height or fixture.width != 1440) {
+        return error.ManifestUnusable;
+    }
+
+    const reference: Canvas = try .init(arena, fixture.width, band_rows);
+
+    try decodeBand(fixture, reference, top, bottom);
+
+    var decode: Decode = try .start(
+        page_limits,
+        rowsOf(fixture, top + 1, bottom - 1, viewport_width),
+    );
+    errdefer decode.abandon();
+
+    try expectStatus(san.SAN_STATUS_OK, try decode.run(fixture.bytes));
+
+    if (decode.fed == fixture.bytes.len) return error.UnexpectedReport;
+
+    const shape: Shape = .of(
+        fixture,
+        viewport_width,
+        top / 4 * 3,
+        bottom / 4 * 3,
+    );
+
+    const report = decode.report;
+
+    if (report[san.SAN_JOB_REPORT_COVERED_ROWS] != shape.rows or
+        report[san.SAN_JOB_REPORT_DECODED_ROWS] != bottom)
+    {
+        return error.UnexpectedReport;
+    }
+
+    try expectShape(report, fixture, shape);
+
+    const scaled: Canvas =
+        try .init(arena, viewport_width, @intCast(shape.rows));
+
+    try expectStatus(
+        san.SAN_STATUS_OK,
+        decode.copy(scaled, @intCast(shape.rows)),
+    );
+
+    try scaled.expectRest(@intCast(shape.rows));
+    try expectAverage(fixture, reference, top, scaled, shape);
+    try decode.finish();
+}
+
+/// The limits of a reader with room for the large page at the image
+/// size in one lease.
+const large_limits: san.san_engine_limits = roomy: {
+    var limits = page_limits;
+
+    limits.aggregate_budget_bytes = 1 << 30;
+    limits.output_bytes = 128 << 20;
+    limits.output_lease_bytes = 128 << 20;
+
+    break :roomy limits;
+};
+
+/// Decodes the large page scaled to the width of the reference viewport
+/// under the ceiling of one lease that refuses it at the image size.
+/// The bytes before the hold publish every grid row that the image
+/// rows of the hold complete, and the whole output is the area average
+/// of the page at the image size, whose samples hash to the value of
+/// the manifest.
+pub fn scalesLarge(
+    io: std.Io,
+    arena: Allocator,
+    directory: []const u8,
+) Error!void {
+    const fixture: Fixture = try .read(io, arena, directory, large_path);
+
+    const reference: Canvas = try .init(arena, fixture.width, fixture.height);
+
+    {
+        var decode: Decode = try .start(large_limits, whole);
+        errdefer decode.abandon();
+
+        try expectStatus(san.SAN_STATUS_OK, try decode.run(fixture.bytes));
+        try expectRows(decode.report, fixture.height);
+        try expectGeometry(decode.report, fixture, true);
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            decode.copy(reference, fixture.height),
+        );
+
+        try decode.finish();
+    }
+
+    const samples = try samplesOf(arena, reference);
+
+    if (!std.mem.eql(u8, &samples, &fixture.samples)) {
+        return error.UnexpectedPixels;
+    }
+
+    var decode: Decode = try .start(
+        page_limits,
+        rowsOf(fixture, 0, fixture.height, viewport_width),
+    );
+    errdefer decode.abandon();
+
+    try expectStatus(
+        san.SAN_STATUS_INPUT_NEEDED,
+        try decode.advance(fixture.bytes, fixture.held_from, false),
+    );
+
+    var shape: Shape = .of(fixture, viewport_width, 0, 0);
+
+    shape.rows = shape.grid_height;
+
+    // A grid row is complete when the image rows of the hold reach its
+    // lower edge.
+    const held = @divFloor(
+        @as(i64, fixture.held_rows) * shape.grid_height,
+        fixture.height,
+    );
+
+    const early = decode.report;
+
+    if (early[san.SAN_JOB_REPORT_COVERED_ROWS] != held or
+        early[san.SAN_JOB_REPORT_DECODED_ROWS] != fixture.held_rows)
+    {
+        return error.UnexpectedReport;
+    }
+
+    try expectShape(early, fixture, shape);
+
+    try expectStatus(
+        san.SAN_STATUS_OK,
+        try decode.advance(fixture.bytes, fixture.bytes.len, true),
+    );
+
+    const final = decode.report;
+
+    if (final[san.SAN_JOB_REPORT_COVERED_ROWS] != shape.rows or
+        final[san.SAN_JOB_REPORT_DECODED_ROWS] != fixture.height)
+    {
+        return error.UnexpectedReport;
+    }
+
+    try expectShape(final, fixture, shape);
+
+    const scaled: Canvas =
+        try .init(arena, viewport_width, @intCast(shape.rows));
+
+    try expectStatus(
+        san.SAN_STATUS_OK,
+        decode.copy(scaled, @intCast(shape.rows)),
+    );
+
+    try scaled.expectRest(@intCast(shape.rows));
+    try expectAverage(fixture, reference, 0, scaled, shape);
+    try decode.finish();
 }
 
 /// Decodes the ordinary page with its payload withheld at the hold
@@ -525,7 +963,7 @@ pub fn decodesOrdinary(
 ) Error!void {
     const fixture: Fixture = try .read(io, arena, directory, ordinary_path);
 
-    var decode: Decode = try .start(page_limits);
+    var decode: Decode = try .start(page_limits, whole);
     errdefer decode.abandon();
 
     try expectStatus(
@@ -539,18 +977,19 @@ pub fn decodesOrdinary(
     try expectGeometry(early, fixture, true);
 
     // One row more than the coverage holds is refused and writes nothing.
-    const held: Canvas = try .init(arena, fixture, fixture.held_rows + 1);
+    const held: Canvas =
+        try .init(arena, fixture.width, fixture.held_rows + 1);
 
     try expectStatus(
         san.SAN_STATUS_BINDING_MISMATCH,
-        decode.copy(fixture, held, fixture.held_rows + 1),
+        decode.copy(held, fixture.held_rows + 1),
     );
 
     try held.expectRest(0);
 
     try expectStatus(
         san.SAN_STATUS_OK,
-        decode.copy(fixture, held, fixture.held_rows),
+        decode.copy(held, fixture.held_rows),
     );
 
     try held.expectRest(fixture.held_rows);
@@ -575,11 +1014,11 @@ pub fn decodesOrdinary(
     try expectRows(final, fixture.height);
     try expectGeometry(final, fixture, true);
 
-    const image: Canvas = try .init(arena, fixture, fixture.height);
+    const image: Canvas = try .init(arena, fixture.width, fixture.height);
 
     try expectStatus(
         san.SAN_STATUS_OK,
-        decode.copy(fixture, image, fixture.height),
+        decode.copy(image, fixture.height),
     );
 
     try image.expectRest(fixture.height);
@@ -630,7 +1069,7 @@ pub fn refusesLong(
     // image, and then one byte more.
     if (fixture.bytes.len <= portion_bytes) return error.ManifestUnusable;
 
-    var decode: Decode = try .start(segment_limits);
+    var decode: Decode = try .start(segment_limits, whole);
     errdefer decode.abandon();
 
     try expectStatus(
@@ -701,6 +1140,30 @@ test "the lease of the long segment is refused with its geometry" {
 
     try expectBound();
     try refusesLong(testing.io, arena_state.allocator(), corpus_directory);
+}
+
+test "the bands of the long segment join into its samples" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    try expectBound();
+    try joinsLongBands(testing.io, arena_state.allocator(), corpus_directory);
+}
+
+test "a scaled band of the long segment is the average of its rows" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    try expectBound();
+    try scalesLongBand(testing.io, arena_state.allocator(), corpus_directory);
+}
+
+test "the scaled large page is the average of the page" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    try expectBound();
+    try scalesLarge(testing.io, arena_state.allocator(), corpus_directory);
 }
 
 test "a manifest states its digests as 64 hexadecimal digits" {
