@@ -365,7 +365,7 @@ fn archive(
 ) *std.Build.Step.Compile {
     requireHardening(module, name);
 
-    return b.addLibrary(.{
+    const built = b.addLibrary(.{
         .linkage = .static,
         .name = name,
         .root_module = module,
@@ -377,6 +377,16 @@ fn archive(
             .host => null,
         },
     });
+
+    // An Android archive holds LLVM bitcode, so that the link of the
+    // library that takes it optimizes across Zig and C. The host tests
+    // link the host archives as machine code.
+    switch (platform) {
+        .android => built.lto = .full,
+        .host => {},
+    }
+
+    return built;
 }
 
 /// Returns a module whose root declares San's libpng configuration header

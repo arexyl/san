@@ -17,6 +17,10 @@
 //! - LLVM and LLD, selected explicitly. Without the selection, Zig 0.17.0
 //!   builds x86_64 Debug with its own backend and ELF linker, whose output
 //!   has no PT_GNU_RELRO.
+//! - Link-time optimization across the library's Zig code and the C
+//!   archives that it links, which carry LLVM bitcode for it. The link
+//!   then generates all of the code at once, inlines across the boundary
+//!   between the two languages, and drops what the exports do not reach.
 //! - A version script from the export set that allowlist.zig declares for
 //!   the artifact: the exports stay global, and every other symbol becomes
 //!   local, so that the link can drop what the exports do not reach.
@@ -71,6 +75,7 @@ pub fn add(b: *std.Build, options: Options) *std.Build.Step.Compile {
     library.link_function_sections = true;
     library.link_data_sections = true;
     library.link_gc_sections = true;
+    library.lto = .full;
 
     const script = b.addWriteFiles().add(
         b.fmt("{s}.map", .{options.name}),
