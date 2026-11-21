@@ -46,6 +46,9 @@ const engine_test_modes = [_]std.lang.Optimize{ .debug, .safe };
 /// The root of the C ABI module, which also holds its host tests.
 const abi_root = "src/abi/root.zig";
 
+/// The corpus cases of the C ABI, which also hold their host tests.
+const abi_corpus_root = "src/abi/corpus.zig";
+
 /// The root of libsan_canary_test.so, the device test library of the
 /// stack protector, its test-only C source, and the root of its harness.
 const canary_device_test_root = "src/canary/device_test.zig";
@@ -131,6 +134,8 @@ const Selection = struct {
     ndk: ?[]const u8,
     /// The NDK major of -Dguard-ndk-major, which only adds a failure.
     guard_ndk_major: ?u32,
+    /// The directory of -Dcorpus, which only test-corpus reads.
+    corpus: ?[]const u8,
 };
 
 pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
@@ -156,14 +161,21 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         std.lang.Optimize,
         "optimize",
         "Optimization mode of the Android checks and of the Zig code of " ++
-            "test-codecs, test-abi, and test-jni; requests the codec " ++
-            "packages: " ++ profile.optimize_names,
+            "test-codecs, test-abi, test-corpus, and test-jni; requests " ++
+            "the codec packages: " ++ profile.optimize_names,
     );
 
     const ndk_root = b.option(
         []const u8,
         "ndk",
         "Absolute NDK root of the Android steps; no environment fallback",
+    );
+
+    const corpus_directory = b.option(
+        []const u8,
+        "corpus",
+        "Absolute directory of the reader corpus of test-corpus, with its " ++
+            "manifest.json; no default",
     );
 
     const guard_zig_minor = b.option(
@@ -196,6 +208,12 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         "test-abi",
         "Run the host tests of the C ABI against the translated header, " ++
             "linked with the host codec archives, for -Doptimize",
+    );
+
+    const test_corpus = b.step(
+        "test-corpus",
+        "Decode the fixtures of -Dcorpus through the C ABI on the host, " ++
+            "for -Doptimize",
     );
 
     const test_jni = b.step(
@@ -268,6 +286,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
             test_tsan,
             test_header,
             test_abi,
+            test_corpus,
             test_jni,
             check_header,
             check_engine,
@@ -298,6 +317,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         .optimize = optimize,
         .ndk = ndk_root,
         .guard_ndk_major = guard_ndk_major,
+        .corpus = corpus_directory,
     };
 
     addHeaderCheck(b, check_header, layout, selection);
@@ -316,6 +336,7 @@ pub fn build(b: *std.Build) error{LazyDependencyNeeded}!void {
         null;
 
     addAbiTest(b, test_abi, layout, selection, codec_packages);
+    addCorpusTest(b, test_corpus, layout, selection, codec_packages);
     addJniTest(b, test_jni, layout, selection, codec_packages);
 
     addLibraryStage(b, .{
@@ -676,60 +697,152 @@ fn addAbiTest(
     selection: Selection,
     requested: ?codecs.Packages,
 ) void {
-    const host_codecs = HostCodecs.of(b, step, selection, requested) orelse
+    const host = HostAbi.of(b, step, layout, selection, requested) orelse
         return;
 
-    if (failMissingPackage(b, step, layout)) return;
-
-    const translate_c = b.lazyImport(@This(), "translate_c") orelse return;
-
-    const target = b.resolveTargetQuery(
-        profile.hostQuery(b.graph.host.result),
-    );
-
-    const translation = header.translate(
-        b,
-        translate_c.Translator,
-        b.dependency("translate_c", .{}),
-        target,
-        .host,
-    );
-
-    const engine = b.createModule(.{
-        .root_source_file = b.path(engine_root),
-    });
-
-    const png = switch (addPng(
-        b,
-        translate_c.Translator,
-        host_codecs.packages,
-        target,
-        null,
-        layout,
-        engine,
-    )) {
-        .ok => |module| module,
-        .rejected => |message| return failSteps(b, &.{step}, message),
-    };
-
     const tests = b.addTest(.{
-        .name = b.fmt("abi-{t}", .{host_codecs.optimize}),
-        .root_module = b.createModule(.{
-            .root_source_file = b.path(abi_root),
-            .target = target,
-            .optimize = host_codecs.optimize,
-            // The tests run the system backing on the host libc.
-            .link_libc = true,
-            .imports = &.{
-                .{ .name = "san", .module = translation.san },
-                .{ .name = "engine", .module = engine },
-                .{ .name = "png", .module = png },
-            },
-        }),
+        .name = b.fmt("abi-{t}", .{host.optimize}),
+        .root_module = host.abi,
     });
 
     step.dependOn(&b.addRunArtifact(tests).step);
 }
+
+/// Adds the host tests of the corpus cases of the C ABI, in the mode of
+/// -Doptimize, against the directory of -Dcorpus. The option has no
+/// default, so that no file of San names a path outside its repository.
+fn addCorpusTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    layout: Layout,
+    selection: Selection,
+    requested: ?codecs.Packages,
+) void {
+    const directory = selection.corpus orelse return failSteps(
+        b,
+        &.{step},
+        "missing -Dcorpus; pass the absolute directory of the reader " ++
+            "corpus, which holds its manifest.json",
+    );
+
+    if (!std.fs.path.isAbsolute(directory)) return failSteps(
+        b,
+        &.{step},
+        b.fmt("-Dcorpus={s} is not an absolute path", .{directory}),
+    );
+
+    const host = HostAbi.of(b, step, layout, selection, requested) orelse
+        return;
+
+    const options = b.addOptions();
+
+    options.addOption([]const u8, "directory", directory);
+
+    // The cases call the functions of the header, which the C ABI module
+    // exports into the test binary. As an import, it adds none of its
+    // own tests, which need the state of the process to themselves.
+    const tests = b.addTest(.{
+        .name = b.fmt("corpus-{t}", .{host.optimize}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(abi_corpus_root),
+            .target = host.target,
+            .optimize = host.optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "san", .module = host.san },
+                .{ .name = "abi", .module = host.abi },
+                .{ .name = "corpus_options", .module = options.createModule() },
+            },
+        }),
+    });
+
+    const run = b.addRunArtifact(tests);
+
+    // The tests read the corpus, which the build does not hash, so no
+    // earlier pass may stand for this run.
+    run.has_side_effects = true;
+
+    step.dependOn(&run.step);
+}
+
+/// The C ABI module of the host tests, in the mode of -Doptimize.
+const HostAbi = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    /// The host translation of the Bindings header.
+    san: *std.Build.Module,
+    /// The C ABI, composed with the engine and the PNG decoder over the
+    /// host codec archives.
+    abi: *std.Build.Module,
+
+    /// Returns the module, or null after it failed `step`.
+    fn of(
+        b: *std.Build,
+        step: *std.Build.Step,
+        layout: Layout,
+        selection: Selection,
+        requested: ?codecs.Packages,
+    ) ?HostAbi {
+        const host_codecs = HostCodecs.of(b, step, selection, requested) orelse
+            return null;
+
+        if (failMissingPackage(b, step, layout)) return null;
+
+        const translate_c = b.lazyImport(@This(), "translate_c") orelse
+            return null;
+
+        const target = b.resolveTargetQuery(
+            profile.hostQuery(b.graph.host.result),
+        );
+
+        const translation = header.translate(
+            b,
+            translate_c.Translator,
+            b.dependency("translate_c", .{}),
+            target,
+            .host,
+        );
+
+        const engine = b.createModule(.{
+            .root_source_file = b.path(engine_root),
+        });
+
+        const png = switch (addPng(
+            b,
+            translate_c.Translator,
+            host_codecs.packages,
+            target,
+            null,
+            layout,
+            engine,
+        )) {
+            .ok => |module| module,
+            .rejected => |message| {
+                failSteps(b, &.{step}, message);
+
+                return null;
+            },
+        };
+
+        return .{
+            .target = target,
+            .optimize = host_codecs.optimize,
+            .san = translation.san,
+            .abi = b.createModule(.{
+                .root_source_file = b.path(abi_root),
+                .target = target,
+                .optimize = host_codecs.optimize,
+                // The tests run the system backing on the host libc.
+                .link_libc = true,
+                .imports = &.{
+                    .{ .name = "san", .module = translation.san },
+                    .{ .name = "engine", .module = engine },
+                    .{ .name = "png", .module = png },
+                },
+            }),
+        };
+    }
+};
 
 /// Adds the host tests of the JNI layer, in the mode of -Doptimize. The
 /// headers of the layer come from the NDK, so the host translates them
@@ -1331,8 +1444,9 @@ fn addDeviceStage(
         .ndk = found,
     });
 
-    // The harness decodes the PNG that is built at compile time, because
-    // the writer of the test images is no part of it.
+    // The harness holds the PNG that is built at compile time, because
+    // the writer of the test images is no part of it. It reads the
+    // fixtures of the corpus at run time.
     const abi_imports: []const std.Build.Module.Import = &.{
         .{ .name = "san", .module = translation.san },
         .{ .name = "engine", .module = androidEngine(b) },

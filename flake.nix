@@ -86,6 +86,13 @@
             exit 2
           fi
 
+          # The reader corpus lies outside this repository, so the caller names it.
+          if [ "$#" -ne 1 ] || [ ! -f "$1/manifest.json" ] || [ ! -d "$1/journey" ]; then
+            echo "usage: san-device <corpus>, the directory of the reader corpus with its manifest.json and journey/" >&2
+            exit 2
+          fi
+
+          corpus=$1
           remote=/data/local/tmp/san
           failed=0
 
@@ -112,7 +119,7 @@
             "san-png-harness inject"
             "san-png-harness cancel"
             "san-png-harness stress"
-            "san-abi-harness"
+            "san-abi-harness corpus"
             "san-jni-harness"
             "san-canary-harness control"
           )
@@ -130,10 +137,15 @@
               files+=("$staged/$name")
             done
 
-            adb shell "rm -rf $remote && mkdir $remote" </dev/null
+            adb shell "rm -rf $remote && mkdir -p $remote/corpus" </dev/null
 
             # adb reports the progress of a push on the error stream.
             if ! pushed=$(adb push "''${files[@]}" "$remote/" 2>&1); then
+              echo "$pushed" >&2
+              exit 1
+            fi
+
+            if ! pushed=$(adb push "$corpus/manifest.json" "$corpus/journey" "$remote/corpus/" 2>&1); then
               echo "$pushed" >&2
               exit 1
             fi

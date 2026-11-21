@@ -1,7 +1,8 @@
 //! The Android harness of libsan_abi_test.so, the device test library of
 //! the C ABI. It needs the library through DT_NEEDED and calls the
 //! functions of the Bindings header as a caller would. It runs beside
-//! the library on the device: `LD_LIBRARY_PATH=. ./san-abi-harness`.
+//! the library on the device, with the directory of the reader corpus:
+//! `LD_LIBRARY_PATH=. ./san-abi-harness <corpus>`.
 //!
 //! The binding flag and the engine slot belong to the process, so the
 //! cases run in one fixed order: the calls before the binding is
@@ -10,12 +11,14 @@
 //! of an engine, a job from its request to its release with a pending
 //! shutdown, one decode with the lease that outlives it, early output
 //! with the outcomes that keep it, cancellations that race the step of
-//! their job, a run of engines one after another, and creations that
-//! race from several threads.
+//! their job, a run of engines one after another, creations that race
+//! from several threads, and the cases of the corpus.
 //!
-//! The decodes read an image that is built at compile time. They check
-//! the reports and the counters, and they copy each lease into a plain
-//! destination with a padded stride and compare its pixels.
+//! The decodes before the corpus read an image that is built at compile
+//! time. They check the reports and the counters, and they copy each
+//! lease into a plain destination with a padded stride and compare its
+//! pixels. The cases of the corpus read their fixtures and its manifest
+//! from the directory.
 //!
 //! The harness prints one line per case, ending in `ok` or `FAIL`, then
 //! a summary. It exits 0 only when every case passes, 1 when a case
@@ -24,6 +27,7 @@
 const std = @import("std");
 const san = @import("san");
 const tiny = @import("tiny_png");
+const corpus = @import("corpus.zig");
 
 pub const panic = @import("engine").android_panic;
 
@@ -92,18 +96,20 @@ const race_rounds = 200;
 /// The rounds of the race of a cancellation against a step.
 const cancel_rounds = 2000;
 
-const usage = "usage: san-abi-harness\n";
+const usage = "usage: san-abi-harness <corpus directory>\n";
 
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    if (args.len != 1) {
+    if (args.len != 2) {
         try std.Io.File.stderr().writeStreamingAll(io, usage);
 
         return 2;
     }
+
+    const directory = args[1];
 
     var buffer: [4096]u8 = undefined;
 
@@ -123,6 +129,19 @@ pub fn main(init: std.process.Init) !u8 {
     try harness.case("racing cancellations", try racingCancellations());
     try harness.case("engines in turn", enginesInTurn());
     try harness.case("racing creations", try racingCreations());
+
+    // Each case of the corpus holds its fixture and its pixels at once.
+    inline for (.{
+        .{ "corpus: ordinary page", corpus.decodesOrdinary },
+        .{ "corpus: long segment", corpus.refusesLong },
+    }) |named| {
+        const name, const run = named;
+
+        var arena: std.heap.ArenaAllocator = .init(init.gpa);
+        defer arena.deinit();
+
+        try harness.outcome(name, run(io, arena.allocator(), directory));
+    }
 
     try harness.out.print("summary passed={d} failed={d}\n", .{
         harness.passed,
@@ -146,6 +165,20 @@ const Harness = struct {
             name,
             if (passed) "ok" else "FAIL",
         });
+    }
+
+    /// Counts a case of the corpus and names the error of a failed one.
+    fn outcome(
+        harness: *Harness,
+        name: []const u8,
+        result: corpus.Error!void,
+    ) !void {
+        if (result) |_| {
+            try harness.case(name, true);
+        } else |err| {
+            try harness.out.print("{s}: {t}\n", .{ name, err });
+            try harness.case(name, false);
+        }
     }
 };
 
