@@ -2680,6 +2680,34 @@ const Decoding = struct {
         try canvas.expectUntouched(rows, 1);
     }
 
+    /// Checks that `report` covers `rows` rows of a lease whose first
+    /// row is the image row `top`, and copies them out of its lease:
+    /// each copied row holds the samples of its image row.
+    fn expectBand(
+        decoding: *Decoding,
+        report: Report,
+        top: u32,
+        rows: u32,
+    ) !void {
+        try testing.expectEqual(rows, report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+        try testing.expectEqual(top, report[san.SAN_JOB_REPORT_LEASE_TOP]);
+
+        const count: i32 = @intCast(rows);
+
+        var canvas: Canvas = try .init(
+            @intCast(report[san.SAN_JOB_REPORT_LEASE_WIDTH]),
+            count,
+        );
+        defer canvas.deinit();
+
+        try testing.expectEqual(
+            san.SAN_STATUS_OK,
+            decoding.copy(report, canvas.taking(0, count)),
+        );
+
+        try canvas.expectImage(0, decoding.samples, top, rows);
+    }
+
     fn release(decoding: *Decoding, report: Report) san.san_status {
         return releaseOutput(
             &decoding.state,
@@ -2989,6 +3017,151 @@ test "a cancellation inside one feed ends the decode within one row" {
     try testing.expectEqual(0, report[san.SAN_JOB_REPORT_COVERED_ROWS]);
     try testing.expectEqual(1, report[san.SAN_JOB_REPORT_DECODED_ROWS]);
     try expectGeometry(striped_geometry, report);
+
+    // The codec context and the unpublished lease are gone.
+    const counted = try decoding.counters();
+
+    try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
+    try testing.expectEqual(0, counted[output_bytes]);
+    try testing.expectEqual(own_blocks + 1, decoding.backing.blocks);
+    try decoding.expectSettled();
+    try decoding.stop();
+}
+
+/// The image rows [8, 14) of the striped image at every column, so that
+/// a decode discards eight rows above the band and never reaches the two
+/// below it.
+const striped_band: san.san_output_request = .{
+    .left = 0,
+    .top = 8,
+    .right = 8,
+    .bottom = 14,
+    .max_output_width = 0,
+};
+
+/// The bytes of the lease of that band with their block header.
+const striped_band_lease_bytes = 8 * 6 * Lease.pixel_bytes + Heap.header_size;
+
+/// Feeds the striped image to a job of `striped_band` in portions of
+/// its chunks until the first step that publishes rows of the band but
+/// not all of them, and returns that step.
+fn advanceIntoBand(decoding: *Decoding) !Decoding.Stepped {
+    var counted: i64 = 0;
+
+    while (decoding.rest() > 0) {
+        const stepped = try decoding.advance(@min(decoding.rest(), 16), 0);
+
+        try testing.expectEqual(san.SAN_STATUS_INPUT_NEEDED, stepped.status);
+
+        const covered = stepped.report[san.SAN_JOB_REPORT_COVERED_ROWS];
+        const decoded = stepped.report[san.SAN_JOB_REPORT_DECODED_ROWS];
+
+        if (covered > 0) {
+            // The eight rows above the band are counted with its rows.
+            try testing.expect(covered < 6);
+            try testing.expectEqual(8 + covered, decoded);
+
+            return stepped;
+        }
+
+        // No row above the band is published, and the count of the
+        // decoded rows only rises up to the band.
+        try testing.expectEqual(
+            san.SAN_NO_HANDLE,
+            stepped.report[san.SAN_JOB_REPORT_LEASE],
+        );
+
+        try testing.expect(decoded >= counted and decoded <= 8);
+
+        counted = decoded;
+    }
+
+    return error.TestUnexpectedResult;
+}
+
+test "a truncation inside a band keeps the rows that it published" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, striped_band);
+    defer decoding.deinit();
+
+    const early = try advanceIntoBand(&decoding);
+    const rows: u32 = @intCast(early.report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+
+    const ended = try decoding.advance(0, 1);
+
+    try testing.expectEqual(san.SAN_STATUS_TRUNCATED_CONTENT, ended.status);
+    try testing.expectEqual(early.report, ended.report);
+    try decoding.expectBand(ended.report, 8, rows);
+    try decoding.drop(ended.report);
+    try decoding.stop();
+}
+
+test "a cancellation inside a band repeats its last publication" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, striped_band);
+    defer decoding.deinit();
+
+    const early = try advanceIntoBand(&decoding);
+    const rows: u32 = @intCast(early.report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+
+    // The canceled step consumes none of the bytes that wait for it.
+    try testing.expectEqual(san.SAN_STATUS_OK, feedBytes(
+        &decoding.state,
+        decoding.content,
+        @intCast(decoding.fed),
+        decoding.bytes[decoding.fed..],
+        1,
+    ));
+
+    try testing.expectEqual(
+        san.SAN_STATUS_OK,
+        cancelJob(&decoding.state, decoding.job),
+    );
+
+    const canceled = decoding.step();
+
+    try testing.expectEqual(san.SAN_STATUS_CANCELED, canceled.status);
+    try testing.expectEqual(early.report, canceled.report);
+
+    // The lease of the canceled job still holds its rows for a copy.
+    try decoding.expectBand(canceled.report, 8, rows);
+    try decoding.drop(canceled.report);
+    try decoding.stop();
+}
+
+test "a cancellation above a band ends the decode within one discarded row" {
+    var decoding: Decoding = undefined;
+
+    try decoding.start(striped, roomy, striped_band);
+    defer decoding.deinit();
+
+    // The request comes when the admission step takes the lease, inside
+    // the decoder's feed, and the decoder observes it after its first
+    // row, which lies above the band.
+    decoding.canceling.job = decoding.job;
+    decoding.canceling.at_len = striped_band_lease_bytes;
+
+    const canceled = try decoding.advance(decoding.rest(), 1);
+
+    try testing.expectEqual(1, decoding.canceling.requests);
+    try testing.expectEqual(san.SAN_STATUS_CANCELED, canceled.status);
+
+    try testing.expectEqual(
+        san.SAN_NO_HANDLE,
+        canceled.report[san.SAN_JOB_REPORT_LEASE],
+    );
+
+    const report = canceled.report;
+
+    try testing.expectEqual(0, report[san.SAN_JOB_REPORT_REVISION]);
+    try testing.expectEqual(0, report[san.SAN_JOB_REPORT_COVERED_ROWS]);
+    try testing.expectEqual(1, report[san.SAN_JOB_REPORT_DECODED_ROWS]);
+
+    // The admission step had taken the lease of the band.
+    try testing.expectEqual(8, report[san.SAN_JOB_REPORT_LEASE_TOP]);
+    try testing.expectEqual(6, report[san.SAN_JOB_REPORT_LEASE_HEIGHT]);
 
     // The codec context and the unpublished lease are gone.
     const counted = try decoding.counters();
