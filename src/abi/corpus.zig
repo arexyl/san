@@ -100,6 +100,31 @@ const segment_limits: san.san_engine_limits = roomy: {
     break :roomy limits;
 };
 
+/// The limits of a reader that holds decoded strips: beside one job,
+/// room for the leases of four bands under the ceiling of all output,
+/// where `page_limits` admits one lease.
+const reader_limits: san.san_engine_limits = .{
+    .aggregate_budget_bytes = 128 << 20,
+    .content_count = 3,
+    .job_count = 1,
+    .content_length_bytes = 512 << 20,
+    .input_portion_bytes = portion_bytes,
+    .image_axis_pixels = 65_535,
+    .image_area_pixels = 64_000_000,
+    .metadata_bytes = 4 << 20,
+    .metadata_expanded_bytes = 2 << 20,
+    .metadata_payload_bytes = 1 << 20,
+    .held_chunk_bytes = 1_049_600,
+    .icc_tag_count = 128,
+    .exif_entry_count = 1024,
+    .output_bytes = 64 << 20,
+    .output_lease_bytes = 16 << 20,
+    .output_lease_count = strip_limit,
+};
+
+/// The leases that `reader_limits` lets live at once.
+const strip_limit = 4;
+
 /// The request of the whole image at a scale of 1:1.
 const whole: san.san_output_request = .{
     .left = 0,
@@ -341,17 +366,23 @@ const Decode = struct {
         };
         errdefer decode.abandon();
 
+        try decode.open(request);
+
+        return decode;
+    }
+
+    /// Opens the content and requests its job, in an engine that the
+    /// case created.
+    fn open(decode: *Decode, request: san.san_output_request) Error!void {
         try expectStatus(
             san.SAN_STATUS_OK,
-            san.san_content_open(engine, &decode.content),
+            san.san_content_open(decode.engine, &decode.content),
         );
 
         try expectStatus(
             san.SAN_STATUS_OK,
             san.san_job_request(decode.content, &request, &decode.job),
         );
-
-        return decode;
     }
 
     /// Feeds `bytes` from the bytes received on, in portions with a step
@@ -769,6 +800,473 @@ pub fn joinsLongBands(
         try decodeBand(fixture, canvas, top, bottom);
         try hashRows(arena, &hash, canvas, bottom - top);
     }
+
+    if (!std.mem.eql(u8, &hash.finalResult(), &fixture.samples)) {
+        return error.UnexpectedPixels;
+    }
+}
+
+const Counters = [san.SAN_ENGINE_COUNTERS_LENGTH]i64;
+
+/// The largest overhead of one lease in the output bytes that a case
+/// accepts: San counts a size header with the pixels of a lease.
+const lease_overhead_limit = 64;
+
+/// The live bytes that a decode of a band may reach above the leases:
+/// the staging of one portion, and beside it the state of the codec and
+/// the tables of the engine, which measured 51,381 bytes for every band
+/// of the long segment. A decode that kept the rows above its band
+/// would exceed the bound by megabytes.
+const workspace_bytes = portion_bytes + (128 << 10);
+
+/// The live bytes beside its lease by which a band may exceed the band
+/// at the top of its segment, which discards no row.
+const band_slack_bytes = 4 << 10;
+
+/// One engine under `reader_limits`, in which a case decodes bands of
+/// one fixture one after another, each in a content and a job of its
+/// own, and holds their leases as decoded strips.
+const Strips = struct {
+    engine: san.san_handle,
+    fixture: Fixture,
+    /// The band that is not done, whose content and job the engine
+    /// still holds.
+    band: ?Decode = null,
+    /// The leases of the bands that are done, the oldest first, and the
+    /// rows of each.
+    held: [strip_limit]san.san_handle = @splat(san.SAN_NO_HANDLE),
+    rows: [strip_limit]i32 = @splat(0),
+    count: usize = 0,
+    /// The bytes that the engine counts for a lease beside its pixels,
+    /// which the first strip shows.
+    overhead: ?i64 = null,
+
+    fn start(fixture: Fixture) Error!Strips {
+        var engine: san.san_handle = san.SAN_NO_HANDLE;
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_engine_create(&reader_limits, &engine),
+        );
+
+        return .{ .engine = engine, .fixture = fixture };
+    }
+
+    /// Decodes the image rows [top, bottom) at the image size in a new
+    /// content, from the first byte of the file, with exactly the rows
+    /// down to its last row decoded. It then ends the job and the
+    /// content and holds the lease, which outlives both.
+    fn decode(strips: *Strips, top: i32, bottom: i32) Error!void {
+        const fixture = strips.fixture;
+
+        strips.band = .{
+            .engine = strips.engine,
+            .content = san.SAN_NO_HANDLE,
+            .job = san.SAN_NO_HANDLE,
+        };
+
+        const band = &strips.band.?;
+
+        try band.open(rowsOf(fixture, top, bottom, 0));
+        try expectStatus(san.SAN_STATUS_OK, try band.run(fixture.bytes));
+
+        const report = band.report;
+
+        if (report[san.SAN_JOB_REPORT_COVERED_ROWS] != bottom - top or
+            report[san.SAN_JOB_REPORT_DECODED_ROWS] != bottom)
+        {
+            return error.UnexpectedReport;
+        }
+
+        try expectShape(
+            report,
+            fixture,
+            .of(fixture, fixture.width, top, bottom),
+        );
+
+        try expectStatus(san.SAN_STATUS_OK, san.san_job_release(band.job));
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_content_close(band.content),
+        );
+
+        strips.held[strips.count] = band.lease;
+        strips.rows[strips.count] = bottom - top;
+        strips.count += 1;
+        strips.band = null;
+
+        if (strips.overhead == null) try strips.measure();
+    }
+
+    /// Reads the overhead of a lease from the output bytes of the first
+    /// strip, which is the only lease then.
+    fn measure(strips: *Strips) Error!void {
+        const found = try strips.counters(false);
+
+        const overhead =
+            found[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] - strips.pixelBytes();
+
+        if (strips.count != 1 or
+            overhead < 0 or overhead > lease_overhead_limit)
+        {
+            return error.UnexpectedReport;
+        }
+
+        strips.overhead = overhead;
+    }
+
+    /// The bytes of the pixels of every strip.
+    fn pixelBytes(strips: Strips) i64 {
+        var rows: i64 = 0;
+
+        for (strips.rows[0..strips.count]) |count| rows += count;
+
+        return rows * strips.fixture.width * 4;
+    }
+
+    /// The output bytes that the engine counts for the strips.
+    fn leaseBytes(strips: Strips) i64 {
+        const leases: i64 = @intCast(strips.count);
+
+        return strips.pixelBytes() + leases * (strips.overhead orelse 0);
+    }
+
+    /// Requests the image rows [top, bottom) while every lease is held.
+    /// The count of the leases refuses the request itself, before any
+    /// byte of the band, and nothing of it stays.
+    fn expectFull(strips: *Strips, top: i32, bottom: i32) Error!void {
+        // A request that is admitted after all leaves its job to
+        // `abandon`.
+        strips.band = .{
+            .engine = strips.engine,
+            .content = san.SAN_NO_HANDLE,
+            .job = 1,
+        };
+
+        const band = &strips.band.?;
+        const request = rowsOf(strips.fixture, top, bottom, 0);
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_content_open(strips.engine, &band.content),
+        );
+
+        try expectStatus(
+            san.SAN_STATUS_BUDGET_EXCEEDED,
+            san.san_job_request(band.content, &request, &band.job),
+        );
+
+        if (band.job != san.SAN_NO_HANDLE) return error.UnexpectedReport;
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_content_close(band.content),
+        );
+
+        strips.band = null;
+    }
+
+    /// Copies the rows of the oldest strip to the top of `canvas`, which
+    /// holds nothing else afterward, and returns their count.
+    fn copy(strips: Strips, canvas: Canvas) Error!i32 {
+        const rows = strips.rows[0];
+
+        @memset(canvas.pixels, untouched);
+
+        try expectStatus(san.SAN_STATUS_OK, san.san_output_copy(
+            strips.held[0],
+            0,
+            rows,
+            canvas.pixels.ptr,
+            @intCast(canvas.row_bytes / 4),
+            canvas.rows,
+            @intCast(canvas.stride()),
+            0,
+            san.SAN_ALPHA_OPAQUE,
+        ));
+
+        try canvas.expectRest(rows);
+
+        return rows;
+    }
+
+    /// Releases the oldest strip.
+    fn drop(strips: *Strips) Error!void {
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_output_release(strips.held[0]),
+        );
+
+        strips.count -= 1;
+
+        @memmove(
+            strips.held[0..strips.count],
+            strips.held[1..][0..strips.count],
+        );
+
+        @memmove(
+            strips.rows[0..strips.count],
+            strips.rows[1..][0..strips.count],
+        );
+    }
+
+    fn counters(strips: Strips, reset_peak: bool) Error!Counters {
+        var counters_out: Counters = @splat(-1);
+
+        try expectStatus(san.SAN_STATUS_OK, san.san_engine_counters(
+            strips.engine,
+            @intFromBool(reset_peak),
+            &counters_out,
+        ));
+
+        return counters_out;
+    }
+
+    /// Checks that the engine holds exactly the strips: their leases
+    /// with their bytes, no content, and no job.
+    fn expectHeld(strips: Strips) Error!void {
+        const found = try strips.counters(false);
+        const leases: i64 = @intCast(strips.count);
+        const bytes = strips.leaseBytes();
+
+        if (found[san.SAN_ENGINE_COUNTERS_LEASE_COUNT] != leases or
+            found[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] != bytes or
+            found[san.SAN_ENGINE_COUNTERS_CONTENT_COUNT] != 0 or
+            found[san.SAN_ENGINE_COUNTERS_JOB_COUNT] != 0)
+        {
+            return error.UnexpectedReport;
+        }
+    }
+
+    /// Checks that the live and the reserved bytes of the engine never
+    /// rose above `bytes` of leases and the workspace of one decode
+    /// since the last reset of the peaks. Returns the live bytes that
+    /// the peak held beside the leases.
+    fn peakBeside(strips: Strips, bytes: i64) Error!i64 {
+        const found = try strips.counters(false);
+        const ceiling = bytes + workspace_bytes;
+
+        if (found[san.SAN_ENGINE_COUNTERS_PEAK_LIVE_BYTES] > ceiling or
+            found[san.SAN_ENGINE_COUNTERS_PEAK_COMMITTED_BYTES] > ceiling)
+        {
+            return error.UnexpectedReport;
+        }
+
+        return found[san.SAN_ENGINE_COUNTERS_PEAK_LIVE_BYTES] - bytes;
+    }
+
+    /// Ends the engine, whose shutdown stays pending until the last
+    /// strip is released.
+    fn finish(strips: *Strips) Error!void {
+        while (strips.count > 0) {
+            try expectStatus(
+                san.SAN_STATUS_PENDING,
+                san.san_engine_shutdown(strips.engine),
+            );
+
+            try strips.drop();
+        }
+
+        try expectStatus(
+            san.SAN_STATUS_OK,
+            san.san_engine_shutdown(strips.engine),
+        );
+    }
+
+    /// Ends the engine of a failed case as far as the calls allow, so
+    /// that the next case finds none live.
+    fn abandon(strips: Strips) void {
+        _ = san.san_engine_shutdown(strips.engine);
+
+        if (strips.band) |band| {
+            _ = san.san_job_release(band.job);
+            _ = san.san_output_release(band.lease);
+        }
+
+        for (strips.held[0..strips.count]) |lease| {
+            _ = san.san_output_release(lease);
+        }
+
+        _ = san.san_engine_shutdown(strips.engine);
+    }
+};
+
+/// The rows of the band `index` of a segment of `height` rows.
+fn bandOf(height: i32, index: usize) struct { i32, i32 } {
+    const top = @as(i32, @intCast(index)) * band_rows;
+
+    return .{ top, @min(top + band_rows, height) };
+}
+
+/// The bands of a segment of `height` rows, the last one short.
+fn bandCount(height: i32) usize {
+    return @intCast(@divFloor(height + band_rows - 1, band_rows));
+}
+
+/// What one band left: the hash of its samples, and the live bytes that
+/// its decode reached beside its lease.
+const Redecoded = struct {
+    digest: Digest,
+    beside: i64,
+};
+
+/// Decodes the band `index` of the long segment as the only strip of
+/// `strips`, checks what the engine holds with it, and releases it. It
+/// also adds the samples of the band to `joined`.
+fn redecodeBand(
+    strips: *Strips,
+    arena: Allocator,
+    canvas: Canvas,
+    index: usize,
+    joined: ?*Sha256,
+) Error!Redecoded {
+    const top, const bottom = bandOf(strips.fixture.height, index);
+
+    // The peak of this band starts from an engine that holds nothing.
+    _ = try strips.counters(true);
+
+    try strips.decode(top, bottom);
+    try strips.expectHeld();
+
+    const bytes = strips.leaseBytes();
+    const rows = try strips.copy(canvas);
+
+    var hash: Sha256 = .init(.{});
+
+    try hashRows(arena, &hash, canvas, rows);
+
+    if (joined) |whole_hash| try hashRows(arena, whole_hash, canvas, rows);
+
+    try strips.drop();
+    try strips.expectHeld();
+
+    return .{
+        .digest = hash.finalResult(),
+        .beside = try strips.peakBeside(bytes),
+    };
+}
+
+/// Walks the long segment at the image size in bands of one viewport
+/// under the limits of the reader, in one engine: downward, and then
+/// upward as a reader does that keeps no decoded strip. Every band
+/// decodes in a new content from the first byte of the file, after the
+/// lease of the band before it was released. The samples of the
+/// downward bands hash to the value of the manifest for the whole
+/// image, and each upward band has the samples of its downward band.
+/// The live bytes of a band stay within its lease and the workspace of
+/// one decode, and no band reaches more beside its lease than the first
+/// one, however many rows above it the decode discards.
+pub fn redecodesLongBackward(
+    io: std.Io,
+    arena: Allocator,
+    directory: []const u8,
+) Error!void {
+    const fixture: Fixture = try .read(io, arena, directory, long_path);
+
+    const canvas: Canvas = try .init(arena, fixture.width, band_rows);
+    const downward = try arena.alloc(Redecoded, bandCount(fixture.height));
+
+    var strips: Strips = try .start(fixture);
+    errdefer strips.abandon();
+
+    var hash: Sha256 = .init(.{});
+
+    for (downward, 0..) |*band, index| {
+        band.* = try redecodeBand(&strips, arena, canvas, index, &hash);
+    }
+
+    if (!std.mem.eql(u8, &hash.finalResult(), &fixture.samples)) {
+        return error.UnexpectedPixels;
+    }
+
+    // The band at the top discards no row.
+    const beside = downward[0].beside + band_slack_bytes;
+
+    var index = downward.len;
+
+    while (index > 0) {
+        index -= 1;
+
+        const upward = try redecodeBand(&strips, arena, canvas, index, null);
+
+        if (!std.mem.eql(u8, &upward.digest, &downward[index].digest)) {
+            return error.UnexpectedPixels;
+        }
+
+        if (upward.beside > beside or downward[index].beside > beside) {
+            return error.UnexpectedReport;
+        }
+    }
+
+    try strips.finish();
+}
+
+/// Walks the long segment downward at the image size in bands of one
+/// viewport and holds the leases of the bands as decoded strips, under
+/// the limits of the reader. A strip is held after its job and its
+/// content ended, and the oldest one leaves only when a band needs its
+/// lease: with every lease held, the request of the next band is
+/// refused as SAN_STATUS_BUDGET_EXCEEDED and changes nothing, and it is
+/// admitted once the oldest strip is released. Each strip is copied
+/// when it leaves, after the bands below it decoded, and the last ones
+/// during the shutdown, which stays pending until the last strip is
+/// released. The samples of those copies in order hash to the value of
+/// the manifest for the whole image. The engine holds exactly the
+/// strips, and the live bytes of each decode stay within them and the
+/// workspace of one decode.
+pub fn retainsLongStrips(
+    io: std.Io,
+    arena: Allocator,
+    directory: []const u8,
+) Error!void {
+    const fixture: Fixture = try .read(io, arena, directory, long_path);
+    const count = bandCount(fixture.height);
+
+    // The case needs a band that finds every lease held.
+    if (count <= strip_limit) return error.ManifestUnusable;
+
+    const canvas: Canvas = try .init(arena, fixture.width, band_rows);
+
+    var strips: Strips = try .start(fixture);
+    errdefer strips.abandon();
+
+    var hash: Sha256 = .init(.{});
+
+    for (0..count) |index| {
+        const top, const bottom = bandOf(fixture.height, index);
+
+        if (strips.count == strip_limit) {
+            try strips.expectFull(top, bottom);
+            try strips.expectHeld();
+            try hashRows(arena, &hash, canvas, try strips.copy(canvas));
+            try strips.drop();
+        }
+
+        // The peak of this band starts from the strips that stay.
+        _ = try strips.counters(true);
+
+        try strips.decode(top, bottom);
+        try strips.expectHeld();
+        _ = try strips.peakBeside(strips.leaseBytes());
+    }
+
+    // The strips that are left leave during the shutdown, which still
+    // lets a held lease be copied.
+    while (strips.count > 0) {
+        try expectStatus(
+            san.SAN_STATUS_PENDING,
+            san.san_engine_shutdown(strips.engine),
+        );
+
+        try hashRows(arena, &hash, canvas, try strips.copy(canvas));
+        try strips.drop();
+    }
+
+    try expectStatus(
+        san.SAN_STATUS_OK,
+        san.san_engine_shutdown(strips.engine),
+    );
 
     if (!std.mem.eql(u8, &hash.finalResult(), &fixture.samples)) {
         return error.UnexpectedPixels;
@@ -1236,6 +1734,32 @@ test "the bands of the long segment join into its samples" {
 
     try expectBound();
     try joinsLongBands(testing.io, arena_state.allocator(), corpus_directory);
+}
+
+test "the long segment decodes again band by band upward" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    try expectBound();
+
+    try redecodesLongBackward(
+        testing.io,
+        arena_state.allocator(),
+        corpus_directory,
+    );
+}
+
+test "held strips of the long segment fill the leases and keep their rows" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    try expectBound();
+
+    try retainsLongStrips(
+        testing.io,
+        arena_state.allocator(),
+        corpus_directory,
+    );
 }
 
 test "a scaled band of the long segment is the average of its rows" {

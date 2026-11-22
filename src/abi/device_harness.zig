@@ -136,6 +136,7 @@ pub fn main(init: std.process.Init) !u8 {
         .{ "corpus: long segment", corpus.refusesLong },
         .{ "corpus: first band", corpus.publishesTopBand },
         .{ "corpus: scaled band", corpus.scalesLongBand },
+        .{ "corpus: held strips", corpus.retainsLongStrips },
     }) |named| {
         const name, const run = named;
 
