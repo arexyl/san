@@ -30,6 +30,10 @@ const weights: Wide = .{ 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 }
 comptime {
     std.debug.assert(span % step == 0);
 
+    // A sum over the lanes of a vector wraps without a check, so the
+    // largest sum of a step is checked here: every byte at 255.
+    std.debug.assert(255 * @as(u32, @reduce(.Add, weights)) <= std.math.maxInt(u16));
+
     // Hidden, as every C symbol of the codecs is: only zlib binds it.
     @export(&adler32, .{ .name = "adler32", .visibility = .hidden });
 }
@@ -58,9 +62,7 @@ pub fn update(checksum: u32, bytes: []const u8) u32 {
             const block: @Vector(step, u8) = chunk[0..step].*;
             const wide: Wide = block;
 
-            // A product is at most 16 times 255, and the sum of all at
-            // most 136 times 255, so neither leaves 16 bits.
-            b += step * a + @reduce(.Add, wide *% weights);
+            b += step * a + @reduce(.Add, wide * weights);
             a += @reduce(.Add, wide);
             chunk = chunk[step..];
         }
