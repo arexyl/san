@@ -271,15 +271,7 @@ fn write(ctx: *anyopaque, index: u32, samples: []const u8) Codec.Demand {
                     decode.written += 1;
                 }
             } else {
-                const pixels = decode.lease.row(decode.written);
-
-                for (0..image.width) |column| {
-                    const pixel = pixels[column * Lease.pixel_bytes ..];
-
-                    pixel[0..3].* = samples[column * 3 ..][0..3].*;
-                    pixel[3] = 0xff;
-                }
-
+                expand(decode.lease.row(decode.written), samples);
                 decode.written += 1;
             }
         },
@@ -294,7 +286,89 @@ fn write(ctx: *anyopaque, index: u32, samples: []const u8) Codec.Demand {
     return .more;
 }
 
+/// The pixels that one step of `expand` writes.
+const step_pixels = 4;
+
+/// The sample bytes that one step of `expand` reads: those of its pixels
+/// and the four after them, which it drops.
+const step_samples = 16;
+
+/// Writes the RGB samples of a row as opaque pixels.
+///
+/// A step reorders 16 sample bytes at once into the pixels of the first
+/// 12, so the steps end where fewer than 16 sample bytes remain, and the
+/// last pixels go one by one. The vector compiles to the baseline of
+/// each target, so nothing detects a feature at run time.
+fn expand(pixels: []u8, samples: []const u8) void {
+    comptime std.debug.assert(step_pixels * Lease.pixel_bytes == step_samples);
+
+    std.debug.assert(samples.len % 3 == 0);
+    std.debug.assert(pixels.len == samples.len / 3 * Lease.pixel_bytes);
+
+    const Step = @Vector(step_samples, u8);
+
+    // The alpha comes from the bits below and not from a second operand of
+    // the shuffle: a shuffle of the samples with a vector of 0xff compiles
+    // to moves of single bytes on arm64, and this one to a table lookup.
+    // The index of an alpha byte is any valid one.
+    const order: @Vector(step_samples, i32) = .{
+        0, 1, 2, 0, 3, 4,  5,  0,
+        6, 7, 8, 0, 9, 10, 11, 0,
+    };
+
+    const alpha: Step = .{
+        0, 0, 0, 0xff, 0, 0, 0, 0xff,
+        0, 0, 0, 0xff, 0, 0, 0, 0xff,
+    };
+
+    var source = samples;
+    var target = pixels;
+
+    while (source.len >= step_samples) {
+        const rgb: Step = source[0..step_samples].*;
+
+        target[0..step_samples].* = @shuffle(u8, rgb, undefined, order) | alpha;
+        source = source[step_pixels * 3 ..];
+        target = target[step_samples..];
+    }
+
+    while (source.len != 0) {
+        target[0..3].* = source[0..3].*;
+        target[3] = 0xff;
+        source = source[3..];
+        target = target[Lease.pixel_bytes..];
+    }
+}
+
 const testing = std.testing;
+
+test "a row of samples becomes opaque pixels at every width" {
+    const widest = 40;
+    const guard = 0xa5;
+
+    var samples: [3 * widest]u8 = undefined;
+
+    // No sample equals the alpha of a pixel or the guard.
+    for (&samples, 0..) |*sample, index| sample.* = @intCast(index + 1);
+
+    for (0..widest + 1) |width| {
+        var row: [8 + Lease.pixel_bytes * widest + 8]u8 = @splat(guard);
+        const pixels = row[8..][0 .. width * Lease.pixel_bytes];
+
+        expand(pixels, samples[0 .. width * 3]);
+
+        for (0..width) |column| {
+            const pixel = pixels[column * Lease.pixel_bytes ..][0..Lease.pixel_bytes];
+
+            try testing.expectEqualSlices(u8, samples[column * 3 ..][0..3], pixel[0..3]);
+            try testing.expectEqual(0xff, pixel[3]);
+        }
+
+        // Nothing outside the row changed.
+        for (row[0..8]) |byte| try testing.expectEqual(guard, byte);
+        for (row[8 + pixels.len ..]) |byte| try testing.expectEqual(guard, byte);
+    }
+}
 
 fn imageOf(width: u31, height: u31) Codec.Image {
     return .{ .width = width, .height = height, .layout = .rgb8 };
