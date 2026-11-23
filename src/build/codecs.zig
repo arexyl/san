@@ -6,7 +6,9 @@
 //! libpng. Zig sets the optimization mode per module, so the C code
 //! compiles in ReleaseSafe, at -O2 with the undefined-behavior trap, in
 //! every San build mode, Debug included: Debug runs execute the C code
-//! that published builds ship, whatever mode the Zig code takes.
+//! that published builds ship, whatever mode the Zig code takes. The
+//! Adler-32 that zlib's inflate calls is Zig code of the PNG decoder and
+//! takes the mode of its root.
 
 const std = @import("std");
 const profile = @import("profile.zig");
@@ -47,9 +49,10 @@ const adapter_flags = [_][]const u8{
 const inflate_observer = "-Dinflate=san_png_inflate";
 
 /// zlib's inflate path, which libpng's reader uses. The gz file
-/// functions and deflate stay out.
+/// functions and deflate stay out, and so does adler32.c: inflate binds
+/// the Adler-32 of src/codecs/png/adler32.zig, which adds 16 bytes in a
+/// step where zlib's adds one.
 const zlib_sources = [_][]const u8{
-    "adler32.c",
     "crc32.c",
     "inflate.c",
     "inftrees.c",

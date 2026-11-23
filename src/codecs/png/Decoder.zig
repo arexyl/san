@@ -35,6 +35,12 @@ const Heap = engine.Heap;
 
 const Decoder = @This();
 
+comptime {
+    // zlib's inflate calls the Adler-32 that adler32.zig exports, so every
+    // link of the zlib archive takes that file with the decoder.
+    _ = @import("adler32.zig");
+}
+
 heap: *Heap,
 sink: Sink,
 cancel: Cancel,
@@ -515,6 +521,7 @@ const TestBacking = Heap.TestBacking;
 test {
     _ = fixtures;
     _ = cases;
+    _ = @import("adler32.zig");
 }
 
 /// A budget that admits every decode of the tests below.
