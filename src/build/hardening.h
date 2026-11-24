@@ -1,11 +1,12 @@
-/* The hardening check of every C compile of San.
+/* The hardening and target check of every C compile of San.
  *
  * The build forces this header into every C translation unit with
  * -include. clang applies every -D and -U of the command line before it
  * reads a forced header, so the macros below show the final effect of
  * the compiler's own flags and San's later ones. The header defines and
  * includes nothing, so it needs no include guard. It only fails the
- * compile when a hardening flag did not take effect.
+ * compile when a hardening flag or a feature of the target did not take
+ * effect.
  */
 
 /* FORTIFY stays off: its __*_chk calls would import Bionic's checks or
@@ -48,6 +49,14 @@
 #if !__has_feature( shadow_call_stack )
 #error "ShadowCallStack is off: pass -fsanitize=shadow-call-stack"
 #endif
+#endif
+
+/* The target has the CRC instructions. zlib computes its CRC-32 on them
+ * only with this macro and its 64-bit word, and falls back to its tables
+ * without a word otherwise, so the library would only be slower.
+ */
+#if !defined( __ARM_FEATURE_CRC32 )
+#error "the CRC instructions are off: the arm64 target needs the crc feature"
 #endif
 
 #endif

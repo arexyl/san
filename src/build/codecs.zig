@@ -15,7 +15,8 @@ const profile = @import("profile.zig");
 
 /// The header that every C compile includes before its first line,
 /// relative to the San root. It fails the compile when a hardening flag
-/// of `common_flags` or `arm64_android_flags` did not take effect.
+/// of `common_flags` or `arm64_android_flags`, or a feature that the
+/// profile adds to the arm64 target, did not take effect.
 pub const hardening_header = "src/build/hardening.h";
 
 /// San's libpng configuration header, relative to the San root. libpng's
@@ -47,6 +48,12 @@ const adapter_flags = [_][]const u8{
 /// data stream, which libpng only warns about. zlib and the adapter
 /// compile without it, so they keep the real inflate.
 const inflate_observer = "-Dinflate=san_png_inflate";
+
+/// The flag of zlib's compiles that names its 64-bit word. zutil.h looks
+/// for that type in <limits.h> only without Z_SOLO. Without the type,
+/// crc32.c computes on 32-bit words on every target and never selects
+/// the CRC instructions of arm64.
+const zlib_word = "-DZ_U8=unsigned long long";
 
 /// zlib's inflate path, which libpng's reader uses. The gz file
 /// functions and deflate stay out, and so does adler32.c: inflate binds
@@ -246,7 +253,10 @@ pub fn addArchives(
     zlib.addCSourceFiles(.{
         .root = zlib_root,
         .files = &zlib_sources,
-        .flags = flags,
+        .flags = std.mem.concat(b.graph.arena, []const u8, &.{
+            flags,
+            &.{zlib_word},
+        }) catch @panic("OOM"),
     });
 
     const png = codecModule(b, target, platform, &.{

@@ -63,13 +63,16 @@ pub const Abi = enum {
     /// Returns the target query of the ABI at the profile's API level.
     /// On arm64-v8a the CPU features include reserve_x18, so code that
     /// Zig generates never allocates x18, which ShadowCallStack owns in
-    /// the C frames.
+    /// the C frames. They also include crc, which the ABI leaves optional:
+    /// zlib then computes its CRC-32 with the CRC instructions, without a
+    /// check at run time, so the library needs a processor that has them.
     pub fn targetQuery(abi: Abi) std.Target.Query {
         return switch (abi) {
             .@"arm64-v8a" => .{
                 .cpu_arch = .aarch64,
                 .cpu_features_add = std.Target.aarch64.featureSet(&.{
                     .reserve_x18,
+                    .crc,
                 }),
                 .os_tag = .linux,
                 .abi = .android,
@@ -254,6 +257,15 @@ test "the resolved arm64-v8a target reserves x18" {
     try testing.expect(target.cpu.has(.aarch64, .reserve_x18));
 }
 
+test "the resolved arm64-v8a target has the CRC instructions" {
+    const target = try std.zig.system.resolveTargetQuery(
+        testing.io,
+        Abi.@"arm64-v8a".targetQuery(),
+    );
+
+    try testing.expect(target.cpu.has(.aarch64, .crc));
+}
+
 test "the android baseline alone does not reserve x18" {
     const baseline: std.Target.Query = .{
         .cpu_arch = .aarch64,
@@ -265,6 +277,7 @@ test "the android baseline alone does not reserve x18" {
     const target = try std.zig.system.resolveTargetQuery(testing.io, baseline);
 
     try testing.expect(!target.cpu.has(.aarch64, .reserve_x18));
+    try testing.expect(!target.cpu.has(.aarch64, .crc));
 }
 
 test "the host query is explicit" {
