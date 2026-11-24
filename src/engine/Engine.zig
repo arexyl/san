@@ -256,6 +256,10 @@ pub const Shutdown = enum {
 pub fn shutdown(slot: *Slot, handle: Handle) error{InvalidHandle}!Shutdown {
     const engine = try slot.close(handle);
 
+    // A closing engine admits no lease, so it frees the block that it
+    // keeps for one, and the leases that end from here on free theirs.
+    engine.heap.stopKeeping();
+
     // The end of a job removes its link to its content, so the jobs end
     // while the contents are still open. A repeated call finds every job
     // ended and every content shut, and both loops change nothing.

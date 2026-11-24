@@ -12,8 +12,16 @@
 //! When the heap refuses a block, it records the cause, the budget or the
 //! backing, so that a caller who sees only a null pointer or
 //! error.OutOfMemory reports the right category.
+//!
+//! The heap keeps the block of the output lease that ended last, for the
+//! next lease of its size: an allocator that returns a block of that size
+//! to the system would make every lease fault its pages in again. The
+//! kept block stays a live block of a kind of its own. The heap frees it
+//! for a lease of another size, when it stands between a request and the
+//! budget, a ceiling, or the backing, and when the engine shuts down.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Ledger = @import("Ledger.zig");
 
 const Heap = @This();
@@ -25,6 +33,16 @@ backing: Backing,
 /// through it therefore takes it before the work whose failure it maps,
 /// and again once that work fails.
 refusal: ?Refusal = null,
+/// The kept block, by its header, or null.
+kept: ?[*]align(header_size) u8 = null,
+/// Whether an ended lease leaves its block. An engine that shuts down
+/// admits no lease, so it keeps none.
+keeps: bool = true,
+
+/// The byte that a debug build writes over a kept block. A copy takes
+/// only rows that the lease of the block has covered, so no output holds
+/// a row of it, which the tests of the leases rely on.
+pub const kept_fill = 0xa5;
 
 /// The bytes of the header before the memory of each block. The header
 /// size is also the alignment of every block.
@@ -110,17 +128,96 @@ pub fn alloc(heap: *Heap, size: usize) ?[*]align(header_size) u8 {
     const bytes = accounted(size) orelse
         return heap.refuse(error.BudgetExceeded);
 
-    var reservation = heap.ledger.reserve(.codec, bytes) catch |err|
+    var reservation = heap.reserve(.codec, bytes) catch |err|
         return heap.refuse(err);
     defer heap.ledger.cancel(&reservation);
 
     return heap.allocReserved(&reservation, size);
 }
 
+/// Admits `bytes` as a new reservation for blocks of `kind`, as the
+/// ledger does. When only the kept block stands between the request and
+/// the budget or a ceiling, the heap frees that block first. A refusal
+/// that the kept block does not cause leaves it in place. The heap
+/// records no refusal here: the caller reports the error.
+pub fn reserve(
+    heap: *Heap,
+    kind: Ledger.Kind,
+    bytes: u64,
+) error{BudgetExceeded}!Ledger.Reservation {
+    return heap.ledger.reserve(kind, bytes) catch |err| {
+        if (!heap.ledger.admits(kind, bytes, heap.ledger.usage.kept)) {
+            return err;
+        }
+
+        heap.evict();
+
+        return heap.ledger.reserve(kind, bytes);
+    };
+}
+
+/// Returns the kept block as the pixels of a lease of `size` bytes when
+/// it has exactly that size, counted as output again. A kept block of
+/// another size is freed, so that the lease which follows allocates
+/// beside nothing.
+pub fn takeKept(heap: *Heap, size: usize) ?[*]align(header_size) u8 {
+    const block = heap.kept orelse return null;
+
+    const header = headerOf(block);
+
+    if (header.size != size) {
+        heap.evict();
+
+        return null;
+    }
+
+    heap.ledger.move(.kept, .output, accounted(size).?);
+    header.kind = .output;
+    heap.kept = null;
+
+    return block + header_size;
+}
+
+/// Ends the use of the pixels of a lease at `ptr`. The heap keeps the
+/// block in place of the one that it kept before, or frees it when it
+/// keeps none.
+pub fn keep(heap: *Heap, ptr: [*]align(header_size) u8) void {
+    const block = blockOf(ptr);
+
+    if (!heap.keeps) return heap.release(block);
+
+    heap.evict();
+
+    const header = headerOf(block);
+
+    std.debug.assert(header.kind == .output);
+
+    if (builtin.mode == .debug) @memset(ptr[0..header.size], kept_fill);
+
+    heap.ledger.move(.output, .kept, accounted(header.size).?);
+    header.kind = .kept;
+    heap.kept = block;
+}
+
+/// Frees the kept block, if the heap holds one.
+pub fn evict(heap: *Heap) void {
+    const block = heap.kept orelse return;
+
+    heap.kept = null;
+    heap.release(block);
+}
+
+/// Frees the kept block and keeps none from now on.
+pub fn stopKeeping(heap: *Heap) void {
+    heap.keeps = false;
+    heap.evict();
+}
+
 /// Returns `size` bytes aligned to 16 from what `reservation` holds, as
 /// a block of its kind, or null after it records the cause of the
 /// refusal. A block beyond the reservation is refused as BudgetExceeded,
-/// and a failed backing leaves the reservation intact.
+/// and a failed backing leaves the reservation intact. The backing is
+/// asked once more after the heap has freed a kept block.
 pub fn allocReserved(
     heap: *Heap,
     reservation: *Ledger.Reservation,
@@ -131,7 +228,7 @@ pub fn allocReserved(
 
     if (bytes > reservation.bytes) return heap.refuse(error.BudgetExceeded);
 
-    const block = heap.backing.vtable.alloc(heap.backing.ptr, bytes) orelse
+    const block = heap.backed(bytes) orelse
         return heap.refuse(error.AllocationFailed);
 
     heap.ledger.convert(reservation, bytes);
@@ -243,6 +340,21 @@ fn allocatorFree(
         @panic("a sized release does not match its block in San's heap");
 }
 
+/// Returns a block of `bytes` from the backing. When the backing has
+/// none and the heap keeps a block, the heap frees that block and asks
+/// once more.
+fn backed(heap: *Heap, bytes: usize) ?[*]align(header_size) u8 {
+    const backing = heap.backing;
+
+    if (backing.vtable.alloc(backing.ptr, bytes)) |block| return block;
+
+    if (heap.kept == null) return null;
+
+    heap.evict();
+
+    return backing.vtable.alloc(backing.ptr, bytes);
+}
+
 fn refuse(heap: *Heap, cause: Refusal) ?[*]align(header_size) u8 {
     heap.refusal = cause;
 
@@ -290,6 +402,9 @@ pub const TestBacking = struct {
     peak: u64 = 0,
     /// The blocks that the heap holds.
     blocks: u64 = 0,
+    /// The bound of `outstanding`: a block beyond it is not served, as
+    /// with a system that has no memory left until a block returns.
+    capacity: u64 = std.math.maxInt(u64),
 
     pub fn init(gpa: std.mem.Allocator) TestBacking {
         return .{ .gpa = gpa };
@@ -304,6 +419,8 @@ pub const TestBacking = struct {
 
     fn testAlloc(ptr: *anyopaque, len: usize) ?[*]align(16) u8 {
         const test_backing: *TestBacking = @ptrCast(@alignCast(ptr));
+
+        if (len > test_backing.capacity - test_backing.outstanding) return null;
 
         const block = test_backing.gpa.alignedAlloc(u8, .@"16", len) catch
             return null;
@@ -822,4 +939,300 @@ test "a slice comes from its reservation as one block of its kind" {
         .peak_committed = 100,
     }, heap.ledger.usage);
     try testing.expectEqual(0, test_backing.blocks);
+}
+
+/// Returns `size` bytes as the pixels of a lease, as its admission
+/// allocates them.
+fn leasePixels(heap: *Heap, size: usize) ![*]align(header_size) u8 {
+    if (heap.takeKept(size)) |pixels| return pixels;
+
+    var reservation = try heap.reserve(.output, accounted(size).?);
+    defer heap.ledger.cancel(&reservation);
+
+    return heap.allocReserved(&reservation, size) orelse
+        return heap.takeRefusal().?;
+}
+
+test "a lease of the kept size takes the kept block without the backing" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), roomy);
+    defer heap.evict();
+
+    const first = try leasePixels(&heap, 400);
+
+    heap.keep(first);
+
+    try testing.expectEqual(Ledger.Usage{
+        .live = 416,
+        .peak = 416,
+        .peak_committed = 416,
+        .kept = 416,
+    }, heap.ledger.usage);
+
+    try testing.expectEqual(1, test_backing.blocks);
+
+    // A backing that serves nothing more shows that the heap asks for
+    // nothing.
+    test_backing.capacity = test_backing.outstanding;
+
+    const second = try leasePixels(&heap, 400);
+
+    try testing.expectEqual(first, second);
+    try testing.expectEqual(null, heap.kept);
+    try testing.expectEqual(null, heap.takeRefusal());
+
+    try testing.expectEqual(Ledger.Usage{
+        .live = 416,
+        .peak = 416,
+        .peak_committed = 416,
+        .output = 416,
+    }, heap.ledger.usage);
+
+    // The block is output again, so its release settles as output.
+    heap.free(second);
+    try testing.expectEqual(0, heap.ledger.usage.live);
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "a lease of another size frees the kept block before its own" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), roomy);
+    defer heap.evict();
+
+    heap.keep(try leasePixels(&heap, 400));
+
+    for ([_]usize{ 399, 401 }) |size| {
+        heap.ledger.resetPeaks();
+        test_backing.peak = test_backing.outstanding;
+
+        const pixels = try leasePixels(&heap, size);
+
+        // The peak holds the larger of the two blocks, never both.
+        const larger = @max(416, size + header_size);
+
+        try testing.expectEqual(larger, heap.ledger.usage.peak);
+        try testing.expectEqual(larger, test_backing.peak);
+        try testing.expectEqual(0, heap.ledger.usage.kept);
+        try testing.expectEqual(1, test_backing.blocks);
+        heap.free(pixels);
+        heap.keep(try leasePixels(&heap, 400));
+    }
+}
+
+test "a newer block takes the place of the kept one" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), roomy);
+    defer heap.evict();
+
+    var reservation = try heap.reserve(.output, 1024);
+    defer heap.ledger.cancel(&reservation);
+
+    const older = heap.allocReserved(&reservation, 100).?;
+    const newer = heap.allocReserved(&reservation, 200).?;
+
+    heap.keep(older);
+    try testing.expectEqual(116, heap.ledger.usage.kept);
+    try testing.expectEqual(216, heap.ledger.usage.output);
+    heap.keep(newer);
+    try testing.expectEqual(216, heap.ledger.usage.kept);
+    try testing.expectEqual(0, heap.ledger.usage.output);
+    try testing.expectEqual(216, heap.ledger.usage.live);
+    try testing.expectEqual(1, test_backing.blocks);
+    try testing.expectEqual(newer, heap.kept.? + header_size);
+    try expectMatches(&heap, &test_backing);
+}
+
+test "a debug build fills the block that it keeps" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), roomy);
+    defer heap.evict();
+
+    const pixels = try leasePixels(&heap, 64);
+
+    @memset(pixels[0..64], 0x11);
+    heap.keep(pixels);
+
+    const expected: u8 = if (builtin.mode == .debug) kept_fill else 0x11;
+
+    for (pixels[0..64]) |byte| try testing.expectEqual(expected, byte);
+}
+
+test "a reservation that only the kept block refuses frees that block" {
+    const Case = struct {
+        kind: Ledger.Kind,
+        ceilings: Ledger.Ceilings = .{},
+    };
+
+    // The budget holds the kept block and 100 bytes more. Each case asks
+    // for 300: the budget refuses every kind, and the output ceiling
+    // refuses the output kind while the budget would admit it.
+    const cases = [_]Case{
+        .{ .kind = .input },
+        .{ .kind = .metadata },
+        .{ .kind = .codec },
+        .{ .kind = .output },
+        .{ .kind = .output, .ceilings = .{ .output = 516 } },
+    };
+
+    for (cases, 0..) |case, index| {
+        var test_backing: TestBacking = .init(testing.allocator);
+
+        const budget: u64 = if (index == 4) 4096 else 516;
+
+        var heap: Heap = .init(test_backing.backing(), .{ .bytes = budget });
+
+        heap.ledger.ceilings = case.ceilings;
+        heap.keep(try leasePixels(&heap, 400));
+
+        var reservation = try heap.reserve(case.kind, 300);
+
+        try testing.expectEqual(null, heap.kept);
+        try testing.expectEqual(0, heap.ledger.usage.kept);
+        try testing.expectEqual(0, heap.ledger.usage.live);
+        try testing.expectEqual(300, heap.ledger.usage.reserved);
+        try testing.expectEqual(0, test_backing.blocks);
+        try testing.expectEqual(null, heap.takeRefusal());
+        heap.ledger.cancel(&reservation);
+    }
+}
+
+test "a reservation that the kept block does not refuse leaves it kept" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), .{ .bytes = 1000 });
+    defer heap.evict();
+
+    heap.ledger.ceilings = .{ .metadata = 200, .output = 600 };
+    heap.keep(try leasePixels(&heap, 400));
+
+    // Beyond the budget even without the kept block, beyond the metadata
+    // ceiling, which the kept block does not count under, and beyond the
+    // output ceiling even without it.
+    try testing.expectError(error.BudgetExceeded, heap.reserve(.codec, 1001));
+    try testing.expectError(error.BudgetExceeded, heap.reserve(.metadata, 201));
+    try testing.expectError(error.BudgetExceeded, heap.reserve(.output, 601));
+    try testing.expectEqual(416, heap.ledger.usage.kept);
+    try testing.expectEqual(1, test_backing.blocks);
+
+    // The codec view records the refusal that the kept block does not
+    // cause, and none for a block that its eviction admits.
+    try testing.expectEqual(null, heap.alloc(1000));
+    try testing.expectEqual(error.BudgetExceeded, heap.takeRefusal().?);
+    try testing.expectEqual(416, heap.ledger.usage.kept);
+
+    const block = heap.alloc(900).?;
+
+    try testing.expectEqual(null, heap.takeRefusal());
+    try testing.expectEqual(null, heap.kept);
+    try testing.expectEqual(916, heap.ledger.usage.live);
+    heap.free(block);
+}
+
+test "a backing without a block is asked again after the kept one is freed" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), roomy);
+
+    heap.keep(try leasePixels(&heap, 400));
+
+    // The system holds the kept block and room for 84 bytes more, so a
+    // block of 216 fits only in its place.
+    test_backing.capacity = 500;
+
+    const block = heap.alloc(200).?;
+
+    try testing.expectEqual(null, heap.takeRefusal());
+    try testing.expectEqual(null, heap.kept);
+    try testing.expectEqual(216, heap.ledger.usage.live);
+    try testing.expectEqual(1, test_backing.blocks);
+    try expectMatches(&heap, &test_backing);
+    heap.free(block);
+
+    // A block that fits beside the kept one leaves it kept.
+    heap.keep(try leasePixels(&heap, 400));
+
+    const small = heap.alloc(64).?;
+
+    try testing.expectEqual(416, heap.ledger.usage.kept);
+    heap.free(small);
+
+    // A block that fits in no case fails once the kept one is freed.
+    try testing.expectEqual(null, heap.alloc(600));
+    try testing.expectEqual(error.AllocationFailed, heap.takeRefusal().?);
+    try testing.expectEqual(null, heap.kept);
+    try testing.expectEqual(0, heap.ledger.usage.live);
+    try testing.expectEqual(0, test_backing.blocks);
+}
+
+test "a heap that stopped keeping frees its block and each later one" {
+    var test_backing: TestBacking = .init(testing.allocator);
+    var heap: Heap = .init(test_backing.backing(), roomy);
+
+    heap.keep(try leasePixels(&heap, 400));
+
+    const held = try leasePixels(&heap, 200);
+
+    heap.stopKeeping();
+    try testing.expectEqual(null, heap.kept);
+    try testing.expectEqual(216, heap.ledger.usage.live);
+    heap.keep(held);
+    try testing.expectEqual(null, heap.kept);
+    try testing.expectEqual(0, test_backing.blocks);
+    try testing.expect(heap.ledger.settled());
+
+    // A repeated stop frees nothing twice.
+    heap.stopKeeping();
+    try testing.expect(heap.ledger.settled());
+}
+
+/// Returns the pixels of a lease, or ends the run of an injected failure
+/// as `refused` does.
+fn pixelsOrRefused(
+    heap: *Heap,
+    test_backing: *const TestBacking,
+    size: usize,
+) ![*]align(header_size) u8 {
+    return leasePixels(heap, size) catch |err| {
+        try testing.expectEqual(error.AllocationFailed, err);
+        try expectMatches(heap, test_backing);
+
+        return error.OutOfMemory;
+    };
+}
+
+/// Allocates through the routes of the heap beside a kept block, which a
+/// failed backing frees before the failure stands, and frees everything.
+fn useBesideKept(gpa: std.mem.Allocator, exits: *Exits) !void {
+    var test_backing: TestBacking = .init(gpa);
+
+    var heap: Heap = .init(test_backing.backing(), roomy);
+    defer exits.record(&heap, &test_backing);
+    defer heap.evict();
+
+    heap.keep(try pixelsOrRefused(&heap, &test_backing, 400));
+
+    const raw = heap.alloc(40) orelse try refused(&heap, &test_backing);
+    defer heap.free(raw);
+
+    // A lease of another size, then one that takes the kept block.
+    heap.keep(try pixelsOrRefused(&heap, &test_backing, 300));
+
+    const pixels = try pixelsOrRefused(&heap, &test_backing, 300);
+    defer heap.keep(pixels);
+
+    const again = heap.alloc(40) orelse try refused(&heap, &test_backing);
+    defer heap.free(again);
+}
+
+test "every allocation failure beside a kept block settles" {
+    var exits: Exits = .{};
+
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        useBesideKept,
+        .{&exits},
+    );
+
+    // The kept block, the two blocks of codec state, and the lease of
+    // another size each fail once, beside the run that fails nowhere.
+    try testing.expect(exits.runs >= 5);
+    try testing.expectEqual(exits.runs, exits.settled);
 }

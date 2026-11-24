@@ -1039,10 +1039,19 @@ const Strips = struct {
         }
     }
 
+    /// Returns the bytes of output that `found` counts: the leases, and
+    /// the block that the engine keeps for its next lease. A decode
+    /// holds that block until its admission, which takes it for a lease
+    /// of its size and frees it before a lease of another size.
+    fn heldIn(found: Counters) i64 {
+        return found[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] +
+            found[san.SAN_ENGINE_COUNTERS_KEPT_BYTES];
+    }
+
     /// Checks that the live and the reserved bytes of the engine never
-    /// rose above `bytes` of leases and the workspace of one decode
+    /// rose above `bytes` of output and the workspace of one decode
     /// since the last reset of the peaks. Returns the live bytes that
-    /// the peak held beside the leases.
+    /// the peak held beside that output.
     fn peakBeside(strips: Strips, bytes: i64) Error!i64 {
         const found = try strips.counters(false);
         const ceiling = bytes + workspace_bytes;
@@ -1105,7 +1114,8 @@ fn bandCount(height: i32) usize {
 }
 
 /// What one band left: the hash of its samples, and the live bytes that
-/// its decode reached beside its lease.
+/// its decode reached beside its output, which is its lease or, when it
+/// is larger, the block that the engine kept before the band.
 const Redecoded = struct {
     digest: Digest,
     beside: i64,
@@ -1123,13 +1133,15 @@ fn redecodeBand(
 ) Error!Redecoded {
     const top, const bottom = bandOf(strips.fixture.height, index);
 
-    // The peak of this band starts from an engine that holds nothing.
-    _ = try strips.counters(true);
+    // The peak of this band starts from an engine that holds no lease.
+    // It keeps the block of the band before, which this band takes or,
+    // when it has another size, holds until its admission.
+    const before = try strips.counters(true);
 
     try strips.decode(top, bottom);
     try strips.expectHeld();
 
-    const bytes = strips.leaseBytes();
+    const bytes = @max(strips.leaseBytes(), Strips.heldIn(before));
     const rows = try strips.copy(canvas);
 
     var hash: Sha256 = .init(.{});
@@ -1243,12 +1255,16 @@ pub fn retainsLongStrips(
             try strips.drop();
         }
 
-        // The peak of this band starts from the strips that stay.
-        _ = try strips.counters(true);
+        // The peak of this band starts from the strips that stay and
+        // from the block of the strip that left, which the engine keeps.
+        const before = try strips.counters(true);
 
         try strips.decode(top, bottom);
         try strips.expectHeld();
-        _ = try strips.peakBeside(strips.leaseBytes());
+
+        _ = try strips.peakBeside(
+            @max(strips.leaseBytes(), Strips.heldIn(before)),
+        );
     }
 
     // The strips that are left leave during the shutdown, which still

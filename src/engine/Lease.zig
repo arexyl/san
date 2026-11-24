@@ -146,15 +146,26 @@ pub fn allocate(
 
     if (bytes > engine.output_lease_bytes) return error.BudgetExceeded;
 
-    var reservation = try engine.heap.ledger.reserve(.output, bytes);
-    defer engine.heap.ledger.cancel(&reservation);
-
-    const pixels = engine.heap.allocReserved(&reservation, size) orelse
-        return error.AllocationFailed;
+    const pixels = engine.heap.takeKept(size) orelse
+        try allocatePixels(engine, bytes, size);
 
     lease.pixels = pixels[0..size];
     lease.width = width;
     lease.height = height;
+}
+
+/// Returns a new block of `size` bytes for the pixels of a lease, which
+/// counts `bytes` in the ledger.
+fn allocatePixels(
+    engine: *Engine,
+    bytes: u64,
+    size: usize,
+) Heap.Refusal![*]align(Heap.header_size) u8 {
+    var reservation = try engine.heap.reserve(.output, bytes);
+    defer engine.heap.ledger.cancel(&reservation);
+
+    return engine.heap.allocReserved(&reservation, size) orelse
+        error.AllocationFailed;
 }
 
 /// Returns the pixels of the row `index` of `lease`, which has its
@@ -217,10 +228,11 @@ pub fn countLive(engine: *const Engine) u64 {
     return count;
 }
 
-/// Releases the pixels of `lease`, which no claim keeps, and frees its
-/// slot.
+/// Leaves the pixels of `lease`, which no claim keeps, to the heap, and
+/// frees its slot. The heap keeps the block for the next lease or frees
+/// it.
 fn reclaim(lease: *Lease, engine: *Engine) void {
-    if (lease.pixels) |pixels| engine.heap.free(pixels.ptr);
+    if (lease.pixels) |pixels| engine.heap.keep(pixels.ptr);
 
     lease.* = .{};
 }
@@ -659,5 +671,128 @@ test "the rows of a lease lie side by side without padding" {
     }
 
     lease.endJobClaim(rig.engine);
+    try rig.finish();
+}
+
+/// Ends both claims on `lease`, whose caller holds it.
+fn end(rig: *Rig, lease: *Lease) !void {
+    release(try resolve(&rig.slot, lease.handle(rig.engine)));
+    lease.endJobClaim(rig.engine);
+}
+
+test "a lease takes the block of an ended one of its size, in another slot" {
+    var rig: Rig = undefined;
+
+    try rig.start(Rig.roomy());
+
+    const usage = &rig.engine.heap.ledger.usage;
+    const size = Heap.accounted(2 * 3 * pixel_bytes).?;
+
+    const first = try rig.publish();
+    const stale = first.handle(rig.engine);
+    const block = first.pixels.?.ptr;
+    const blocks = rig.backing.blocks;
+
+    first.covered = 3;
+    @memset(first.pixels.?, 0x11);
+    try end(&rig, first);
+
+    try testing.expectEqual(size, usage.kept);
+    try testing.expectEqual(0, usage.output);
+    try testing.expectEqual(0, countLive(rig.engine));
+    try testing.expectEqual(blocks, rig.backing.blocks);
+
+    // The slot of the ended lease goes to a lease without pixels, so the
+    // block moves to the slot behind it.
+    const waiting = try rig.take();
+    const second = try rig.publish();
+
+    try testing.expect(second != first);
+    try testing.expectEqual(block, second.pixels.?.ptr);
+    try testing.expectEqual(blocks, rig.backing.blocks);
+    try testing.expectEqual(0, usage.kept);
+    try testing.expectEqual(size, usage.output);
+
+    // The handle of the ended lease reaches neither slot.
+    try rig.expectInvalid(stale);
+
+    // The lease starts as a new one does. Its covered row is the mark of
+    // the rig, and a debug build has written over what the block held.
+    try testing.expectEqual(1, second.covered);
+
+    if (@import("builtin").mode == .debug) {
+        for (second.pixels.?) |byte| try testing.expectEqual(Heap.kept_fill, byte);
+    }
+
+    waiting.endJobClaim(rig.engine);
+    try end(&rig, second);
+    try rig.finish();
+}
+
+test "a lease of another geometry frees the kept block" {
+    var rig: Rig = undefined;
+
+    try rig.start(Rig.roomy());
+
+    const usage = &rig.engine.heap.ledger.usage;
+    const blocks = rig.backing.blocks;
+
+    try end(&rig, try rig.publish());
+    try testing.expectEqual(blocks + 1, rig.backing.blocks);
+
+    const wider = try rig.take();
+
+    // Three by two pixels take the bytes of two by three, so the size
+    // of the block decides, not the geometry.
+    try wider.allocate(rig.engine, 3, 2);
+    try testing.expectEqual(0, usage.kept);
+    try testing.expectEqual(blocks + 1, rig.backing.blocks);
+    wider.endJobClaim(rig.engine);
+
+    const larger = try rig.take();
+
+    try larger.allocate(rig.engine, 3, 3);
+    try testing.expectEqual(0, usage.kept);
+    try testing.expectEqual(blocks + 1, rig.backing.blocks);
+
+    try testing.expectEqual(
+        Heap.accounted(3 * 3 * pixel_bytes).?,
+        usage.output,
+    );
+
+    larger.endJobClaim(rig.engine);
+    try rig.finish();
+}
+
+test "a kept block gives way to the staging of a content under the budget" {
+    var limits = Rig.roomy();
+
+    const lease_bytes: i64 = @intCast(Heap.accounted(8 * 8 * pixel_bytes).?);
+
+    limits.input_portion_bytes = 64;
+
+    var rig: Rig = undefined;
+
+    try rig.start(limits);
+
+    const usage = &rig.engine.heap.ledger.usage;
+
+    // The budget holds what the engine holds now, the kept block, and
+    // less than a staging beside them.
+    const lease = try rig.take();
+
+    try lease.allocate(rig.engine, 8, 8);
+    lease.endJobClaim(rig.engine);
+    try testing.expectEqual(@as(u64, @intCast(lease_bytes)), usage.kept);
+
+    rig.engine.heap.ledger.budget = .{ .bytes = usage.live + 16 };
+
+    const content = try Engine.Content.open(rig.engine);
+
+    try testing.expectEqual(0, usage.kept);
+    try testing.expectEqual(Heap.accounted(64).?, usage.input);
+    try testing.expectEqual(null, rig.engine.heap.takeRefusal());
+
+    Engine.Content.close(try Engine.Content.resolve(&rig.slot, content));
     try rig.finish();
 }

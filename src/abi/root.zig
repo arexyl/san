@@ -298,6 +298,7 @@ fn counters(
     out[san.SAN_ENGINE_COUNTERS_INPUT_BYTES] = reported(usage.input);
     out[san.SAN_ENGINE_COUNTERS_METADATA_BYTES] = reported(usage.metadata);
     out[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] = reported(usage.output);
+    out[san.SAN_ENGINE_COUNTERS_KEPT_BYTES] = reported(usage.kept);
 
     if (reset_peak == 1) ledger.resetPeaks();
 
@@ -857,6 +858,7 @@ fn countersOf(counts: struct {
     peak_committed: u64,
     metadata: u64,
     output: u64 = 0,
+    kept: u64 = 0,
     contents: u64 = 0,
     input: u64 = 0,
     jobs: u64 = 0,
@@ -878,6 +880,7 @@ fn countersOf(counts: struct {
 
     report[san.SAN_ENGINE_COUNTERS_METADATA_BYTES] = reported(counts.metadata);
     report[san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES] = reported(counts.output);
+    report[san.SAN_ENGINE_COUNTERS_KEPT_BYTES] = reported(counts.kept);
 
     return report;
 }
@@ -1091,6 +1094,7 @@ fn openCount(state: *Process, engine: san.san_handle) !i64 {
 const input_bytes = san.SAN_ENGINE_COUNTERS_INPUT_BYTES;
 const metadata_bytes = san.SAN_ENGINE_COUNTERS_METADATA_BYTES;
 const output_bytes = san.SAN_ENGINE_COUNTERS_OUTPUT_BYTES;
+const kept_bytes = san.SAN_ENGINE_COUNTERS_KEPT_BYTES;
 
 /// Opens a content in `engine` and returns its handle.
 fn openOk(state: *Process, engine: san.san_handle) !san.san_handle {
@@ -3018,12 +3022,14 @@ test "a cancellation inside one feed ends the decode within one row" {
     try testing.expectEqual(1, report[san.SAN_JOB_REPORT_DECODED_ROWS]);
     try expectGeometry(striped_geometry, report);
 
-    // The codec context and the unpublished lease are gone.
+    // The codec context and the unpublished lease are gone, and the
+    // engine keeps the block of that lease for the next one.
     const counted = try decoding.counters();
 
     try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
     try testing.expectEqual(0, counted[output_bytes]);
-    try testing.expectEqual(own_blocks + 1, decoding.backing.blocks);
+    try testing.expectEqual(striped_lease_bytes, counted[kept_bytes]);
+    try testing.expectEqual(own_blocks + 2, decoding.backing.blocks);
     try decoding.expectSettled();
     try decoding.stop();
 }
@@ -3163,12 +3169,14 @@ test "a cancellation above a band ends the decode within one discarded row" {
     try testing.expectEqual(8, report[san.SAN_JOB_REPORT_LEASE_TOP]);
     try testing.expectEqual(6, report[san.SAN_JOB_REPORT_LEASE_HEIGHT]);
 
-    // The codec context and the unpublished lease are gone.
+    // The codec context and the unpublished lease are gone, and the
+    // engine keeps the block of that lease for the next one.
     const counted = try decoding.counters();
 
     try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
     try testing.expectEqual(0, counted[output_bytes]);
-    try testing.expectEqual(own_blocks + 1, decoding.backing.blocks);
+    try testing.expectEqual(striped_band_lease_bytes, counted[kept_bytes]);
+    try testing.expectEqual(own_blocks + 2, decoding.backing.blocks);
     try decoding.expectSettled();
     try decoding.stop();
 }
@@ -3708,6 +3716,7 @@ test "a representation beyond the length ceiling ends as BudgetExceeded" {
 
 test "every failed allocation of a decode ends the job and settles" {
     var failures: usize = 0;
+    var leased = false;
 
     for (0..64) |fail_index| {
         var decoding: Decoding = undefined;
@@ -3747,10 +3756,21 @@ test "every failed allocation of a decode ends the job and settles" {
 
         const counted = try decoding.counters();
 
+        // The allocations of a decode come in one order. A failure
+        // before the lease keeps nothing, and every failure behind it
+        // finds the lease allocated, whose block the engine then keeps.
+        const kept = counted[kept_bytes];
+
+        if (kept != 0) leased = true;
+
+        const blocks: u64 = if (leased) own_blocks + 2 else own_blocks + 1;
+        const expected: i64 = if (leased) striped_lease_bytes else 0;
+
+        try testing.expectEqual(expected, kept);
         try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_LEASE_COUNT]);
         try testing.expectEqual(0, counted[output_bytes]);
         try testing.expectEqual(0, counted[san.SAN_ENGINE_COUNTERS_RESERVED_BYTES]);
-        try testing.expectEqual(own_blocks + 1, decoding.backing.blocks);
+        try testing.expectEqual(blocks, decoding.backing.blocks);
         try decoding.expectSettled();
         try decoding.stop();
     } else return error.TestUnexpectedResult;
@@ -3758,6 +3778,7 @@ test "every failed allocation of a decode ends the job and settles" {
     // The decoder object, libpng's structs, its row buffers, zlib's state
     // and window, and the lease, each failed once.
     try testing.expect(failures > 6);
+    try testing.expect(leased);
 }
 
 // This test runs on the state of the process, after the lifecycle test,

@@ -2324,7 +2324,7 @@ test "a codec that ends its image short of the lease fails the job" {
     }
 }
 
-test "each failed allocation of a decode ends the job and keeps nothing" {
+test "each failed allocation of a decode ends the job and holds no lease" {
     // The state of the codec, the pixels of the lease, and the
     // workspace of the codec, in the order of their allocation.
     const reports = [_]Report{
@@ -2337,6 +2337,7 @@ test "each failed allocation of a decode ends the job and keeps nothing" {
     };
 
     const script = image_script ++ row_command;
+    const lease_bytes: u64 = image_lease_bytes;
 
     for (reports, 0..) |report, fail_index| {
         var rig: Rig = undefined;
@@ -2360,7 +2361,14 @@ test "each failed allocation of a decode ends the job and keeps nothing" {
 
         const usage = &rig.engine.heap.ledger.usage;
 
-        try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
+        // A failure behind the pixels leaves their block to the heap,
+        // which keeps it for the next lease.
+        const kept: u64 = if (fail_index > 1) lease_bytes else 0;
+        const blocks: u64 = if (fail_index > 1) own_blocks + 2 else own_blocks + 1;
+
+        try testing.expectEqual(kept, usage.kept);
+        try testing.expectEqual(blocks, rig.backing.blocks);
+
         try testing.expectEqual(0, usage.output);
         try testing.expectEqual(0, usage.reserved);
         try testing.expectEqual(0, Lease.countLive(rig.engine));
@@ -2855,7 +2863,7 @@ test "a scale of an image beyond the exact sums is no operation of the build" {
     }
 }
 
-test "each failed allocation of a scaled decode keeps nothing" {
+test "each failed allocation of a scaled decode holds no lease" {
     // The state of the codec, the pixels of the lease, the words of the
     // scale, and the workspace of the codec, in the order of their
     // allocation. A decode whose words fail holds its pixels until the
@@ -2871,6 +2879,7 @@ test "each failed allocation of a scaled decode keeps nothing" {
     };
 
     const script = halved_script ++ row_command ++ row_command;
+    const lease_bytes = Engine.Heap.accounted(2 * 2 * Lease.pixel_bytes).?;
 
     for (0..reports.len + 1) |fail_index| {
         var rig: Rig = undefined;
@@ -2903,10 +2912,18 @@ test "each failed allocation of a scaled decode keeps nothing" {
         } else {
             try testing.expectEqual(.allocation_failed, taken.outcome);
             try testing.expectEqual(reports[fail_index], taken.report);
-            try testing.expectEqual(own_blocks + 1, rig.backing.blocks);
         }
 
         const usage = &rig.engine.heap.ledger.usage;
+
+        // The pixels are the second allocation. A decode that fails
+        // behind them, or ends as canceled, leaves their block to the
+        // heap, which keeps it for the next lease.
+        const kept: u64 = if (fail_index > 1) lease_bytes else 0;
+        const blocks: u64 = if (fail_index > 1) own_blocks + 2 else own_blocks + 1;
+
+        try testing.expectEqual(kept, usage.kept);
+        try testing.expectEqual(blocks, rig.backing.blocks);
 
         try testing.expectEqual(0, usage.output);
         try testing.expectEqual(0, usage.reserved);
@@ -2914,5 +2931,166 @@ test "each failed allocation of a scaled decode keeps nothing" {
         try rig.expectSettled();
         try rig.drop(handle);
         try rig.finish();
+    }
+}
+
+test "the next decode of a geometry writes into the pixels of the one before" {
+    var rig: Rig = undefined;
+
+    try rig.start(.{});
+
+    const usage = &rig.engine.heap.ledger.usage;
+    const script = image_script ++ row_command;
+
+    var seen: [3][*]u8 = undefined;
+
+    // Each decode covers one row and ends as canceled, so the rows
+    // below it stay as the block came.
+    for (&seen) |*pixels| {
+        const content = try rig.open();
+
+        const handle = try rig.admit(content, .{});
+
+        const taken = try rig.run(handle, &script, false);
+
+        const named_lease = taken.report.lease.?;
+
+        const lease = try rig.leaseOf(named_lease);
+
+        pixels.* = lease.pixels.?.ptr;
+
+        try testing.expectEqual(1, taken.report.covered_rows);
+        try expectRows(lease, 1);
+        try testing.expectEqual(0, usage.kept);
+        try testing.expectEqual(image_lease_bytes, usage.output);
+
+        try cancel(&rig.slot, handle);
+        try testing.expectEqual(.canceled, try rig.advance(handle));
+        try rig.releaseLease(named_lease);
+        try testing.expectError(error.InvalidHandle, rig.leaseOf(named_lease));
+        try testing.expectEqual(image_lease_bytes, usage.kept);
+        try testing.expectEqual(0, usage.output);
+        try rig.expectSettled();
+        try rig.drop(handle);
+        try rig.closeContent(content);
+    }
+
+    try testing.expectEqual(seen[0], seen[1]);
+    try testing.expectEqual(seen[0], seen[2]);
+    try rig.finish();
+}
+
+/// A request whose lease has two rows, with the script that completes it
+/// and the script that covers its first row alone.
+const TwoRows = struct {
+    wanted: Request,
+    whole: []const u8,
+    end_of_input: bool,
+    first: []const u8,
+};
+
+test "no copy of a lease holds a pixel of the lease whose block it took" {
+    const cases = [_]TwoRows{
+        // The image of four rows at half its size.
+        .{
+            .wanted = .{ .max_output_width = 2 },
+            .whole = &(halved_script ++ row_command ++ row_command ++
+                row_command ++ row_command ++ end_command),
+            .end_of_input = true,
+            .first = &(halved_script ++ row_command ++ row_command),
+        },
+        // The image rows 1 and 2 of four.
+        .{
+            .wanted = .{
+                .region = .{ .left = 0, .top = 1, .right = 3, .bottom = 3 },
+            },
+            .whole = &(image_script ++ row_command ++ row_command ++
+                row_command),
+            .end_of_input = false,
+            .first = &(image_script ++ row_command ++ row_command),
+        },
+    };
+
+    const fill = Engine.Heap.kept_fill;
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |fails| {
+            var rig: Rig = undefined;
+
+            try rig.start(.{});
+
+            // The lease before, with every byte as a debug build leaves
+            // a kept block, so that the measured build shows the same.
+            const before = try rig.admit(try rig.open(), case.wanted);
+
+            const whole = try rig.run(before, case.whole, case.end_of_input);
+
+            try testing.expectEqual(.completed, whole.outcome);
+
+            const soiled = try rig.leaseOf(whole.report.lease.?);
+            const block = soiled.pixels.?.ptr;
+
+            @memset(soiled.pixels.?, fill);
+            try rig.releaseLease(whole.report.lease.?);
+            try rig.drop(before);
+
+            // The next job takes that block, covers one row, and ends
+            // as canceled or as failed.
+            const handle = try rig.admit(try rig.open(), case.wanted);
+
+            const taken = try rig.run(handle, case.first, false);
+
+            try testing.expectEqual(null, taken.outcome);
+            try testing.expectEqual(1, taken.report.covered_rows);
+
+            const taken_lease = taken.report.lease.?;
+
+            const lease = try rig.leaseOf(taken_lease);
+
+            try testing.expectEqual(block, lease.pixels.?.ptr);
+
+            const ended = if (fails)
+                try rig.run(handle, &invalid_command, false)
+            else ended: {
+                try cancel(&rig.slot, handle);
+
+                break :ended try rig.take(handle);
+            };
+
+            try testing.expect((ended.outcome.? == .canceled) != fails);
+            try testing.expectEqual(1, ended.report.covered_rows);
+
+            // The copy of what the report covers holds decoded pixels
+            // alone, and the row below it still holds the fill, which
+            // only the coverage keeps from a reader.
+            const row_bytes = @as(usize, lease.width) * Lease.pixel_bytes;
+
+            const rows = ended.report.covered_rows;
+
+            // Room for both rows of the widest lease, so that a report
+            // that covered too much would show the fill.
+            var copied: [2 * 3 * Lease.pixel_bytes]u8 = @splat(0);
+
+            Lease.copy(try Lease.resolve(&rig.slot, taken_lease), .{
+                .first_row = 0,
+                .row_count = rows,
+                .destination = &copied,
+                .stride = row_bytes,
+            });
+
+            for (0..rows * lease.width) |index| {
+                const pixel = copied[index * Lease.pixel_bytes ..][0..4];
+
+                try testing.expectEqual(0xff, pixel[3]);
+                try testing.expect(!std.mem.allEqual(u8, pixel, fill));
+            }
+
+            try testing.expectEqualSlices(u8, lease.row(0), copied[0..row_bytes]);
+            try testing.expect(std.mem.allEqual(u8, lease.row(1), fill));
+
+            try rig.releaseLease(taken_lease);
+            try rig.drop(handle);
+            try rig.finish();
+        }
     }
 }

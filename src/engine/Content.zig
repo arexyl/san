@@ -130,7 +130,7 @@ pub fn open(engine: *Engine) OpenError!Handle {
 
     const bytes = Heap.accounted(size) orelse return error.BudgetExceeded;
 
-    var reservation = try engine.heap.ledger.reserve(.input, bytes);
+    var reservation = try engine.heap.reserve(.input, bytes);
     defer engine.heap.ledger.cancel(&reservation);
 
     // A refusal that an earlier call left would name the wrong cause.

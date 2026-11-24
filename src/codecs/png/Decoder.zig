@@ -623,6 +623,9 @@ const Options = struct {
     enough_at: ?u32 = null,
     /// The heap holds a refusal of other work when the decode starts.
     stale_refusal: bool = false,
+    /// The bytes of the block that the heap keeps for a lease when the
+    /// decode starts, or 0 for none.
+    kept: usize = 0,
 };
 
 /// What one test decode observed.
@@ -636,6 +639,8 @@ const Outcome = struct {
     samples: []u8,
     /// The highest live bytes of the ledger.
     peak: u64,
+    /// The bytes of the block that the heap still kept after the decode.
+    kept: u64,
 
     fn deinit(outcome: Outcome) void {
         testing.allocator.free(outcome.samples);
@@ -673,6 +678,16 @@ fn decodeWith(
         try testing.expectEqual(null, heap.alloc(options.budget.bytes));
     }
 
+    if (options.kept != 0) {
+        var reservation = try heap.reserve(
+            .output,
+            Heap.accounted(options.kept).?,
+        );
+        defer heap.ledger.cancel(&reservation);
+
+        heap.keep(heap.allocReserved(&reservation, options.kept).?);
+    }
+
     var decoder: Decoder = undefined;
 
     const result = run: {
@@ -683,8 +698,10 @@ fn decodeWith(
     };
 
     const released = decoder.codec == null;
+    const kept = heap.ledger.usage.kept;
 
     decoder.deinit();
+    heap.evict();
     exits.record(&heap, &backing);
     try testing.expect(released);
     try testing.expectEqual(0, collector.mismatches);
@@ -698,6 +715,7 @@ fn decodeWith(
         .rows = collector.rows,
         .samples = try collector.samples.toOwnedSlice(testing.allocator),
         .peak = heap.ledger.usage.peak,
+        .kept = kept,
     };
 }
 
@@ -1224,6 +1242,39 @@ test "every budget below the decode's peak fails and settles" {
             }
         }
     }
+}
+
+test "a decode frees the block that the heap keeps only for the room" {
+    const bytes = try encode(cases.small);
+    defer testing.allocator.free(bytes);
+
+    const reference = try decode(bytes, .{});
+    defer reference.deinit();
+
+    try reference.result;
+
+    const kept = 4096;
+    const kept_bytes = Heap.accounted(kept).?;
+
+    // One byte short of the room for both, an allocation of the codec
+    // frees the block, and no recorded refusal stops the decode.
+    const pressed = try decode(bytes, .{
+        .budget = .{ .bytes = reference.peak + kept_bytes - 1 },
+        .kept = kept,
+    });
+    defer pressed.deinit();
+
+    try expectImage(cases.small, pressed);
+    try testing.expectEqual(0, pressed.kept);
+
+    const beside = try decode(bytes, .{
+        .budget = .{ .bytes = reference.peak + kept_bytes },
+        .kept = kept,
+    });
+    defer beside.deinit();
+
+    try expectImage(cases.small, beside);
+    try testing.expectEqual(kept_bytes, beside.kept);
 }
 
 test "a refusal recorded before the decode does not fail it" {

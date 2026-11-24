@@ -46,7 +46,7 @@ pub const Budget = struct {
 };
 
 /// What a block holds. The ledger counts the live bytes of the first
-/// three kinds, and the rest of the live bytes is the last one.
+/// four kinds, and the rest of the live bytes is the last one.
 pub const Kind = enum {
     /// The input staging of a content.
     input,
@@ -54,6 +54,10 @@ pub const Kind = enum {
     metadata,
     /// An output lease or a conversion intermediate.
     output,
+    /// The block of an ended output lease that the heap keeps for the
+    /// next one. No reservation has this kind: a block only moves to it
+    /// from the output kind and back.
+    kept,
     /// Codec state and workspace.
     codec,
 };
@@ -74,6 +78,8 @@ pub const Usage = struct {
     metadata: u64 = 0,
     /// The part of `live` in blocks of the output kind.
     output: u64 = 0,
+    /// The part of `live` in the block of the kept kind.
+    kept: u64 = 0,
 };
 
 /// Bytes that the budget admitted for work before the work allocates
@@ -107,16 +113,12 @@ pub fn reserve(
     kind: Kind,
     bytes: u64,
 ) error{BudgetExceeded}!Reservation {
-    if (bytes > ledger.available()) return error.BudgetExceeded;
+    // A block only moves to the kept kind, so no reservation becomes one.
+    std.debug.assert(kind != .kept);
 
-    if (ledger.boundOf(kind)) |bound| {
-        const held = bound.live + bound.reserved.*;
+    if (!ledger.admits(kind, bytes, 0)) return error.BudgetExceeded;
 
-        // The sum stays within the ceiling, so the difference holds.
-        if (bytes > bound.ceiling - held) return error.BudgetExceeded;
-
-        bound.reserved.* += bytes;
-    }
+    if (ledger.boundOf(kind)) |bound| bound.reserved.* += bytes;
 
     const usage = &ledger.usage;
 
@@ -128,6 +130,31 @@ pub fn reserve(
     );
 
     return .{ .bytes = bytes, .kind = kind };
+}
+
+/// Reports whether the budget and the ceiling of `kind` admit `bytes`
+/// more once `freed` bytes of the kept kind are released. The ledger
+/// counts at least `freed` kept bytes.
+pub fn admits(ledger: *Ledger, kind: Kind, bytes: u64, freed: u64) bool {
+    std.debug.assert(freed <= ledger.usage.kept);
+
+    if (bytes > ledger.available() + freed) return false;
+
+    const bound = ledger.boundOf(kind) orelse return true;
+
+    // Kept bytes count under the output ceiling alone.
+    const relief = if (kind == .output) freed else 0;
+    const held = bound.live + bound.reserved.* - relief;
+
+    // The sum stays within the ceiling, so the difference holds.
+    return bytes <= bound.ceiling - held;
+}
+
+/// Counts `bytes` of live blocks of the kind `from` under the kind `to`,
+/// for a block that changes its kind and stays.
+pub fn move(ledger: *Ledger, from: Kind, to: Kind, bytes: u64) void {
+    if (ledger.countOf(from)) |count| count.* -= bytes;
+    if (ledger.countOf(to)) |count| count.* += bytes;
 }
 
 /// Converts `bytes` of `reservation` into live bytes, for a block of its
@@ -174,12 +201,13 @@ fn countOf(ledger: *Ledger, kind: Kind) ?*u64 {
         .input => &ledger.usage.input,
         .metadata => &ledger.usage.metadata,
         .output => &ledger.usage.output,
+        .kept => &ledger.usage.kept,
         .codec => null,
     };
 }
 
-/// A kind that has a ceiling: the ceiling, the live bytes of the kind,
-/// and the count of its reserved bytes.
+/// A kind that has a ceiling: the ceiling, the live bytes that count
+/// under it, and the count of its reserved bytes.
 const Bound = struct {
     ceiling: u64,
     live: u64,
@@ -195,12 +223,15 @@ fn boundOf(ledger: *Ledger, kind: Kind) ?Bound {
             .live = ledger.usage.metadata,
             .reserved = &ledger.reserved_metadata,
         },
+        // A kept block is output memory that waits, so it counts under
+        // the ceiling of output until a lease takes it or the heap frees
+        // it.
         .output => .{
             .ceiling = ledger.ceilings.output,
-            .live = ledger.usage.output,
+            .live = ledger.usage.output + ledger.usage.kept,
             .reserved = &ledger.reserved_output,
         },
-        .input, .codec => null,
+        .input, .kept, .codec => null,
     };
 }
 
@@ -548,4 +579,46 @@ test "the largest budget admits all of its bytes without overflow" {
     ledger.convert(&reservation, largest);
     try testing.expectError(error.BudgetExceeded, ledger.reserve(.codec, 1));
     try testing.expectEqual(largest, ledger.usage.peak);
+}
+
+test "a kept block counts as live bytes under the ceiling of output" {
+    var ledger: Ledger = .init(try .init(1000));
+
+    ledger.ceilings = .{ .metadata = 300, .output = 500 };
+
+    var reservation = try ledger.reserve(.output, 400);
+
+    ledger.convert(&reservation, 400);
+    ledger.move(.output, .kept, 400);
+
+    try testing.expectEqual(Usage{
+        .live = 400,
+        .peak = 400,
+        .peak_committed = 400,
+        .kept = 400,
+    }, ledger.usage);
+
+    // The ceiling of output leaves 100 bytes beside the kept block, and
+    // the budget 600.
+    try testing.expectError(error.BudgetExceeded, ledger.reserve(.output, 101));
+    try testing.expectError(error.BudgetExceeded, ledger.reserve(.codec, 601));
+    try testing.expect(!ledger.admits(.output, 101, 0));
+    try testing.expect(!ledger.admits(.codec, 601, 0));
+
+    // Without the block, each kind has what the block took from it, and
+    // the ceiling of metadata has what it had.
+    try testing.expect(ledger.admits(.output, 500, 400));
+    try testing.expect(!ledger.admits(.output, 501, 400));
+    try testing.expect(ledger.admits(.codec, 1000, 400));
+    try testing.expect(!ledger.admits(.codec, 1001, 400));
+    try testing.expect(ledger.admits(.metadata, 300, 400));
+    try testing.expect(!ledger.admits(.metadata, 301, 400));
+    try testing.expect(!ledger.admits(.metadata, 301, 0));
+
+    // The block returns to output, and its release settles the ledger.
+    ledger.move(.kept, .output, 400);
+    try testing.expectEqual(400, ledger.usage.output);
+    try testing.expectEqual(0, ledger.usage.kept);
+    ledger.release(.output, 400);
+    try testing.expect(ledger.settled());
 }
