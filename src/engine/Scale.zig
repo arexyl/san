@@ -120,13 +120,14 @@ pub fn add(scale: *Scale, index: u32, samples: []const u8) bool {
 pub fn emit(scale: *Scale, pixels: []u8) void {
     std.debug.assert(pixels.len == @as(usize, scale.width) * 4);
 
-    const area = @as(u64, scale.image_width) * scale.image_height;
+    const area: Divisor = .init(@as(u64, scale.image_width) * scale.image_height);
+    const half = area.value / 2;
 
     for (0..scale.width) |column| {
         const pixel = pixels[column * 4 ..][0..4];
 
         for (scale.down[column * 3 ..][0..3], pixel[0..3]) |sum, *sample| {
-            sample.* = @intCast((sum + area / 2) / area);
+            sample.* = @intCast(area.divide(sum + half));
         }
 
         pixel[3] = 0xff;
@@ -141,28 +142,87 @@ pub fn emit(scale: *Scale, pixels: []u8) void {
     scale.below = 0;
 }
 
+/// A divisor of many 64-bit values, at least 1, with the reciprocal that
+/// replaces each division by a multiplication. An output row divides
+/// every sample by the same area.
+const Divisor = struct {
+    value: u64,
+    /// The largest word below 2^64 divided by the value.
+    reciprocal: u64,
+
+    fn init(value: u64) Divisor {
+        return .{
+            .value = value,
+            .reciprocal = std.math.maxInt(u64) / value,
+        };
+    }
+
+    /// Returns `dividend` divided by the value, rounded down. The
+    /// product with the reciprocal is below the exact quotient by less
+    /// than 1, so its whole part is the quotient or one less, which the
+    /// remainder tells apart.
+    fn divide(divisor: Divisor, dividend: u64) u64 {
+        const product = @as(u128, dividend) * divisor.reciprocal;
+        const low: u64 = @intCast(product >> 64);
+        const rest = dividend - low * divisor.value;
+
+        return low + @intFromBool(rest >= divisor.value);
+    }
+};
+
 /// Sums the samples of one image row into each grid column, each
-/// sample times the units of the column that it covers.
+/// sample times the units of the column that it covers. It walks the row
+/// once: a pixel that lies whole in a column counts with the units of a
+/// pixel, which multiply the plain sum of those pixels once, and a pixel
+/// that two columns share gives each its part.
 fn sumAcross(scale: *Scale, samples: []const u8) void {
-    const image_width: u64 = scale.image_width;
-    const width: u64 = scale.width;
+    // A grid column spans as many units as the image has columns, and
+    // an image pixel as many as the grid has.
+    const column_units: u64 = scale.image_width;
+    const pixel_units: u64 = scale.width;
+
+    var source: usize = 0;
+    // The units of the pixel `source` that the column before took.
+    var taken: u64 = 0;
 
     for (0..scale.width) |column| {
-        const left = column * image_width;
-        const right = left + image_width;
-
+        var room = column_units;
         var sums: [3]u64 = @splat(0);
-        var source: usize = @intCast(left / width);
 
-        while (source * width < right) : (source += 1) {
-            const covered =
-                @min((source + 1) * width, right) - @max(source * width, left);
+        // The rest of a shared pixel is less than a pixel and so less
+        // than a column.
+        if (taken != 0) {
+            const part = pixel_units - taken;
 
             for (&sums, samples[source * 3 ..][0..3]) |*sum, sample| {
-                sum.* += covered * sample;
+                sum.* = part * sample;
+            }
+
+            room -= part;
+            source += 1;
+        }
+
+        var whole: [3]u64 = @splat(0);
+
+        while (room >= pixel_units) : (source += 1) {
+            for (&whole, samples[source * 3 ..][0..3]) |*sum, sample| {
+                sum.* += sample;
+            }
+
+            room -= pixel_units;
+        }
+
+        for (&sums, whole) |*sum, plain| sum.* += plain * pixel_units;
+
+        // Both axes end together, so the last column leaves no room and
+        // reads no pixel beyond the row.
+        if (room != 0) {
+            for (&sums, samples[source * 3 ..][0..3]) |*sum, sample| {
+                sum.* += room * sample;
             }
         }
 
+        taken = room;
         scale.across[column * 3 ..][0..3].* = sums;
     }
 }
@@ -412,6 +472,81 @@ test "the source rows of grid rows round outward" {
     try testing.expectEqual(3, endSource(10, 4, 1));
     try testing.expectEqual(5, endSource(10, 4, 2));
     try testing.expectEqual(10, endSource(10, 4, 4));
+}
+
+test "the sums along a row are its samples times the units they cover" {
+    // The output rounds a sum away, so this test reads the sums. The
+    // ratios hold a pixel that two columns share, columns with one count
+    // of whole pixels and with two, a pixel that ends on the edge of a
+    // column, whole pixels alone, and one column for the whole row.
+    const ratios = [_][2]u32{
+        .{ 3, 2 }, .{ 40, 27 }, .{ 91, 24 }, .{ 36, 27 },
+        .{ 8, 4 }, .{ 5, 5 },   .{ 13, 1 },
+    };
+
+    for (ratios, 0..) |ratio, seed| {
+        const image_width, const width = ratio;
+
+        const samples = try noise(image_width, 1, seed);
+        defer testing.allocator.free(samples);
+
+        const workspace = try testing.allocator.alloc(u64, words(width));
+        defer testing.allocator.free(workspace);
+
+        var scale: Scale = .init(workspace, image_width, 1, width, 1, 0);
+
+        scale.sumAcross(samples);
+
+        for (0..width) |column| {
+            for (0..3) |channel| {
+                var sum: u128 = 0;
+
+                for (0..image_width) |source| {
+                    const units = shared(source, width, column, image_width);
+
+                    sum += units * samples[source * 3 + channel];
+                }
+
+                try testing.expectEqual(sum, scale.across[column * 3 + channel]);
+            }
+        }
+    }
+}
+
+test "a division through the reciprocal is the division" {
+    const values = [_]u64{
+        1,       2,             3,              7,
+        255,     256,           4096 * 6144,    (1 << 32) - 1,
+        1 << 32, (1 << 32) + 1, area_limit - 1, area_limit,
+    };
+
+    var prng: std.Random.DefaultPrng = .init(0x5a17);
+
+    const random = prng.random();
+
+    for (values) |value| {
+        const divisor: Divisor = .init(value);
+
+        // The edges of a quotient, the largest sum of an output sample
+        // with its rounding, and the largest word.
+        const edges = [_]u64{
+            0,                        value - 1,
+            value,                    value + 1,
+            2 * value - 1,            2 * value,
+            255 * value + value / 2,  std.math.maxInt(u64) - value,
+            std.math.maxInt(u64) - 1, std.math.maxInt(u64),
+        };
+
+        for (edges) |dividend| {
+            try testing.expectEqual(dividend / value, divisor.divide(dividend));
+        }
+
+        for (0..10_000) |_| {
+            const dividend = random.int(u64);
+
+            try testing.expectEqual(dividend / value, divisor.divide(dividend));
+        }
+    }
 }
 
 test "the sums of the largest area stay within 64 bits" {
