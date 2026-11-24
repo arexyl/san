@@ -11,6 +11,14 @@
 //!
 //! The sums are exact, and each sample is quantized once: to the nearest
 //! value, halves up.
+//!
+//! The three loops that run for every sample add and multiply with the
+//! wrapping operators, which a safe build does not check: the checks
+//! took nearly half the time of a scale. No sum can wrap. A sum along a
+//! row is at most 255 times the image width, a sum of a grid row at most
+//! 255 times the image area, and `init` admits no area beyond
+//! `area_limit`, whose rounded sum still fits 64 bits. A slice is still
+//! checked wherever it is indexed.
 
 const std = @import("std");
 
@@ -127,7 +135,7 @@ pub fn emit(scale: *Scale, pixels: []u8) void {
         const pixel = pixels[column * 4 ..][0..4];
 
         for (scale.down[column * 3 ..][0..3], pixel[0..3]) |sum, *sample| {
-            sample.* = @intCast(area.divide(sum + half));
+            sample.* = @intCast(area.divide(sum +% half));
         }
 
         pixel[3] = 0xff;
@@ -164,9 +172,11 @@ const Divisor = struct {
     fn divide(divisor: Divisor, dividend: u64) u64 {
         const product = @as(u128, dividend) * divisor.reciprocal;
         const low: u64 = @intCast(product >> 64);
-        const rest = dividend - low * divisor.value;
+        // The whole part times the value is at most the dividend, and the
+        // quotient is at most the dividend.
+        const rest = dividend -% low *% divisor.value;
 
-        return low + @intFromBool(rest >= divisor.value);
+        return low +% @intFromBool(rest >= divisor.value);
     }
 };
 
@@ -195,10 +205,10 @@ fn sumAcross(scale: *Scale, samples: []const u8) void {
             const part = pixel_units - taken;
 
             for (&sums, samples[source * 3 ..][0..3]) |*sum, sample| {
-                sum.* = part * sample;
+                sum.* = part *% sample;
             }
 
-            room -= part;
+            room -%= part;
             source += 1;
         }
 
@@ -206,19 +216,19 @@ fn sumAcross(scale: *Scale, samples: []const u8) void {
 
         while (room >= pixel_units) : (source += 1) {
             for (&whole, samples[source * 3 ..][0..3]) |*sum, sample| {
-                sum.* += sample;
+                sum.* +%= sample;
             }
 
-            room -= pixel_units;
+            room -%= pixel_units;
         }
 
-        for (&sums, whole) |*sum, plain| sum.* += plain * pixel_units;
+        for (&sums, whole) |*sum, plain| sum.* +%= plain *% pixel_units;
 
         // Both axes end together, so the last column leaves no room and
         // reads no pixel beyond the row.
         if (room != 0) {
             for (&sums, samples[source * 3 ..][0..3]) |*sum, sample| {
-                sum.* += room * sample;
+                sum.* +%= room *% sample;
             }
         }
 
@@ -230,7 +240,7 @@ fn sumAcross(scale: *Scale, samples: []const u8) void {
 /// Adds the sums of the current image row to the current grid row,
 /// times the `units` of that grid row that the image row covers.
 fn addDown(scale: *Scale, units: u64) void {
-    for (scale.down, scale.across) |*sum, across| sum.* += units * across;
+    for (scale.down, scale.across) |*sum, across| sum.* +%= units *% across;
 }
 
 const testing = std.testing;
